@@ -4,6 +4,7 @@ from .price import StooqPriceTemplate
 from .comparison import StooqComparisonTemplate
 from .historical import StooqHistoricalTemplate
 from .market_summary import StooqMarketSummaryTemplate
+from .currency import StooqCurrencyTemplate
 from .variables import (
     StockVariable, IndexVariable, CurrencyVariable, CommodityVariable,
     PriceMetricVariable, StockSpec, IndexSpec, CurrencySpec, CommoditySpec,
@@ -16,6 +17,7 @@ __all__ = [
     "StooqComparisonTemplate",
     "StooqHistoricalTemplate",
     "StooqMarketSummaryTemplate",
+    "StooqCurrencyTemplate",
     "StockVariable",
     "IndexVariable",
     "CurrencyVariable",
