@@ -390,10 +390,8 @@ class Actor:
             obs_content = (
                 f"URL: {step.observation.url}\n"
                 f"Title: {step.observation.title}\n"
-                f"Page Content:\n{step.observation.accessibility_tree[:2000]}"
+                f"Page Content:\n{step.observation.accessibility_tree}"
             )
-            if len(step.observation.accessibility_tree) > 2000:
-                obs_content += "\n... (truncated)"
 
             conversation.append({
                 "role": "user",

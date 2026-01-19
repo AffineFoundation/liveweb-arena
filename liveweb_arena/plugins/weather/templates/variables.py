@@ -136,7 +136,7 @@ class LocationVariable(Variable):
             location_type=LocationType.CITY_NAME,
             value={"city": city, "country": country},
             display_name=f"{city}, {country}",
-            api_query=city.replace(" ", "+"),
+            api_query=f"{city},{country}".replace(" ", "+"),
         )
 
     def _sample_airport(self, rng: random.Random) -> LocationSpec:
@@ -417,19 +417,19 @@ class WeatherMetricVariable(Variable):
     METRICS: Dict[MetricType, MetricSpec] = {
         MetricType.TEMPERATURE: MetricSpec(
             MetricType.TEMPERATURE, "temperature", "tempC", "°C",
-            full_tolerance=2, partial_tolerance=5
+            full_tolerance=0, partial_tolerance=0
         ),
         MetricType.TEMPERATURE_HIGH: MetricSpec(
             MetricType.TEMPERATURE_HIGH, "high temperature", "maxtempC", "°C",
-            full_tolerance=2, partial_tolerance=5
+            full_tolerance=0, partial_tolerance=0
         ),
         MetricType.TEMPERATURE_LOW: MetricSpec(
             MetricType.TEMPERATURE_LOW, "low temperature", "mintempC", "°C",
-            full_tolerance=2, partial_tolerance=5
+            full_tolerance=0, partial_tolerance=0
         ),
         MetricType.FEELS_LIKE: MetricSpec(
             MetricType.FEELS_LIKE, "feels like temperature", "FeelsLikeC", "°C",
-            full_tolerance=2, partial_tolerance=5
+            full_tolerance=0, partial_tolerance=0
         ),
         MetricType.HUMIDITY: MetricSpec(
             MetricType.HUMIDITY, "humidity", "humidity", "%",
@@ -444,8 +444,8 @@ class WeatherMetricVariable(Variable):
             full_tolerance=1, partial_tolerance=3
         ),
         MetricType.PRECIPITATION_CHANCE: MetricSpec(
-            MetricType.PRECIPITATION_CHANCE, "chance of rain", "chanceofrain", "%",
-            full_tolerance=10, partial_tolerance=25
+            MetricType.PRECIPITATION_CHANCE, "peak chance of rain", "chanceofrain", "%",
+            full_tolerance=5, partial_tolerance=10
         ),
         MetricType.UV_INDEX: MetricSpec(
             MetricType.UV_INDEX, "UV index", "uvIndex", "",

@@ -188,8 +188,8 @@ class LocationNameWeatherTemplate(QuestionTemplate):
 
         if "temp" in metric_type.lower():
             return """Task-Specific Rules (Weather - Temperature):
-- Score 1.0: Numeric values match exactly OR differ by at most 1°C
-- Score 0.0: Difference exceeds 1°C"""
+- Score 1.0: Numeric values match exactly
+- Score 0.0: Values differ"""
 
         if "chance" in metric_type.lower() or "percent" in metric_type.lower():
             return """Task-Specific Rules (Weather - Percentage):
@@ -253,17 +253,35 @@ class LocationNameWeatherTemplate(QuestionTemplate):
             data = response.json()
 
         weather = data.get("weather", [])
-        # Extract value based on forecast day
-        if forecast_day == 0:
+        value = None
+
+        # For metrics shown on HTML page, use only the 4 displayed time slots
+        # HTML shows Morning(9:00)/Noon(12:00)/Evening(18:00)/Night(21:00) = indices 3,4,6,7
+        display_indices = [3, 4, 6, 7]
+
+        if api_field in ("maxtempC", "mintempC") and forecast_day < len(weather):
+            day_data = weather[forecast_day]
+            hourly = day_data.get("hourly", [])
+            if hourly and len(hourly) >= 8:
+                temps = [int(hourly[i].get("tempC", 0)) for i in display_indices if hourly[i].get("tempC")]
+                if temps:
+                    value = max(temps) if api_field == "maxtempC" else min(temps)
+        elif api_field == "chanceofrain" and forecast_day < len(weather):
+            # For chance of rain, use MAX of displayed time slots (if any slot has 100%, it will rain)
+            day_data = weather[forecast_day]
+            hourly = day_data.get("hourly", [])
+            if hourly and len(hourly) >= 8:
+                chances = [int(hourly[i].get("chanceofrain", 0)) for i in display_indices]
+                if chances:
+                    value = max(chances)
+        elif forecast_day == 0:
             # Current conditions
             current = data.get("current_condition", [{}])[0]
             value = current.get(api_field)
 
             # If not in current, check today's forecast
-            if value is None:
-                weather = data.get("weather", [{}])
-                if weather:
-                    value = weather[0].get(api_field)
+            if value is None and weather:
+                value = weather[0].get(api_field)
         else:
             # Future forecast
             if forecast_day < len(weather):
@@ -278,8 +296,6 @@ class LocationNameWeatherTemplate(QuestionTemplate):
                         values = [float(h.get(api_field, 0)) for h in hourly if h.get(api_field)]
                         if values:
                             value = sum(values) / len(values)
-            else:
-                value = None
 
         # Convert boolean for rain questions
         if is_boolean and value is not None:
@@ -455,7 +471,7 @@ class MultiDayWeatherTemplate(QuestionTemplate):
 - Score 0.0: Answers disagree"""
 
         if question_type == MultiDayQuestionType.AVERAGE:
-            tolerance = "1°C" if "temp" in metric_type.lower() else "10%"
+            tolerance = "0°C (exact match)" if "temp" in metric_type.lower() else "10%"
             return f"""Task-Specific Rules (Multi-Day Weather - Average Value):
 - The question asks for the AVERAGE value over {num_days} days
 - Expected answer is a single averaged value
@@ -463,7 +479,7 @@ class MultiDayWeatherTemplate(QuestionTemplate):
 - Score 0.0: Difference exceeds {tolerance}"""
 
         else:  # DAILY
-            tolerance = "1°C" if "temp" in metric_type.lower() else "10%"
+            tolerance = "0°C (exact match)" if "temp" in metric_type.lower() else "10%"
             return f"""Task-Specific Rules (Multi-Day Weather - Daily Values):
 - The question asks for EACH DAY's value separately over {num_days} days
 - Expected answer lists {num_days} values, one per day
@@ -505,8 +521,30 @@ class MultiDayWeatherTemplate(QuestionTemplate):
         daily_dates = []
         for i in range(min(num_days, len(weather))):
             day_data = weather[i]
-            val = day_data.get(api_field)
             date_str = day_data.get("date", f"Day {i+1}")
+
+            # Use only the 4 time slots shown on HTML: indices 3(9:00), 4(12:00), 6(18:00), 7(21:00)
+            display_indices = [3, 4, 6, 7]
+            hourly = day_data.get("hourly", [])
+
+            if api_field in ("maxtempC", "mintempC"):
+                if hourly and len(hourly) >= 8:
+                    temps = [int(hourly[idx].get("tempC", 0)) for idx in display_indices if hourly[idx].get("tempC")]
+                    if temps:
+                        val = max(temps) if api_field == "maxtempC" else min(temps)
+                    else:
+                        val = day_data.get(api_field)
+                else:
+                    val = day_data.get(api_field)
+            elif api_field == "chanceofrain":
+                if hourly and len(hourly) >= 8:
+                    chances = [int(hourly[idx].get("chanceofrain", 0)) for idx in display_indices]
+                    val = max(chances) if chances else day_data.get(api_field)
+                else:
+                    val = day_data.get(api_field)
+            else:
+                val = day_data.get(api_field)
+
             if val is not None:
                 daily_values.append(float(val))
                 daily_dates.append(date_str)
