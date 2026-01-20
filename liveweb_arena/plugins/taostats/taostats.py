@@ -63,7 +63,6 @@ class TaostatsPlugin(BasePlugin):
         self,
         seed: int,
         template_name: str = None,
-        metric: str = None,
     ) -> SubTask:
         """
         Generate a Taostats query task.
@@ -71,7 +70,6 @@ class TaostatsPlugin(BasePlugin):
         Args:
             seed: Random seed for task generation
             template_name: Specific template to use (e.g., "taostats_subnet_info")
-            metric: Specific metric to query (e.g., "price", "name")
         """
         rng = random.Random(seed)
 
@@ -85,13 +83,7 @@ class TaostatsPlugin(BasePlugin):
             selected_template_name = rng.choice(list(self._template_instances.keys()))
 
         template = self._template_instances[selected_template_name]
-
-        # Generate question with optional metric constraint
-        if metric:
-            # Find a seed that generates the desired metric
-            question = self._generate_with_metric(template, seed, metric)
-        else:
-            question = template.generate(seed)
+        question = template.generate(seed)
 
         return SubTask(
             plugin_name=self.name,
@@ -102,26 +94,6 @@ class TaostatsPlugin(BasePlugin):
             },
             answer_tag="",
         )
-
-    def _generate_with_metric(
-        self,
-        template: QuestionTemplate,
-        base_seed: int,
-        target_metric: str,
-    ) -> GeneratedQuestion:
-        """Generate a question with specific metric by searching seeds."""
-        # Try up to 500 seeds to find a match
-        for offset in range(500):
-            seed = base_seed + offset
-            question = template.generate(seed)
-            # Check if this question has the target metric
-            info = question.validation_info
-            if info.get("metric") == target_metric:
-                return question
-            if info.get("analysis_type") == target_metric:
-                return question
-        # Fallback to base seed if no match found
-        return template.generate(base_seed)
 
     async def validate_answer(
         self, answer: str, validation_info: dict

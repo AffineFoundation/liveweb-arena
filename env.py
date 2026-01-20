@@ -65,7 +65,6 @@ class Actor:
         temperature: float = 0.7,
         max_concurrency: int = 2,
         validation_model: Optional[str] = None,
-        metric: Optional[str] = None,
         task_id: Optional[int] = None,
     ) -> dict:
         """
@@ -83,7 +82,6 @@ class Actor:
             temperature: LLM temperature
             max_concurrency: Container-local concurrency limit
             validation_model: Model for answer validation (default: same as model)
-            metric: Optional specific metric/type to query
             task_id: Optional task ID for deterministic question type
 
         Returns:
@@ -115,7 +113,6 @@ class Actor:
                     timeout=timeout,
                     temperature=temperature,
                     validation_model=validation_model,
-                    metric=metric,
                     task_id=task_id,
                 )
             except Exception as e:
@@ -150,7 +147,6 @@ class Actor:
         timeout: int,
         temperature: float,
         validation_model: Optional[str] = None,
-        metric: Optional[str] = None,
         task_id: Optional[int] = None,
     ) -> dict:
         """Internal evaluation logic"""
@@ -160,7 +156,6 @@ class Actor:
             seed=seed,
             num_subtasks=num_subtasks,
             templates=templates,
-            metric=metric,
         )
         log("Actor", f"Generated {len(task.subtasks)} subtasks, seed={seed}")
         for i, subtask in enumerate(task.subtasks, 1):

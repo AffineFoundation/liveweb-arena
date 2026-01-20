@@ -78,8 +78,8 @@ async def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="LLM temperature (default: 0.7)",
+        default=0.0,
+        help="LLM temperature (default: 0.0)",
     )
     parser.add_argument(
         "--validation-model",
@@ -104,12 +104,6 @@ async def main():
         nargs="+",
         default=None,
         help="Templates to use (e.g., weather/multi_day_weather stooq/stooq_price)",
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default=None,
-        help="Specific metric/type to query (e.g., price, name)",
     )
     parser.add_argument(
         "--task-id",
@@ -184,8 +178,6 @@ async def main():
         config_parts.append(f"tasks={num_tasks}")
         if templates:
             config_parts.append(f"templates={templates}")
-        if args.metric:
-            config_parts.append(f"metric={args.metric}")
         print(f"Config: {', '.join(config_parts)}")
 
     # Initialize actor
@@ -205,7 +197,6 @@ async def main():
             timeout=args.timeout,
             temperature=args.temperature,
             validation_model=args.validation_model,
-            metric=args.metric,
             task_id=args.task_id,
         )
 

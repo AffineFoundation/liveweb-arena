@@ -37,7 +37,6 @@ class TaskManager:
         seed: int,
         num_subtasks: int = 2,
         templates: Optional[List[tuple]] = None,
-        metric: Optional[str] = None,
     ) -> CompositeTask:
         """
         Generate a composite task with multiple sub-tasks.
@@ -46,7 +45,6 @@ class TaskManager:
             seed: Random seed for deterministic generation
             num_subtasks: Number of sub-tasks (1-4)
             templates: List of (plugin, template_name) tuples; None = random
-            metric: Optional specific metric/type to query
 
         Returns:
             CompositeTask with subtasks and combined_intent
@@ -80,7 +78,6 @@ class TaskManager:
             subtask = await plugin.generate_task(
                 subtask_seed,
                 template_name=template_name,
-                metric=metric,
             )
             # Override answer_tag
             subtask.answer_tag = f"answer{i + 1}"

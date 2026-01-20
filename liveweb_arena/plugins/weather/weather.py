@@ -69,7 +69,6 @@ class WeatherPlugin(BasePlugin):
         self,
         seed: int,
         template_name: str = None,
-        metric: str = None,
     ) -> SubTask:
         """Generate a weather query task using templates"""
         rng = random.Random(seed)

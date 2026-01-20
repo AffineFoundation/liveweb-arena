@@ -66,7 +66,6 @@ class StooqPlugin(BasePlugin):
         self,
         seed: int,
         template_name: str = None,
-        metric: str = None,
     ) -> SubTask:
         """
         Generate a Stooq query task.
@@ -74,7 +73,6 @@ class StooqPlugin(BasePlugin):
         Args:
             seed: Random seed for task generation
             template_name: Specific template to use (e.g., "stooq_price")
-            metric: Not used for Stooq (kept for API compatibility)
         """
         rng = random.Random(seed)
 
