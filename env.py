@@ -59,14 +59,14 @@ class Actor:
         api_key: Optional[str] = None,
         seed: Optional[int] = None,
         num_subtasks: int = 2,
-        plugins: Optional[List[str]] = None,
+        templates: Optional[List[tuple]] = None,
         max_steps: Optional[int] = None,
         timeout: int = 3600,
         temperature: float = 0.7,
         max_concurrency: int = 2,
         validation_model: Optional[str] = None,
-        template_name: Optional[str] = None,
         metric: Optional[str] = None,
+        task_id: Optional[int] = None,
     ) -> dict:
         """
         Run a single evaluation.
@@ -77,14 +77,14 @@ class Actor:
             api_key: Override API key for this evaluation
             seed: Deterministic task generation seed (random if None)
             num_subtasks: Number of sub-tasks (1-4)
-            plugins: Explicit plugin list; None = random selection
+            templates: List of (plugin, template_name) tuples; None = random
             max_steps: Max browser interaction steps
             timeout: Total wall-clock budget in seconds
             temperature: LLM temperature
             max_concurrency: Container-local concurrency limit
             validation_model: Model for answer validation (default: same as model)
-            template_name: Optional specific template to use
             metric: Optional specific metric/type to query
+            task_id: Optional task ID for deterministic question type
 
         Returns:
             Evaluation result dict with scores and metadata
@@ -110,13 +110,13 @@ class Actor:
                     api_key=current_api_key,
                     seed=seed,
                     num_subtasks=num_subtasks,
-                    plugins=plugins,
+                    templates=templates,
                     max_steps=max_steps,
                     timeout=timeout,
                     temperature=temperature,
                     validation_model=validation_model,
-                    template_name=template_name,
                     metric=metric,
+                    task_id=task_id,
                 )
             except Exception as e:
                 import traceback
@@ -126,6 +126,7 @@ class Actor:
                     "success": False,
                     "time_taken": time.time() - start_time,
                     "extra": {
+                        "task_id": task_id,
                         "seed": seed,
                         "num_subtasks": num_subtasks,
                         "conversation": [],
@@ -144,13 +145,13 @@ class Actor:
         api_key: str,
         seed: int,
         num_subtasks: int,
-        plugins: Optional[List[str]],
+        templates: Optional[List[tuple]],
         max_steps: Optional[int],
         timeout: int,
         temperature: float,
         validation_model: Optional[str] = None,
-        template_name: Optional[str] = None,
         metric: Optional[str] = None,
+        task_id: Optional[int] = None,
     ) -> dict:
         """Internal evaluation logic"""
         await self._ensure_browser()
@@ -158,8 +159,7 @@ class Actor:
         task = await self.task_manager.generate_composite_task(
             seed=seed,
             num_subtasks=num_subtasks,
-            plugin_names=plugins,
-            template_name=template_name,
+            templates=templates,
             metric=metric,
         )
         log("Actor", f"Generated {len(task.subtasks)} subtasks, seed={seed}")
@@ -268,6 +268,7 @@ class Actor:
                 "success": success,
                 "time_taken": 0.0,  # Will be set by caller
                 "extra": {
+                    "task_id": task_id,
                     "seed": seed,
                     "num_subtasks": num_subtasks,
                     "final_url": final_url,

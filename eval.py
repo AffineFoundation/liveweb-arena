@@ -6,11 +6,14 @@ Usage:
     python run.py [options]
 
 Examples:
-    # Basic evaluation
-    python run.py --model "deepseek-ai/DeepSeek-V3" --seed 42
+    # Basic evaluation (random)
+    python run.py --model "zai-org/GLM-4.7-TEE" --seed 42
 
-    # With custom settings
-    python run.py --model "gpt-4" --base-url "https://api.openai.com/v1" --num-tasks 2
+    # With task_id (deterministic, reproducible question type)
+    python run.py --model "openai/gpt-oss-120b-TEE" --task-id 50001
+
+    # Show task registry info
+    python run.py --show-registry
 """
 
 import argparse
@@ -23,6 +26,7 @@ from pathlib import Path
 
 from env import Actor
 from liveweb_arena.utils.logger import set_verbose
+from liveweb_arena.core.task_registry import TaskRegistry, parse_task_id, max_task_id
 
 
 async def main():
@@ -60,13 +64,6 @@ async def main():
         help="Number of sub-tasks (1-4, default: 1)",
     )
     parser.add_argument(
-        "--plugins",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Plugins to use (default: random from all available)",
-    )
-    parser.add_argument(
         "--max-steps",
         type=int,
         default=None,
@@ -102,10 +99,11 @@ async def main():
         help="Print verbose output",
     )
     parser.add_argument(
-        "--template",
+        "--templates",
         type=str,
+        nargs="+",
         default=None,
-        help="Specific template to use (e.g., taostats_subnet_info)",
+        help="Templates to use (e.g., weather/multi_day_weather stooq/stooq_price)",
     )
     parser.add_argument(
         "--metric",
@@ -113,8 +111,30 @@ async def main():
         default=None,
         help="Specific metric/type to query (e.g., price, name)",
     )
+    parser.add_argument(
+        "--task-id",
+        type=int,
+        default=None,
+        help="Task ID for deterministic question type (1 to max, see --show-registry)",
+    )
+    parser.add_argument(
+        "--show-registry",
+        action="store_true",
+        help="Show task registry info and exit",
+    )
 
     args = parser.parse_args()
+
+    # Handle --show-registry
+    if args.show_registry:
+        TaskRegistry.print_info()
+        sys.exit(0)
+
+    # Validate task_id range
+    if args.task_id is not None:
+        if args.task_id < 1 or args.task_id > max_task_id():
+            print(f"Error: task_id must be between 1 and {max_task_id()}")
+            sys.exit(1)
 
     # Set verbose mode globally
     set_verbose(args.verbose)
@@ -125,10 +145,45 @@ async def main():
         print("Error: API key required. Set CHUTES_API_KEY or use --api-key")
         sys.exit(1)
 
+    # Parse templates from "plugin/template_name" format
+    def parse_templates(template_strs):
+        """Parse 'plugin/template_name' strings to tuples."""
+        if not template_strs:
+            return None
+        result = []
+        for t in template_strs:
+            if "/" in t:
+                plugin, name = t.split("/", 1)
+                result.append((plugin, name))
+            else:
+                raise ValueError(f"Invalid template format: {t}. Use 'plugin/template_name'")
+        return result
+
+    # Prepare config based on task_id and/or seed
+    if args.task_id is not None:
+        task_config = parse_task_id(args.task_id)
+        seed = args.seed if args.seed is not None else task_config["variation_seed"]
+        num_tasks = args.num_tasks if args.num_tasks != 1 else task_config["num_tasks"]
+        templates = task_config["templates"]  # Already list of (plugin, name) tuples
+
+        if args.verbose:
+            print(f"Task ID: {args.task_id}")
+            print(f"  Templates: {templates}")
+            print(f"  Num tasks: {num_tasks}")
+            print(f"  Seed: {seed}")
+    else:
+        seed = args.seed
+        num_tasks = args.num_tasks
+        templates = parse_templates(args.templates)
+
     if args.verbose:
-        config_parts = [f"model={args.model}", f"seed={args.seed or 'random'}", f"tasks={args.num_tasks}"]
-        if args.template:
-            config_parts.append(f"template={args.template}")
+        config_parts = [f"model={args.model}"]
+        if args.task_id:
+            config_parts.append(f"task_id={args.task_id}")
+        config_parts.append(f"seed={seed or 'random'}")
+        config_parts.append(f"tasks={num_tasks}")
+        if templates:
+            config_parts.append(f"templates={templates}")
         if args.metric:
             config_parts.append(f"metric={args.metric}")
         print(f"Config: {', '.join(config_parts)}")
@@ -143,15 +198,15 @@ async def main():
         result = await actor.evaluate(
             model=args.model,
             base_url=args.base_url,
-            seed=args.seed,
-            num_subtasks=args.num_tasks,
-            plugins=args.plugins,
+            seed=seed,
+            num_subtasks=num_tasks,
+            templates=templates,
             max_steps=args.max_steps,
             timeout=args.timeout,
             temperature=args.temperature,
             validation_model=args.validation_model,
-            template_name=args.template,
             metric=args.metric,
+            task_id=args.task_id,
         )
 
         # Print results
