@@ -10,3 +10,4 @@
 6. **File Size** - Keep files under 500 lines
 7. **Import Style** - Use absolute imports for cross-package (`liveweb_arena.core.xxx`), relative for same package
 8. **Commit Rules** - Only commit when explicitly asked; keep messages concise
+9. **Template Testing** - Every new question template must be tested via `eval.py` with multiple seeds to verify the entire evaluation pipeline works correctly

@@ -54,6 +54,9 @@ class TaskRegistry:
         21: ("taostats", "taostats_network"),
         22: ("taostats", "taostats_price"),
 
+        # CoinGecko templates
+        30: ("coingecko", "coingecko_price"),
+
         # Add new templates here with new IDs...
     }
 
