@@ -141,7 +141,7 @@ class CoinGeckoSupplyTemplate(QuestionTemplate):
             return """Task-Specific Rules (CoinGecko - Supply Percentage):
 - Score 1.0: Percentage within 5pp of expected
 - Score 0.0: More than 5pp off
-- Accept formats: "90%", "90.5%", "about 90%", "approximately 90 percent""""
+- Accept formats: 90%, 90.5%, about 90%, approximately 90 percent"""
 
         return """Task-Specific Rules (CoinGecko - Supply):
 - Supply numbers are large and change slowly

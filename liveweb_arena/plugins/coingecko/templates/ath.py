@@ -108,7 +108,7 @@ class CoinGeckoATHTemplate(QuestionTemplate):
 - ATH prices are historical and stable (don't change unless new ATH)
 - Score 1.0: Price within 10% of expected
 - Score 0.0: More than 10% off
-- Accept formats: "$69,000", "69000", "$69K", "69 thousand""""
+- Accept formats: "$69,000", "69000", "$69K", "69 thousand"""
 
     async def get_ground_truth(self, validation_info: Dict[str, Any]) -> GroundTruthResult:
         """Fetch ATH data from CoinGecko API."""

@@ -76,8 +76,8 @@ class TaskRegistry:
         47: ("tmdb", "tmdb_cast_position"),
         48: ("tmdb", "tmdb_recent_works"),
 
-        # Hybrid cross-site templates
-        50: ("hybrid", "hybrid_price_ratio"),
+        # Hybrid cross-site templates (RL-friendly)
+        50: ("hybrid", "hybrid_top_performer"),
 
         # Add new templates here with new IDs...
     }

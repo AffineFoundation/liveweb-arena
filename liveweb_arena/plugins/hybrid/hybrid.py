@@ -12,20 +12,21 @@ from . import templates as _  # noqa: F401
 
 class HybridPlugin(BasePlugin):
     """
-    Plugin for cross-site queries requiring data from multiple sources.
+    Plugin for cross-site optimization tasks requiring exploration.
 
-    This plugin generates questions that cannot be answered by visiting
-    a single website - they require combining information from multiple
-    sources (e.g., CoinGecko + Stooq).
+    This plugin generates RL-friendly tasks that cannot be solved by
+    following a fixed path - they require exploring multiple options
+    across different websites to find the optimal answer.
 
     Supported templates:
-    - hybrid_price_ratio: Calculate how many stock shares equal one crypto
+    - hybrid_top_performer: Find which asset has the best 24h performance
 
-    This is the hardest category because:
-    1. Requires navigating to multiple independent websites
-    2. Requires extracting specific data from each
-    3. Requires performing calculation on the combined data
-    4. Both data sources have real-time changing values
+    Why this is RL-friendly (not just longer SFT):
+    1. EXPLORATION REQUIRED - Must check multiple assets to find the best
+    2. OPTIMIZATION OBJECTIVE - Find maximum, not just any valid answer
+    3. NO FIXED PATH - Order of checking is a strategic choice
+    4. POLICY LEARNING - Agent can learn adaptive strategies
+    5. NON-DEMONSTRABLE - Expert demo doesn't generalize across instances
     """
 
     def __init__(self, templates: List[str] = None):

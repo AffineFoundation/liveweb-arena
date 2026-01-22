@@ -204,7 +204,7 @@ class CoinGeckoPerformanceTemplate(QuestionTemplate):
 - Performance is the 7-day percentage price change
 - Score 1.0: Percentage within 3pp of expected
 - Score 0.0: More than 3pp off
-- Accept formats: "+5.2%", "-3.1%", "up 5%", "down 3%", "declined 18%""""
+- Accept formats: "+5.2%", "-3.1%", "up 5%", "down 3%", "declined 18%"""
 
     async def get_ground_truth(self, validation_info: Dict[str, Any]) -> GroundTruthResult:
         """Fetch 7-day performance data from CoinGecko API."""

@@ -1,7 +1,7 @@
 """Hybrid cross-site query templates"""
 
-from .price_ratio import HybridPriceRatioTemplate
+from .top_performer import HybridTopPerformerTemplate
 
 __all__ = [
-    "HybridPriceRatioTemplate",
+    "HybridTopPerformerTemplate",
 ]
