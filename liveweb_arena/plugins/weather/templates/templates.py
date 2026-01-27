@@ -389,6 +389,20 @@ class LocationNameWeatherTemplate(QuestionTemplate):
         """Return the cache source name for this template."""
         return "weather"
 
+    def get_gt_source(self):
+        """
+        Weather template uses PAGE_ONLY extraction.
+
+        Temperature, humidity, wind speed, and other metrics are visible
+        on the wttr.in page and extractable from the accessibility tree.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.PAGE_ONLY
+
+    def get_page_fields(self):
+        """Fields extractable from weather page."""
+        return ["temperature", "humidity", "wind_speed", "feels_like", "precipitation_chance"]
+
     @classmethod
     def get_cache_urls(cls) -> List[str]:
         """
@@ -621,6 +635,15 @@ class CurrentWeatherTemplate(QuestionTemplate):
             url_contains=city_name if city_name else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    def get_gt_source(self):
+        """Current weather template uses PAGE_ONLY extraction."""
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.PAGE_ONLY
+
+    def get_page_fields(self):
+        """Fields extractable from weather page."""
+        return ["temperature", "humidity", "wind_speed", "feels_like"]
 
 
 class MultiDayQuestionType:
@@ -922,3 +945,12 @@ class MultiDayWeatherTemplate(QuestionTemplate):
             url_contains=city_name if city_name else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    def get_gt_source(self):
+        """Multi-day weather template uses PAGE_ONLY extraction."""
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.PAGE_ONLY
+
+    def get_page_fields(self):
+        """Fields extractable from weather page."""
+        return ["temperature_high", "temperature_low", "precipitation_chance"]

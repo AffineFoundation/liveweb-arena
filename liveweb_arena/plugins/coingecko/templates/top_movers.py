@@ -9,6 +9,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from ..api_client import CoinGeckoClient
 
 
@@ -27,6 +28,8 @@ class CoinGeckoTopMoversTemplate(QuestionTemplate):
     - Which coin is the biggest loser today on CoinGecko?
     - What is the #1 top gainer on CoinGecko right now?
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Requires sorting top 100 coins
 
     GAINER_PATTERNS = [
         "Among the top 100 cryptocurrencies by market cap, which one gained the most in the last 24 hours?",
@@ -252,3 +255,16 @@ class CoinGeckoTopMoversTemplate(QuestionTemplate):
             url_contains="gainer",  # Matches gainers-losers page
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "coingecko"
+
+    def get_gt_source(self):
+        """
+        Top movers requires sorting 100 coins by 24h change.
+        Use API_ONLY because we need aggregated market data.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.API_ONLY

@@ -351,6 +351,20 @@ class StooqPriceTemplate(QuestionTemplate):
         """Return the cache source name for this template."""
         return "stooq"
 
+    def get_gt_source(self):
+        """
+        Stooq price template uses PAGE_ONLY extraction.
+
+        All price metrics (last price, change, high, low, open) are visible
+        on the stock/index page and extractable from the accessibility tree.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.PAGE_ONLY
+
+    def get_page_fields(self):
+        """Fields extractable from Stooq page."""
+        return ["last_price", "change_percent", "change_absolute", "open", "high", "low"]
+
     @classmethod
     def get_cache_urls(cls) -> List[str]:
         """

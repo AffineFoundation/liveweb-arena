@@ -10,6 +10,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from .price import CoinVariable, CoinSpec
 from ..api_client import CoinGeckoClient
 
@@ -37,6 +38,8 @@ class CoinGeckoPerformanceTemplate(QuestionTemplate):
     - How much has Bitcoin's price changed in the last 7 days?
     - Which performed better over the last week: Ethereum or Solana?
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # 7d performance requires special API param
 
     SINGLE_PATTERNS = [
         "How much has {coin}'s price changed in the last 7 days?",
@@ -470,3 +473,8 @@ class CoinGeckoPerformanceTemplate(QuestionTemplate):
             )
 
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "coingecko"

@@ -195,8 +195,6 @@ cp .env.example .env
 | `LLM_BASE_URL` | OpenAI-compatible API base URL | `https://llm.chutes.ai/v1` |
 | `LLM_MODEL` | Default model for evaluation | `zai-org/GLM-4.7-TEE` |
 | `COINGECKO_API_KEY` | CoinGecko Pro API key (optional, higher rate limits) | - |
-| `TMDB_API_KEY` | TMDB API key (required for movie templates) | - |
-| `LIVEWEB_CACHE_DIR` | Directory for API data cache | `cache` |
 | `LIVEWEB_VERBOSE` | Enable verbose logging | `false` |
 
 ## Cache System
@@ -209,30 +207,6 @@ The cache system prevents IP blocking by caching API data for ground truth valid
 - **Web browsing is NOT cached**: Agents browse real websites (this is intentional for testing)
 - **Automatic refresh**: Cache expires after 5 minutes and refreshes on next evaluation
 - **Version locking**: Each evaluation locks cache versions for consistency
-
-### Cache Configuration
-
-```bash
-# Set custom cache directory
-export LIVEWEB_CACHE_DIR=/path/to/cache
-
-# Or in .env file
-LIVEWEB_CACHE_DIR=/path/to/cache
-```
-
-### Cached Data Sources
-
-| Source | Data | Assets |
-|--------|------|--------|
-| CoinGecko | Market data (price, 24h change, market cap) | 25 cryptocurrencies |
-| Stooq | Price data (open, high, low, close) | 20 assets (indices, stocks, commodities) |
-
-### Disable Caching
-
-```python
-# In code
-actor = Actor(use_cache=False)
-```
 
 ## Architecture
 
@@ -249,7 +223,7 @@ liveweb_arena/
 │   ├── stooq/             # Financial data plugin
 │   ├── coingecko/         # Cryptocurrency plugin
 │   ├── taostats/          # Bittensor plugin
-│   └── tmdb/              # Movie database plugin
+│   └── hybrid/            # Cross-source comparison plugin
 └── browser/               # Playwright browser control
 ```
 

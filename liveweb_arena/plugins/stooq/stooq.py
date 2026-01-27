@@ -1,161 +1,90 @@
-"""Stooq plugin for financial market data queries"""
+"""
+Stooq Plugin.
 
-import random
-from typing import Dict, List
+Plugin for financial market data from stooq.com.
+"""
 
-from liveweb_arena.plugins.base import BasePlugin, SubTask, ValidationResult
-from liveweb_arena.core.validators.base import QuestionTemplate, get_registered_templates
+import re
+from typing import Any, Dict, List
+from urllib.parse import urlparse, parse_qs
 
-# Import templates to trigger registration
-from . import templates as _  # noqa: F401
+from liveweb_arena.plugins.base import BasePlugin
+from .api_client import fetch_single_asset_data, fetch_homepage_api_data
+from liveweb_arena.utils.logger import log
 
 
 class StooqPlugin(BasePlugin):
     """
-    Plugin for querying financial market data from stooq.com.
+    Stooq plugin for financial market data.
 
-    Stooq is a financial data portal providing real-time and historical
-    prices for stocks, indices, currencies, and commodities.
+    Handles pages like:
+    - https://stooq.com/ (homepage - all assets)
+    - https://stooq.com/q/?s=aapl.us (stocks)
+    - https://stooq.com/q/?s=^spx (indices)
+    - https://stooq.com/q/?s=gc.f (commodities)
+    - https://stooq.com/q/?s=eurusd (forex)
 
-    Supported templates:
-    - stooq_price: Current price queries for individual instruments
-    - stooq_comparison: Compare multiple instruments
-    - stooq_historical: Historical data queries
-    - stooq_market_summary: Market overview and analysis questions
-
-    Ground truth is fetched from Stooq's CSV download endpoint.
+    API data includes: open, high, low, close, volume, daily_change_pct, etc.
     """
 
-    def __init__(self, templates: List[str] = None):
-        self._template_instances: Dict[str, QuestionTemplate] = {}
+    name = "stooq"
 
-        # Get stooq templates from global registry
-        registered = get_registered_templates()
-        stooq_templates = {
-            k: v for k, v in registered.items()
-            if k.startswith("stooq_")
-        }
+    allowed_domains = [
+        "stooq.com",
+        "www.stooq.com",
+    ]
 
-        template_names = templates or list(stooq_templates.keys())
-        for name in template_names:
-            if name in stooq_templates:
-                self._template_instances[name] = stooq_templates[name]()
+    def get_blocked_patterns(self) -> List[str]:
+        """Block direct CSV download to force agents to use the website."""
+        return [
+            "*/q/d/l/*",  # CSV download endpoint
+        ]
 
-    @property
-    def name(self) -> str:
-        return "stooq"
-
-    @property
-    def supported_sites(self) -> List[str]:
-        return ["stooq.com"]
-
-    @property
-    def description(self) -> str:
-        return "Query financial market data including stocks, indices, currencies, and commodities from stooq.com"
-
-    @property
-    def usage_hint(self) -> str:
-        return """## stooq.com (Finance)
-- /q/?s={symbol} - Quote: price, change, 52-week high/low
-- Indices: ^dji, ^spx, ^dax, ^hsi, ^kospi, ^nkx (use ^ prefix)
-- Stocks: aapl.us, msft.us | Forex: eurusd | Commodities: gc.f
-- /q/d/?s={symbol} - Historical data table
-"""
-
-    async def generate_task(
-        self,
-        seed: int,
-        template_name: str = None,
-        variant: int = None,
-    ) -> SubTask:
+    async def fetch_api_data(self, url: str) -> Dict[str, Any]:
         """
-        Generate a Stooq query task.
+        Fetch API data for a Stooq page.
+
+        - Homepage: Returns all assets in {"assets": {...}} format
+        - Detail page: Returns single asset data with "symbol" field
 
         Args:
-            seed: Random seed for task generation
-            template_name: Specific template to use (e.g., "stooq_price")
-            variant: Optional variant index for deterministic question type selection
+            url: Page URL
+
+        Returns:
+            API data appropriate for the page type
         """
-        rng = random.Random(seed)
+        # Check for detail page first
+        symbol = self._extract_symbol(url)
+        if symbol:
+            data = await fetch_single_asset_data(symbol)
+            return data if data else {}
 
-        if not self._template_instances:
-            raise ValueError("No templates available")
+        # Homepage - return all assets
+        if self._is_homepage(url):
+            return await fetch_homepage_api_data()
 
-        # Normalize template name: accept both "price" and "stooq_price"
-        selected_template_name = None
-        if template_name:
-            if template_name in self._template_instances:
-                selected_template_name = template_name
-            elif f"stooq_{template_name}" in self._template_instances:
-                selected_template_name = f"stooq_{template_name}"
+        return {}
 
-        if not selected_template_name:
-            selected_template_name = rng.choice(list(self._template_instances.keys()))
+    def _is_homepage(self, url: str) -> bool:
+        """Check if URL is the Stooq homepage."""
+        parsed = urlparse(url)
+        path = parsed.path.strip('/')
+        # Homepage has no path or just "/"
+        return path == '' and not parsed.query
 
-        template = self._template_instances[selected_template_name]
+    def _extract_symbol(self, url: str) -> str:
+        """
+        Extract symbol from Stooq URL.
 
-        # Generate question (pass variant for deterministic selection)
-        question = template.generate(seed, variant=variant)
+        Examples:
+            https://stooq.com/q/?s=aapl.us -> aapl.us
+            https://stooq.com/q/?s=^spx -> ^spx
+            https://stooq.com/q/d/?s=gc.f -> gc.f
+        """
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
 
-        return SubTask(
-            plugin_name=self.name,
-            intent=question.question_text,
-            validation_info={
-                "template_name": selected_template_name,
-                **question.validation_info,
-            },
-            answer_tag="",
-            expected_steps=question.expected_steps,
-        )
+        if "s" in query:
+            return query["s"][0].lower()
 
-    async def validate_answer(
-        self, answer: str, validation_info: dict
-    ) -> ValidationResult:
-        """Validate answer using the appropriate template"""
-        template_name = validation_info.get("template_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            template = list(self._template_instances.values())[0]
-
-        result = await template.validate_answer(answer, validation_info)
-
-        return ValidationResult(
-            score=result.score,
-            is_correct=result.is_correct,
-            expected=result.expected,
-            actual=result.actual,
-            details=result.details,
-        )
-
-    async def get_ground_truth(self, validation_info: dict):
-        """Get ground truth from the appropriate template"""
-        from liveweb_arena.core.ground_truth_trigger import GroundTruthResult
-
-        template_name = validation_info.get("template_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            return GroundTruthResult.fail(f"Unknown template: {template_name}")
-
-        return await template.get_ground_truth(validation_info)
-
-    def get_validation_rules(self, validation_info: dict) -> str:
-        """Get validation rules from template"""
-        template_name = validation_info.get("template_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            return ""
-
-        return template.get_validation_rules(validation_info)
-
-    def get_ground_truth_trigger(self, validation_info: dict):
-        """Get trigger from template"""
-        template_name = validation_info.get("template_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            return None
-
-        return template.get_ground_truth_trigger(validation_info)
+        return ""

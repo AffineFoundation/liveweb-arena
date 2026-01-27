@@ -1,4 +1,4 @@
-"""Taostats API client with Bittensor SDK support and caching"""
+"""Taostats API client with Bittensor SDK support"""
 
 import logging
 from typing import Any, Dict, List, Optional
@@ -7,47 +7,6 @@ logger = logging.getLogger(__name__)
 
 # Cache source name
 CACHE_SOURCE = "taostats"
-
-# Global cache context reference
-_cache_context: Optional[Any] = None
-
-
-def set_taostats_cache_context(context: Optional[Any]):
-    """Set the cache context for Taostats API calls."""
-    global _cache_context
-    _cache_context = context
-
-
-def get_taostats_cache_context() -> Optional[Any]:
-    """Get the current cache context."""
-    return _cache_context
-
-
-class TaostatsClient:
-    """
-    Centralized Taostats client using Bittensor SDK.
-
-    Uses bittensor Python SDK to fetch subnet data from the network.
-    """
-
-    @classmethod
-    def get_subnet_from_cache(cls, subnet_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Get subnet data from cache.
-
-        Args:
-            subnet_id: Subnet ID
-
-        Returns:
-            Cached subnet data or None
-        """
-        ctx = get_taostats_cache_context()
-        if ctx is not None:
-            api_data = ctx.get_api_data("taostats")
-            if api_data:
-                subnets = api_data.get("subnets", {})
-                return subnets.get(str(subnet_id))
-        return None
 
 
 # ============================================================

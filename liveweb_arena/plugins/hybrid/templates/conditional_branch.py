@@ -11,6 +11,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from ..utils import get_crypto_24h_change, get_stooq_price, get_stooq_24h_change
 
 
@@ -121,6 +122,8 @@ class HybridConditionalBranchTemplate(QuestionTemplate):
     - Learn to navigate to correct target based on condition
     - Generalize to new condition/target combinations
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Conditional logic with cross-site data
 
     # Threshold for positive/negative classification
     THRESHOLDS = [2.0, 2.5, 3.0]  # percentage points
@@ -432,3 +435,12 @@ class HybridConditionalBranchTemplate(QuestionTemplate):
         """Trigger on Stooq visit (agent should visit after checking condition)."""
         trigger = UrlPatternTrigger(domains=["stooq.com"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "hybrid"
+
+    def get_api_fields(self):
+        """All fields require API aggregation."""
+        return ["condition_value", "target_value", "branch_decision"]

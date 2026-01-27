@@ -8,6 +8,7 @@ import random
 
 if TYPE_CHECKING:
     from ..ground_truth_trigger import GroundTruthTrigger, FetchStrategy, GroundTruthResult
+    from ..gt_collector import GTSourceType
 
 
 # Global template registry
@@ -291,6 +292,42 @@ class QuestionTemplate(ABC):
         """
         return None
 
+    def get_gt_source(self) -> "GTSourceType":
+        """
+        Get GT source type for this template.
+
+        Templates declare their source via class attribute:
+            GT_SOURCE = GTSourceType.API_ONLY
+
+        Default: PAGE_ONLY (single-asset page extraction)
+        """
+        from ..gt_collector import GTSourceType
+        return getattr(self.__class__, 'GT_SOURCE', GTSourceType.PAGE_ONLY)
+
+    def get_page_fields(self) -> List[str]:
+        """
+        Return list of fields that can be extracted from page content.
+
+        Override this for HYBRID templates to specify which fields
+        come from page extraction.
+
+        Returns:
+            List of field names extractable from page
+        """
+        return []
+
+    def get_api_fields(self) -> List[str]:
+        """
+        Return list of fields that require API fetching.
+
+        Override this for HYBRID templates to specify which fields
+        come from API calls.
+
+        Returns:
+            List of field names requiring API
+        """
+        return []
+
     # === Cache Registration Methods ===
     # Templates should override these methods to define their cache requirements.
     # This allows adding new templates without modifying other files.
@@ -306,7 +343,6 @@ class QuestionTemplate(ABC):
         By default, infers source from template name prefix:
         - "coingecko_*" -> "coingecko"
         - "stooq_*" -> "stooq"
-        - "tmdb_*" -> "tmdb"
         - "taostats_*" -> "taostats"
         - "*weather*" or "location_name" etc -> "weather"
 
@@ -329,7 +365,6 @@ class QuestionTemplate(ABC):
         prefixes = {
             "coingecko_": "coingecko",
             "stooq_": "stooq",
-            "tmdb_": "tmdb",
             "taostats_": "taostats",
         }
 

@@ -10,6 +10,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from liveweb_arena.plugins.stooq.api_client import StooqClient
 
 
@@ -86,6 +87,8 @@ class StooqRankingTemplate(QuestionTemplate):
     - "Which of the major indices is closest to its 52-week high?"
     - "Among tech stocks, which has the lowest current price?"
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Multi-instrument ranking
 
     PATTERNS = {
         RankingMetric.CHANGE_PERCENT: {
@@ -424,3 +427,16 @@ The agent must:
         """
         trigger = UrlPatternTrigger(domains=["stooq.com"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.LAST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "stooq"
+
+    def get_gt_source(self):
+        """
+        Ranking requires sorting multiple instruments by various metrics.
+        Use API_ONLY for consistent ranking data.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.API_ONLY

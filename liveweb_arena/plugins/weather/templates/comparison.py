@@ -9,6 +9,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from .variables import LocationVariable, LocationSpec, LocationType
 from ..api_client import WeatherClient
 
@@ -52,6 +53,8 @@ class WeatherComparisonTemplate(QuestionTemplate):
     - Is it hotter in New York or Los Angeles today?
     - Compare the current temperature in Paris and Berlin.
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Multi-city comparison
 
     COMPARISON_PATTERNS = [
         "Which city is warmer right now, {city1} or {city2}?",
@@ -215,3 +218,9 @@ class WeatherComparisonTemplate(QuestionTemplate):
             url_contains=city2_query.replace("+", " ").split(",")[0] if city2_query else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "weather"
+

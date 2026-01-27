@@ -11,6 +11,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from ..utils import get_crypto_24h_change, get_stooq_24h_change
 
 
@@ -94,6 +95,8 @@ class HybridRankingTemplate(QuestionTemplate):
     Scoring uses ranking correlation - partial credit for partially
     correct orderings.
     """
+
+    GT_SOURCE = GTSourceType.HYBRID  # Page extraction + API fallback
 
     PATTERNS = [
         "Rank these assets by their 24-hour performance from best to worst: {assets}.",
@@ -350,3 +353,16 @@ class HybridRankingTemplate(QuestionTemplate):
         """Trigger on Stooq visit (typically visited after CoinGecko)."""
         trigger = UrlPatternTrigger(domains=["stooq.com"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    def get_page_fields(self):
+        """Fields extractable from visited pages."""
+        return ["change_24h", "daily_change_pct"]
+
+    def get_api_fields(self):
+        """Fields that may need API supplement."""
+        return ["change_24h"]
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "hybrid"

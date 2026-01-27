@@ -135,3 +135,8 @@ class PriceTemplate(QuestionTemplate):
         """TAO price: trigger when AI visits taostats.io."""
         trigger = UrlPatternTrigger(domains=["taostats.io"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "taostats"

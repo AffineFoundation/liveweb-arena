@@ -86,6 +86,8 @@ US_STOCKS = [
     StockSpec("dis.us", "Walt Disney (DIS)", "US"),
     StockSpec("nke.us", "Nike (NKE)", "US"),
     StockSpec("intc.us", "Intel (INTC)", "US"),
+    StockSpec("amd.us", "AMD (AMD)", "US"),
+    StockSpec("coin.us", "Coinbase (COIN)", "US"),
 ]
 
 # Major global indices
@@ -116,14 +118,17 @@ CURRENCIES = [
 
 # Major commodities
 COMMODITIES = [
-    CommoditySpec("gc.f", "Gold", "metals"),
-    CommoditySpec("si.f", "Silver", "metals"),
+    CommoditySpec("gc.f", "Gold Futures", "metals"),
+    CommoditySpec("si.f", "Silver Futures", "metals"),
     CommoditySpec("hg.f", "Copper", "metals"),
     CommoditySpec("cl.f", "Crude Oil (WTI)", "energy"),
     CommoditySpec("ng.f", "Natural Gas", "energy"),
     CommoditySpec("zc.f", "Corn", "agriculture"),
     CommoditySpec("zw.f", "Wheat", "agriculture"),
     CommoditySpec("zs.f", "Soybeans", "agriculture"),
+    # Spot prices (used by hybrid templates)
+    CommoditySpec("xauusd", "Gold", "metals"),
+    CommoditySpec("xagusd", "Silver", "metals"),
 ]
 
 

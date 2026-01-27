@@ -26,6 +26,8 @@ class BrowserFatalError(Exception):
 
 # Type for navigation callback: async (url: str) -> None
 NavigationCallback = Callable[[str], Any]
+# Type for step complete callback: async (step: TrajectoryStep) -> None
+StepCompleteCallback = Callable[["TrajectoryStep"], Any]
 
 # URL patterns that indicate browser/network errors (not AI's fault)
 # Note: about:blank is NOT an error - it's the initial page where AI starts
@@ -60,12 +62,14 @@ class AgentLoop:
         policy: AgentPolicy,
         max_steps: int = 30,
         on_navigation: Optional[NavigationCallback] = None,
+        on_step_complete: Optional[StepCompleteCallback] = None,
     ):
         self._session = session
         self._llm_client = llm_client
         self._policy = policy
         self._max_steps = max_steps
         self._on_navigation = on_navigation
+        self._on_step_complete = on_step_complete
 
         # Internal state for partial recovery
         self._trajectory: List[TrajectoryStep] = []
@@ -225,13 +229,21 @@ class AgentLoop:
                 self._final_answer = final_params if final_params else action.params
                 log("Agent", f"Completed: {self._final_answer}")
 
-                self._trajectory.append(TrajectoryStep(
+                step = TrajectoryStep(
                     step_num=step_num,
                     observation=current_obs,
                     thought=thought,
                     action=action,
                     action_result="Task completed",
-                ))
+                )
+                self._trajectory.append(step)
+
+                # Fire step complete callback for final step
+                if self._on_step_complete:
+                    try:
+                        await self._on_step_complete(step)
+                    except Exception as e:
+                        log("Agent", f"Step complete callback error: {e}")
                 break
             else:
                 log("Agent", f"Action: {action.action_type}")
@@ -253,13 +265,21 @@ class AgentLoop:
                 except Exception as e:
                     action_result = f"Failed: {e}"
 
-            self._trajectory.append(TrajectoryStep(
+            step = TrajectoryStep(
                 step_num=step_num,
                 observation=current_obs,
                 thought=thought,
                 action=action,
                 action_result=action_result,
-            ))
+            )
+            self._trajectory.append(step)
+
+            # Fire step complete callback for real-time GT collection
+            if self._on_step_complete:
+                try:
+                    await self._on_step_complete(step)
+                except Exception as e:
+                    log("Agent", f"Step complete callback error: {e}")
 
         # Check if max steps reached without completion
         if self._final_answer is None and effective_step >= self._max_steps:

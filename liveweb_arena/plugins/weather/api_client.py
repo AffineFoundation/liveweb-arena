@@ -7,52 +7,18 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 import httpx
 
-from liveweb_arena.utils.logger import log
+from liveweb_arena.plugins.base_client import BaseAPIClient, RateLimiter
 
 logger = logging.getLogger(__name__)
 
-# Cache source name
 CACHE_SOURCE = "weather"
 
-# Global cache context reference (set by env.py during evaluation)
-_cache_context: Optional[Any] = None
 
-
-def set_weather_cache_context(context: Optional[Any]):
-    """Set the cache context for Weather API calls."""
-    global _cache_context
-    _cache_context = context
-
-
-def get_weather_cache_context() -> Optional[Any]:
-    """Get the current cache context."""
-    return _cache_context
-
-
-class WeatherClient:
-    """
-    Centralized wttr.in API client with caching support.
-
-    Uses JSON format for structured weather data.
-    """
+class WeatherClient(BaseAPIClient):
+    """wttr.in API client with rate limiting."""
 
     API_BASE = "https://wttr.in"
-
-    # Rate limiting
-    _last_request_time: float = 0
-    _min_request_interval: float = 0.5  # seconds between requests
-    _lock = asyncio.Lock()
-
-    @classmethod
-    async def _rate_limit(cls):
-        """Apply rate limiting."""
-        async with cls._lock:
-            import time
-            now = time.time()
-            elapsed = now - cls._last_request_time
-            if elapsed < cls._min_request_interval:
-                await asyncio.sleep(cls._min_request_interval - elapsed)
-            cls._last_request_time = time.time()
+    _rate_limiter = RateLimiter(min_interval=0.5)
 
     @classmethod
     def _normalize_location(cls, location: str) -> str:
@@ -80,39 +46,6 @@ class WeatherClient:
         Returns:
             Weather JSON data or None on error
         """
-        # Try cache first
-        ctx = get_weather_cache_context()
-        if ctx is not None:
-            api_data = ctx.get_api_data("weather")
-            if api_data:
-                locations = api_data.get("locations", {})
-
-                # Try exact match first
-                location_data = locations.get(location)
-                if location_data:
-                    log("GT", f"CACHE HIT - Weather: {location}", force=True)
-                    return location_data
-
-                # Try normalized match
-                normalized = cls._normalize_location(location)
-                for cached_loc, cached_data in locations.items():
-                    if cls._normalize_location(cached_loc) == normalized:
-                        log("GT", f"CACHE HIT - Weather: {location} (normalized)", force=True)
-                        return cached_data
-
-                # Try partial match (city name without country)
-                city_part = location.split(",")[0].strip().lower()
-                for cached_loc, cached_data in locations.items():
-                    cached_city = cached_loc.split(",")[0].strip().lower()
-                    if cached_city == city_part:
-                        log("GT", f"CACHE HIT - Weather: {location} (city match)", force=True)
-                        return cached_data
-
-                # Cache mode but data not found - this is an error
-                log("GT", f"CACHE MISS - Weather: {location} not in cache ({len(locations)} locations cached)", force=True)
-                return None
-
-        # No cache context - use live API (non-cache mode)
         await cls._rate_limit()
 
         url = f"{cls.API_BASE}/{location}?format=j1"

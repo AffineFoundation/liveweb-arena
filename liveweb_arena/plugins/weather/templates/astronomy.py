@@ -405,3 +405,9 @@ class AstronomyTemplate(QuestionTemplate):
             url_contains=city_name if city_name else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "weather"
+

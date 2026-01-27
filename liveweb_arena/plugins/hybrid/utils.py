@@ -13,19 +13,19 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
-# Thread-local cache context (set during evaluation)
-_cache_context: Optional[Any] = None
+# Page extraction state (for HYBRID GT that prefers page data)
+_extraction_state: Optional[Any] = None
 
 
-def set_cache_context(context: Optional[Any]):
-    """Set the cache context for current evaluation."""
-    global _cache_context
-    _cache_context = context
+def set_extraction_state(state: Optional[Any]):
+    """Set the extraction state for GT lookups."""
+    global _extraction_state
+    _extraction_state = state
 
 
-def get_cache_context() -> Optional[Any]:
-    """Get the current cache context."""
-    return _cache_context
+def get_extraction_state() -> Optional[Any]:
+    """Get the current extraction state."""
+    return _extraction_state
 
 
 async def retry_with_backoff(
@@ -92,9 +92,14 @@ async def retry_with_backoff(
 
 async def get_crypto_24h_change(coin_id: str) -> float:
     """
-    Get 24h percentage change from CoinGecko with retry.
+    Get 24h percentage change from CoinGecko.
 
-    Uses cache if available, otherwise falls back to live API.
+    Priority order:
+    1. Page extraction state (if agent visited the page)
+    2. Collected API data from GTCollector (page-bound data)
+    3. Live API call (fallback in live mode)
+
+    This ensures GT matches what the agent sees on visited pages.
 
     Args:
         coin_id: CoinGecko coin identifier
@@ -103,23 +108,41 @@ async def get_crypto_24h_change(coin_id: str) -> float:
         24h percentage change
 
     Raises:
-        RuntimeError: If all retries fail
+        RuntimeError: If data not found (agent must visit the page)
     """
-    # Try cache first
-    ctx = get_cache_context()
-    if ctx is not None:
-        api_data = ctx.get_api_data("coingecko")
-        if api_data:
-            coins = api_data.get("coins", {})
-            coin_data = coins.get(coin_id)
-            if coin_data:
-                change = coin_data.get("price_change_percentage_24h")
-                if change is not None:
-                    logger.debug(f"Cache hit: CoinGecko {coin_id} change={change}")
-                    return change
-            logger.debug(f"Cache miss for CoinGecko {coin_id}, falling back to API")
+    # First, try page extraction (most accurate - matches what agent sees)
+    ext_state = get_extraction_state()
+    if ext_state is not None:
+        merged = ext_state.get_merged_data()
+        if coin_id in merged:
+            asset_data = merged[coin_id]
+            change = asset_data.get("change_24h")
+            if change is not None:
+                logger.debug(f"Page extraction hit: CoinGecko {coin_id} change={change}")
+                return change
 
-    # Fall back to live API with retry
+    # Second, try collected API data from GTCollector (page-bound)
+    from liveweb_arena.core.gt_collector import get_current_gt_collector
+    gt_collector = get_current_gt_collector()
+    if gt_collector is not None:
+        api_data = gt_collector.get_collected_api_data()
+        if coin_id in api_data:
+            coin_data = api_data[coin_id]
+            change = coin_data.get("price_change_percentage_24h")
+            if change is not None:
+                logger.debug(f"Collected API hit: CoinGecko {coin_id} change={change}")
+                return change
+
+        # If we have collected data but not for this asset, it's an error in cache mode
+        # But if collected data is empty, we're likely in live mode - fall through to API
+        if api_data:
+            collected = list(api_data.keys())
+            raise RuntimeError(
+                f"CoinGecko data for '{coin_id}' not found. "
+                f"Agent must visit the page. Collected: {collected[:10]}..."
+            )
+
+    # Live mode fallback - fetch from API directly
     async def fetch():
         data = await CoinGeckoClient.get_coin_market_data(coin_id)
         if data and len(data) > 0:
@@ -138,9 +161,11 @@ async def get_crypto_24h_change(coin_id: str) -> float:
 
 async def get_stooq_price(symbol: str) -> float:
     """
-    Get current price from Stooq with retry.
+    Get current price from Stooq.
 
-    Uses StooqClient which handles cache internally.
+    Priority order:
+    1. Collected API data from GTCollector (page-bound data)
+    2. Live API call (fallback in live mode)
 
     Args:
         symbol: Stooq symbol
@@ -149,8 +174,30 @@ async def get_stooq_price(symbol: str) -> float:
         Current price
 
     Raises:
-        RuntimeError: If all retries fail
+        RuntimeError: If data not found (agent must visit the page)
     """
+    # Try collected API data from GTCollector (page-bound)
+    from liveweb_arena.core.gt_collector import get_current_gt_collector
+    gt_collector = get_current_gt_collector()
+    if gt_collector is not None:
+        api_data = gt_collector.get_collected_api_data()
+        if symbol in api_data:
+            asset_data = api_data[symbol]
+            price = asset_data.get("close")
+            if price is not None:
+                logger.debug(f"Collected API hit: Stooq {symbol} price={price}")
+                return price
+
+        # If we have collected data but not for this asset, it's an error in cache mode
+        # But if collected data is empty, we're likely in live mode - fall through to API
+        if api_data:
+            collected = list(api_data.keys())
+            raise RuntimeError(
+                f"Stooq data for '{symbol}' not found. "
+                f"Agent must visit the page. Collected: {collected[:10]}..."
+            )
+
+    # Live mode fallback - fetch from API directly
     async def fetch():
         data = await StooqClient.get_price_data(symbol)
         if data:
@@ -169,9 +216,14 @@ async def get_stooq_price(symbol: str) -> float:
 
 async def get_stooq_24h_change(symbol: str) -> float:
     """
-    Get daily percentage change from Stooq with retry.
+    Get daily percentage change from Stooq.
 
-    Uses StooqClient which handles cache internally.
+    Priority order:
+    1. Page extraction state (if agent visited the page)
+    2. Collected API data from GTCollector (page-bound data)
+    3. Live API call (fallback in live mode)
+
+    This ensures GT matches what the agent sees on visited pages.
 
     Args:
         symbol: Stooq symbol
@@ -180,8 +232,46 @@ async def get_stooq_24h_change(symbol: str) -> float:
         Daily percentage change
 
     Raises:
-        RuntimeError: If all retries fail
+        RuntimeError: If data not found (agent must visit the page)
     """
+    # First, try page extraction (most accurate - matches what agent sees)
+    ext_state = get_extraction_state()
+    if ext_state is not None:
+        merged = ext_state.get_merged_data()
+        # Try symbol directly, also try lowercase
+        symbol_lower = symbol.lower()
+        for sym in [symbol, symbol_lower]:
+            if sym in merged:
+                asset_data = merged[sym]
+                change = asset_data.get("daily_change_pct")
+                if change is not None:
+                    logger.debug(f"Page extraction hit: Stooq {symbol} change={change}")
+                    return change
+
+    # Second, try collected API data from GTCollector (page-bound)
+    from liveweb_arena.core.gt_collector import get_current_gt_collector
+    gt_collector = get_current_gt_collector()
+    if gt_collector is not None:
+        api_data = gt_collector.get_collected_api_data()
+        symbol_lower = symbol.lower()
+        for sym in [symbol, symbol_lower]:
+            if sym in api_data:
+                asset_data = api_data[sym]
+                change = asset_data.get("daily_change_pct")
+                if change is not None:
+                    logger.debug(f"Collected API hit: Stooq {symbol} change={change}")
+                    return change
+
+        # If we have collected data but not for this asset, it's an error in cache mode
+        # But if collected data is empty, we're likely in live mode - fall through to API
+        if api_data:
+            collected = list(api_data.keys())
+            raise RuntimeError(
+                f"Stooq data for '{symbol}' not found. "
+                f"Agent must visit the page. Collected: {collected[:10]}..."
+            )
+
+    # Live mode fallback - fetch from API directly
     async def fetch():
         data = await StooqClient.get_price_data(symbol)
         if data:

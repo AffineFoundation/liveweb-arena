@@ -7,35 +7,16 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from liveweb_arena.utils.logger import log
+from liveweb_arena.plugins.base_client import BaseAPIClient, RateLimiter
 
 logger = logging.getLogger(__name__)
 
-# Cache source name
 CACHE_SOURCE = "coingecko"
 
-# Global cache context reference (set by env.py during evaluation)
-_cache_context: Optional[Any] = None
 
-
-def set_coingecko_cache_context(context: Optional[Any]):
-    """Set the cache context for CoinGecko API calls."""
-    global _cache_context
-    _cache_context = context
-
-
-def get_coingecko_cache_context() -> Optional[Any]:
-    """Get the current cache context."""
-    return _cache_context
-
-
-class CoinGeckoClient:
+class CoinGeckoClient(BaseAPIClient):
     """
-    Centralized CoinGecko API client.
-
-    Supports both free and Pro API:
-    - Free: https://api.coingecko.com/api/v3 (rate limited)
-    - Pro: https://pro-api.coingecko.com/api/v3 (requires API key)
+    CoinGecko API client with Pro/Free tier support.
 
     Set COINGECKO_API_KEY environment variable to use Pro API.
     """
@@ -43,10 +24,8 @@ class CoinGeckoClient:
     FREE_API_BASE = "https://api.coingecko.com/api/v3"
     PRO_API_BASE = "https://pro-api.coingecko.com/api/v3"
 
-    # Rate limiting for free tier
-    _last_request_time: float = 0
-    _min_request_interval: float = 2.0  # seconds between requests for free tier
-    _lock = asyncio.Lock()
+    # Free tier: 2s interval; Pro tier uses override in _rate_limit
+    _rate_limiter = RateLimiter(min_interval=2.0)
 
     @classmethod
     def get_api_key(cls) -> Optional[str]:
@@ -55,17 +34,13 @@ class CoinGeckoClient:
 
     @classmethod
     def get_base_url(cls) -> str:
-        """Get appropriate base URL based on API key availability."""
-        if cls.get_api_key():
-            return cls.PRO_API_BASE
-        return cls.FREE_API_BASE
+        """Get base URL based on API key availability."""
+        return cls.PRO_API_BASE if cls.get_api_key() else cls.FREE_API_BASE
 
     @classmethod
     def get_headers(cls) -> Dict[str, str]:
         """Get request headers, including API key if available."""
-        headers = {
-            "Accept": "application/json",
-        }
+        headers = {"Accept": "application/json"}
         api_key = cls.get_api_key()
         if api_key:
             headers["x-cg-pro-api-key"] = api_key
@@ -73,19 +48,11 @@ class CoinGeckoClient:
 
     @classmethod
     async def _rate_limit(cls):
-        """Apply rate limiting for free tier."""
+        """Apply rate limiting - Pro tier has minimal delay."""
         if cls.get_api_key():
-            # Pro tier has higher limits, minimal delay
             await asyncio.sleep(0.1)
-            return
-
-        async with cls._lock:
-            import time
-            now = time.time()
-            elapsed = now - cls._last_request_time
-            if elapsed < cls._min_request_interval:
-                await asyncio.sleep(cls._min_request_interval - elapsed)
-            cls._last_request_time = time.time()
+        else:
+            await cls._rate_limiter.wait()
 
     @classmethod
     async def get(
@@ -153,35 +120,6 @@ class CoinGeckoClient:
         Returns:
             List of coin market data or None
         """
-        # Try cache first
-        ctx = get_coingecko_cache_context()
-        if ctx is not None:
-            api_data = ctx.get_api_data("coingecko")
-            if api_data:
-                coins = api_data.get("coins", {})
-                # Parse requested coin IDs
-                requested_ids = [id.strip() for id in coin_ids.split(",")]
-                cached_results = []
-                all_found = True
-                for coin_id in requested_ids:
-                    coin_data = coins.get(coin_id)
-                    if coin_data:
-                        cached_results.append(coin_data)
-                    else:
-                        all_found = False
-                        break
-
-                if all_found and cached_results:
-                    log("GT", f"CACHE HIT - CoinGecko: {coin_ids}", force=True)
-                    return cached_results
-
-                # Cache mode but data not found - this is an error
-                log("GT", f"CACHE MISS - CoinGecko: {coin_ids} not in cache ({len(coins)} coins cached)", force=True)
-                return None
-            else:
-                log("GT", f"CoinGecko api_data empty - rebuild cache with --force", force=True)
-
-        # No cache context - use live API (non-cache mode)
         params = {
             "vs_currency": vs_currency,
             "ids": coin_ids,
@@ -206,30 +144,6 @@ class CoinGeckoClient:
         Returns:
             Dict of prices or None
         """
-        # Try cache first (if requesting USD prices)
-        if "usd" in vs_currencies.lower():
-            ctx = get_coingecko_cache_context()
-            if ctx is not None:
-                api_data = ctx.get_api_data("coingecko")
-                if api_data:
-                    coins = api_data.get("coins", {})
-                    requested_ids = [id.strip() for id in coin_ids.split(",")]
-                    cached_results = {}
-                    all_found = True
-                    for coin_id in requested_ids:
-                        coin_data = coins.get(coin_id)
-                        if coin_data and "current_price" in coin_data:
-                            cached_results[coin_id] = {"usd": coin_data["current_price"]}
-                        else:
-                            all_found = False
-                            break
-
-                    if all_found and cached_results:
-                        logger.debug(f"Cache hit: CoinGecko simple price for {coin_ids}")
-                        return cached_results
-                    logger.debug(f"Cache miss for CoinGecko simple price {coin_ids}")
-
-        # Fall back to live API
         params = {
             "ids": coin_ids,
             "vs_currencies": vs_currencies,
@@ -255,7 +169,7 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
         }
     }
     """
-    from .templates.variables import CoinVariable
+    from .templates.price import CoinVariable
 
     coins = [coin.coin_id for coin in CoinVariable.COINS]
     logger.info(f"Fetching CoinGecko data for {len(coins)} coins...")
@@ -306,6 +220,25 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"CoinGecko fetch failed: {e}")
         return {"_meta": {"source": CACHE_SOURCE, "coin_count": 0}, "coins": {}}
+
+
+async def fetch_homepage_api_data() -> Dict[str, Any]:
+    """
+    Fetch API data for CoinGecko homepage (all coins).
+
+    Returns homepage format:
+    {
+        "coins": {
+            "bitcoin": {<market_data>},
+            "ethereum": {<market_data>},
+            ...
+        }
+    }
+    """
+    data = await fetch_cache_api_data()
+    if data and data.get("coins"):
+        return {"coins": data["coins"]}
+    return {"coins": {}}
 
 
 async def fetch_single_coin_data(coin_id: str) -> Optional[Dict[str, Any]]:

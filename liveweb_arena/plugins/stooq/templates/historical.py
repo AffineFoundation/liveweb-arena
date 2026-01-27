@@ -11,6 +11,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from liveweb_arena.plugins.stooq.api_client import StooqClient
 from .variables import (
     StockVariable, IndexVariable, US_STOCKS, INDICES,
@@ -39,6 +40,8 @@ class StooqHistoricalTemplate(QuestionTemplate):
 
     Ground truth is calculated from Stooq CSV historical data.
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Requires historical CSV data
 
     PATTERNS = {
         HistoricalQueryType.HIGHEST_CLOSE: [
@@ -287,3 +290,8 @@ class StooqHistoricalTemplate(QuestionTemplate):
             url_contains=symbol if symbol else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "stooq"

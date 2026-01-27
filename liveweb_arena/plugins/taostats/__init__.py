@@ -26,4 +26,7 @@ bt = _safe_import_bittensor()
 
 from .taostats import TaostatsPlugin
 
+# Import templates to register them
+from . import templates
+
 __all__ = ["TaostatsPlugin", "bt"]

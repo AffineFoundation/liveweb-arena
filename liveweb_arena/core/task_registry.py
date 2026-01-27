@@ -17,6 +17,7 @@ Adding new templates:
     3. New combinations are appended, old task_ids unchanged
 """
 
+import random
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple, Any
 import hashlib
@@ -64,14 +65,6 @@ class TaskRegistry:
         35: ("coingecko", "coingecko_supply"),
         36: ("coingecko", "coingecko_ath"),
         37: ("coingecko", "coingecko_performance"),
-
-        # TMDB templates
-        43: ("tmdb", "tmdb_movie_crew"),
-        44: ("tmdb", "tmdb_person_filmography"),
-        45: ("tmdb", "tmdb_movie_collection"),
-        46: ("tmdb", "tmdb_aggregate"),
-        47: ("tmdb", "tmdb_cast_position"),
-        48: ("tmdb", "tmdb_recent_works"),
 
         # Hybrid cross-site templates
         50: ("hybrid", "hybrid_top_performer"),
@@ -214,7 +207,6 @@ class TaskRegistry:
         Returns:
             List of (plugin, template_name) for each sub-task
         """
-        import random
         rng = random.Random(variation_seed)
 
         selected = []
@@ -235,7 +227,6 @@ class TaskRegistry:
         Returns:
             A random task_id in valid range
         """
-        import random
         cls._ensure_initialized()
 
         if rng is None:

@@ -258,7 +258,16 @@ class CoinGeckoPriceTemplate(QuestionTemplate):
             if metric_type == "current_price":
                 price = coin_data.get("current_price")
                 if price is not None:
-                    return GroundTruthResult.ok(f"${price:,.2f}")
+                    # Format with appropriate decimal places for small prices
+                    if price >= 1:
+                        return GroundTruthResult.ok(f"${price:,.2f}")
+                    elif price >= 0.01:
+                        return GroundTruthResult.ok(f"${price:.4f}")
+                    elif price >= 0.0001:
+                        return GroundTruthResult.ok(f"${price:.6f}")
+                    else:
+                        # Very small prices (meme coins)
+                        return GroundTruthResult.ok(f"${price:.10f}")
 
             elif metric_type == "change_24h":
                 change = coin_data.get("price_change_percentage_24h")
@@ -477,6 +486,20 @@ class CoinGeckoPriceTemplate(QuestionTemplate):
     def get_cache_source(cls) -> str:
         """Return the cache source name for this template."""
         return "coingecko"
+
+    def get_gt_source(self):
+        """
+        CoinGecko price template uses PAGE_ONLY extraction.
+
+        Price, 24h change, and market cap are all visible on the coin's page
+        and can be extracted from the accessibility tree.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.PAGE_ONLY
+
+    def get_page_fields(self):
+        """Fields extractable from CoinGecko page."""
+        return ["current_price", "change_24h", "market_cap"]
 
     @classmethod
     def get_cache_urls(cls) -> List[str]:

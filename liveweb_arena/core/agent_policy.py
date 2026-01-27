@@ -103,7 +103,7 @@ You must respond with a single JSON object (no markdown, no extra text). The JSO
 
 - First analyze the task and decide which website to visit
 - Use the "goto" action to navigate to the appropriate URL
-- Analyze the page content to find the information you need
+- Homepage/list data may be inaccurate (no +/- signs, delayed). Always visit detail pages for precise values
 - When done with all tasks, use the "stop" action with your answers
 
 ## IMPORTANT

@@ -11,6 +11,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from liveweb_arena.plugins.stooq.api_client import StooqClient
 
 
@@ -112,6 +113,8 @@ class StooqSectorAnalysisTemplate(QuestionTemplate):
     - Compares each value against current API data (5% tolerance)
     - Scores based on: data accuracy (60%) + correct comparison (40%)
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Cross-sector multi-asset comparison
 
     STOOQ_CSV_URL = "https://stooq.com/q/d/l/"
 
@@ -506,3 +509,8 @@ The agent MUST report individual percentage changes for verification."""
             strategy=FetchStrategy.ALL,
             min_fetch_interval=60.0,
         )
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "stooq"

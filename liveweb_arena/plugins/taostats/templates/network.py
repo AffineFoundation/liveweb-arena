@@ -190,3 +190,29 @@ class NetworkTemplate(QuestionTemplate):
         """Taostats network: trigger when AI visits taostats.io."""
         trigger = UrlPatternTrigger(domains=["taostats.io"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "taostats"
+
+    def get_gt_source(self):
+        """
+        Taostats network template uses HYBRID extraction.
+
+        - subnet_count: extractable from page (list of subnets)
+        - current_block: may need API/SDK for precise value
+
+        Page extraction is preferred when available, API supplements
+        for complex queries.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.HYBRID
+
+    def get_page_fields(self):
+        """Fields extractable from Taostats page."""
+        return ["subnet_count", "current_block"]
+
+    def get_api_fields(self):
+        """Fields that may require API/SDK."""
+        return ["current_block"]

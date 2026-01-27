@@ -7,7 +7,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from .models import BrowserObservation, BrowserAction
 
 if TYPE_CHECKING:
-    from .request_interceptor import RequestInterceptor
+    from .interceptor import CacheInterceptor
 
 # Constants
 MAX_CONTENT_LENGTH = 20000  # Max content shown per view
@@ -42,7 +42,7 @@ class BrowserSession:
         self._last_url = ""
         self._blocked_patterns = []
         self._allowed_domains = None  # None means allow all
-        self._snapshot_interceptor: Optional["RequestInterceptor"] = None
+        self._cache_interceptor: Optional["CacheInterceptor"] = None
 
     async def set_allowed_domains(self, domains: list):
         """
@@ -63,8 +63,8 @@ class BrowserSession:
 
         self._allowed_domains = set(d.lower() for d in domains)
 
-        # If snapshot interceptor is set, it handles routing
-        if self._snapshot_interceptor:
+        # If cache interceptor is set, it handles routing
+        if self._cache_interceptor:
             return
 
         session = self  # Capture reference for closure
@@ -118,26 +118,25 @@ class BrowserSession:
         for pattern in patterns:
             await self._context.route(pattern, lambda route: route.abort())
 
-    async def set_snapshot_interceptor(self, interceptor: "RequestInterceptor"):
+    async def set_cache_interceptor(self, interceptor: "CacheInterceptor"):
         """
-        Set up snapshot-based request interception.
+        Set up cache-based request interception.
 
-        This replaces HAR-based caching with direct request interception
-        using the atomic snapshot cache.
+        Routes all requests through the interceptor for cache handling.
 
         Args:
-            interceptor: RequestInterceptor instance configured with a Snapshot
+            interceptor: CacheInterceptor instance
         """
-        from liveweb_arena.core.request_interceptor import RequestInterceptor
-        self._snapshot_interceptor = interceptor
+        from liveweb_arena.core.interceptor import CacheInterceptor
+        self._cache_interceptor = interceptor
 
         # Route all requests through the interceptor
         await self._context.route("**/*", interceptor.handle_route)
 
     def get_interceptor_stats(self) -> Optional[dict]:
-        """Get request interception statistics."""
-        if hasattr(self, '_snapshot_interceptor') and self._snapshot_interceptor:
-            return self._snapshot_interceptor.get_stats()
+        """Get cache interception statistics."""
+        if hasattr(self, '_cache_interceptor') and self._cache_interceptor:
+            return self._cache_interceptor.get_stats()
         return None
 
     async def goto(self, url: str, max_retries: int = 3) -> BrowserObservation:
@@ -189,7 +188,45 @@ class BrowserSession:
             elif action_type == "click":
                 selector = params.get("selector", "")
                 timeout_ms = params.get("timeout_ms", 5000)
-                await self._page.click(selector, timeout=timeout_ms)
+                clicked = False
+
+                # First try the provided selector
+                try:
+                    await self._page.click(selector, timeout=timeout_ms)
+                    clicked = True
+                except Exception as click_err:
+                    # If selector contains case-sensitive attribute match, try case-insensitive
+                    if '[href*=' in selector or '[src*=' in selector:
+                        import re
+                        # Extract attribute and value: a[href*='GOOGL.US'] -> (href, GOOGL.US)
+                        match = re.search(r"\[(\w+)\*=['\"]([^'\"]+)['\"]\]", selector, re.IGNORECASE)
+                        if match:
+                            attr_name = match.group(1).lower()
+                            attr_value = match.group(2).lower()
+                            # Use JavaScript to find element with case-insensitive match
+                            element_handle = await self._page.evaluate_handle(f"""
+                                () => {{
+                                    const elements = document.querySelectorAll('a, button, [onclick]');
+                                    for (const el of elements) {{
+                                        const attr = el.getAttribute('{attr_name}');
+                                        if (attr && attr.toLowerCase().includes('{attr_value}')) {{
+                                            return el;
+                                        }}
+                                    }}
+                                    return null;
+                                }}
+                            """)
+                            if element_handle:
+                                try:
+                                    await element_handle.as_element().click()
+                                    clicked = True
+                                except Exception:
+                                    pass
+
+                    # If still not clicked, re-raise the original error
+                    if not clicked:
+                        raise click_err
+
                 # Wait briefly for potential navigation
                 await asyncio.sleep(0.3)
 
@@ -197,11 +234,72 @@ class BrowserSession:
                 selector = params.get("selector", "")
                 text = params.get("text", "")
                 press_enter = params.get("press_enter", False)
-                await self._page.fill(selector, text)
-                if press_enter:
-                    await self._page.press(selector, "Enter")
-                    # Wait briefly for potential navigation after Enter
-                    await asyncio.sleep(0.3)
+
+                # Try provided selector first
+                element = await self._page.query_selector(selector)
+
+                # If selector doesn't match, try common fallbacks
+                if not element:
+                    fallback_selectors = [
+                        'input[type="text"]:visible',
+                        'input[type="search"]:visible',
+                        'input:not([type="hidden"]):not([type="submit"]):visible',
+                        'textarea:visible',
+                        'input[name="s"]',  # Stooq search
+                        'input[name="q"]',  # Common search name
+                        '#search',
+                        '[role="searchbox"]',
+                    ]
+                    for fallback in fallback_selectors:
+                        try:
+                            element = await self._page.query_selector(fallback)
+                            if element:
+                                selector = fallback
+                                break
+                        except Exception:
+                            continue
+
+                if element:
+                    # Click first to trigger any onfocus/onclick handlers that set up form state
+                    try:
+                        await element.click()
+                        await asyncio.sleep(0.1)
+                    except Exception:
+                        pass
+
+                    # Fix form association for inputs not properly linked to their form
+                    # (needed for cached pages where JS form setup hasn't run)
+                    try:
+                        await self._page.evaluate("""
+                            (selector) => {
+                                const input = document.querySelector(selector);
+                                if (input && !input.form) {
+                                    // Try to find and associate with nearest form
+                                    const forms = document.forms;
+                                    for (let i = 0; i < forms.length; i++) {
+                                        const form = forms[i];
+                                        if (form.id) {
+                                            input.setAttribute('form', form.id);
+                                            // Also set global form reference for Stooq-style JS
+                                            if (typeof window.cmp_f === 'string' || !window.cmp_f) {
+                                                window.cmp_f = form;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        """, selector)
+                    except Exception:
+                        pass
+
+                    await self._page.fill(selector, text)
+                    if press_enter:
+                        await self._page.press(selector, "Enter")
+                        # Wait briefly for potential navigation after Enter
+                        await asyncio.sleep(0.3)
+                else:
+                    raise Exception(f"No element found for selector '{selector}'")
 
             elif action_type == "press":
                 key = params.get("key", "Enter")
@@ -232,21 +330,149 @@ class BrowserSession:
                 name = params.get("name", "")
                 exact = params.get("exact", False)
                 locator = self._page.get_by_role(role, name=name, exact=exact)
-                await locator.click(timeout=5000)
-                # Wait briefly for potential navigation
-                await asyncio.sleep(0.3)
+                count = await locator.count()
+
+                # If no match with exact=True, try with exact=False
+                if count == 0 and exact:
+                    locator = self._page.get_by_role(role, name=name, exact=False)
+                    count = await locator.count()
+
+                # If still no match, try partial name match
+                if count == 0 and name:
+                    for keyword in name.split()[:3]:
+                        if len(keyword) > 2:
+                            partial_locator = self._page.get_by_role(role, name=keyword, exact=False)
+                            partial_count = await partial_locator.count()
+                            if partial_count > 0:
+                                locator = partial_locator.first
+                                count = 1
+                                break
+
+                if count > 0:
+                    await locator.click(timeout=5000)
+                    # Wait briefly for potential navigation
+                    await asyncio.sleep(0.3)
+                else:
+                    raise Exception(f"No element found with role='{role}' name='{name}'")
 
             elif action_type == "type_role":
                 role = params.get("role", "textbox")
                 name = params.get("name", "")
                 text = params.get("text", "")
                 press_enter = params.get("press_enter", False)
+
+                # Try exact name match first
                 locator = self._page.get_by_role(role, name=name)
-                await locator.fill(text)
-                if press_enter:
-                    await locator.press("Enter")
-                    # Wait briefly for potential navigation
-                    await asyncio.sleep(0.3)
+                count = await locator.count()
+
+                # If no match with given name, try fallbacks for textbox
+                if count == 0 and role == "textbox":
+                    # Fallback 1: Try common search input selectors
+                    search_selectors = [
+                        'input[name="s"]',   # Stooq search
+                        'input[name="q"]',   # Common search name
+                        'input[type="search"]',
+                        '#search',
+                        '[role="searchbox"]',
+                    ]
+                    for selector in search_selectors:
+                        try:
+                            el = await self._page.query_selector(selector)
+                            if el:
+                                locator = self._page.locator(selector)
+                                count = 1
+                                break
+                        except Exception:
+                            continue
+
+                    # Fallback 2: Try partial name match
+                    if count == 0 and name:
+                        for keyword in name.split()[:3]:
+                            if len(keyword) > 2:
+                                partial_locator = self._page.get_by_role(role, name=keyword)
+                                partial_count = await partial_locator.count()
+                                if partial_count > 0:
+                                    locator = partial_locator.first
+                                    count = 1
+                                    break
+
+                    # Fallback 3: Use first visible textbox
+                    if count == 0:
+                        empty_locator = self._page.get_by_role(role, name="")
+                        empty_count = await empty_locator.count()
+                        if empty_count > 0:
+                            locator = empty_locator.first
+                            count = 1
+
+                if count > 0:
+                    # Click first to trigger any onfocus/onclick handlers
+                    try:
+                        await locator.click()
+                        await asyncio.sleep(0.1)
+                    except Exception:
+                        pass
+
+                    # Fix form association for inputs not properly linked to their form
+                    # Also fix window.cmp_f for Stooq-style sites where JS expects form reference
+                    try:
+                        await self._page.evaluate("""
+                            () => {
+                                const inputs = document.querySelectorAll('input[type="text"], input[type="search"]');
+                                inputs.forEach(input => {
+                                    if (!input.form) {
+                                        const forms = document.forms;
+                                        for (let i = 0; i < forms.length; i++) {
+                                            const form = forms[i];
+                                            if (form.id) {
+                                                input.setAttribute('form', form.id);
+                                                // Also set global form reference for Stooq-style JS
+                                                if (typeof window.cmp_f === 'string' || !window.cmp_f) {
+                                                    window.cmp_f = form;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        """)
+                    except Exception:
+                        pass
+
+                    await locator.fill(text)
+                    if press_enter:
+                        original_url = self._page.url
+                        await locator.press("Enter")
+                        # Wait briefly for potential navigation
+                        await asyncio.sleep(0.5)
+
+                        # If still on same page, try calling the JS redirect directly
+                        # (handles cached pages where form handlers fail)
+                        if self._page.url == original_url and text:
+                            try:
+                                # Try calling Stooq's cmp_u function directly
+                                await self._page.evaluate(f"""
+                                    () => {{
+                                        if (typeof cmp_u === 'function') {{
+                                            cmp_u('{text}');
+                                        }} else {{
+                                            // Fallback: direct navigation for search-style inputs
+                                            const url = window.location.origin;
+                                            if (url.includes('stooq')) {{
+                                                window.location.href = url + '/q/?s=' + encodeURIComponent('{text}');
+                                            }}
+                                        }}
+                                    }}
+                                """)
+                                # Wait for URL to actually change (navigation is async)
+                                for _ in range(10):
+                                    await asyncio.sleep(0.3)
+                                    if self._page.url != original_url:
+                                        break
+                            except Exception:
+                                pass
+                else:
+                    raise Exception(f"No element found with role='{role}' name='{name}'")
 
             elif action_type == "stop":
                 # Stop action - no browser operation needed
@@ -257,8 +483,8 @@ class BrowserSession:
                 await asyncio.sleep(0.5)
 
         except Exception as e:
-            # Log error but continue - observation will show current state
-            pass
+            # Re-raise action execution errors so agent_loop can report failure
+            raise
 
         return await self._get_observation()
 

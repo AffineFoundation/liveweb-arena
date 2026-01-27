@@ -266,3 +266,17 @@ The agent must:
             url_contains=symbol if symbol else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "stooq"
+
+    def get_gt_source(self):
+        """Exchange rate is visible on the currency pair page."""
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.PAGE_ONLY
+
+    def get_page_fields(self):
+        """Fields extractable from Stooq page."""
+        return ["current_price", "change_percent"]

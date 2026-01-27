@@ -10,6 +10,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from liveweb_arena.plugins.stooq.api_client import StooqClient
 from .variables import INDICES, US_STOCKS
 
@@ -35,6 +36,8 @@ class StooqMarketSummaryTemplate(QuestionTemplate):
     - "Analyze the tech sector using AAPL, MSFT, NVDA, and GOOGL"
     - "Is the market trending up or down based on major indices?"
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Multi-instrument aggregation
 
     PATTERNS = {
         MarketSummaryType.US_INDICES: [
@@ -296,3 +299,16 @@ Key validation points:
         """Market summary: LAST for multi-page analysis."""
         trigger = UrlPatternTrigger(domains=["stooq.com"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.LAST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "stooq"
+
+    def get_gt_source(self):
+        """
+        Market summary requires aggregating multiple instruments.
+        Use API_ONLY for consistent multi-instrument data.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.API_ONLY

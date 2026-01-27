@@ -10,6 +10,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from liveweb_arena.plugins.stooq.api_client import StooqClient
 from .variables import (
     StockVariable, IndexVariable, US_STOCKS, INDICES,
@@ -38,6 +39,8 @@ class StooqComparisonTemplate(QuestionTemplate):
 
     Ground truth is fetched from Stooq CSV endpoint for all compared instruments.
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Multi-instrument comparison
 
     PATTERNS = {
         ComparisonType.HIGHER_PRICE: [
@@ -295,3 +298,16 @@ class StooqComparisonTemplate(QuestionTemplate):
         """
         trigger = UrlPatternTrigger(domains=["stooq.com"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.LAST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "stooq"
+
+    def get_gt_source(self):
+        """
+        Comparison requires fetching data for multiple instruments simultaneously.
+        Use API_ONLY for consistent comparison at the same time point.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.API_ONLY

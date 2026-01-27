@@ -1,177 +1,81 @@
-"""Weather plugin using wttr.in with extensible template framework"""
+"""
+Weather Plugin.
 
-import random
-from typing import Dict, List, Type
+Plugin for weather data from wttr.in.
+"""
 
-from liveweb_arena.plugins.base import BasePlugin, SubTask, ValidationResult
-from liveweb_arena.core.validators.base import QuestionTemplate, GeneratedQuestion, get_registered_templates
-from liveweb_arena.core.ground_truth_trigger import GroundTruthResult
+import re
+from typing import Any, Dict, List
+from urllib.parse import urlparse, unquote
 
-# Import templates to trigger registration via decorators
-from . import templates as _  # noqa: F401
+from liveweb_arena.plugins.base import BasePlugin
+from .api_client import fetch_single_location_data
 
 
 class WeatherPlugin(BasePlugin):
     """
-    Weather plugin using wttr.in.
+    Weather plugin for wttr.in data.
 
-    Templates are auto-registered via @register_template decorator:
-    - location_name: Single day, single metric queries
-    - multi_day: Multi-day aggregate or daily value queries
-    - time_of_day: Time-period specific queries (morning/afternoon/evening/night)
+    Handles pages like:
+    - https://wttr.in/London
+    - https://wttr.in/New+York
+    - https://v2.wttr.in/Tokyo
+
+    API data includes: current_condition, 3-day forecast, astronomy, etc.
     """
 
-    # Weather-specific template names
-    WEATHER_TEMPLATES = {"location_name", "current_weather", "multi_day", "time_of_day", "astronomy", "weather_comparison"}
+    name = "weather"
 
-    def __init__(self, templates: List[str] = None, use_chinese: bool = False):
-        self.use_chinese = use_chinese
-        self._template_instances: Dict[str, QuestionTemplate] = {}
+    allowed_domains = [
+        "wttr.in",
+        "v2.wttr.in",
+    ]
 
-        # Get weather templates from global registry (filter to weather-only)
-        registered = get_registered_templates()
-        weather_templates = {
-            k: v for k, v in registered.items()
-            if k in self.WEATHER_TEMPLATES
-        }
+    def get_blocked_patterns(self) -> List[str]:
+        """Block JSON API access to force agents to use the HTML website."""
+        return [
+            "*?format=j1*",
+            "*?format=json*",
+        ]
 
-        template_names = templates or list(weather_templates.keys())
-        for name in template_names:
-            if name in weather_templates:
-                cls = weather_templates[name]
-                # Some templates support use_chinese, others don't
-                try:
-                    self._template_instances[name] = cls(use_chinese=use_chinese)
-                except TypeError:
-                    self._template_instances[name] = cls()
-
-    @property
-    def name(self) -> str:
-        return "weather"
-
-    @property
-    def supported_sites(self) -> List[str]:
-        return ["wttr.in"]
-
-    @property
-    def description(self) -> str:
-        return "Query weather information for any location worldwide using wttr.in"
-
-    @property
-    def usage_hint(self) -> str:
-        return """## wttr.in (Weather)
-- URL: https://wttr.in/{city} (e.g., /London, /New+York, /~Eiffel+Tower)
-- HTML page shows current conditions + 3-day forecast with 4 time periods per day
-- Time periods: Morning (09:00), Noon (12:00), Evening (18:00), Night (21:00)
-- Temperature format: +25(28)°C means 25°C actual, 28°C feels-like
-
-**v2 format: https://v2.wttr.in/{city}**
-- Enhanced display with temperature graph, precipitation bars, moon phases
-- Shows sunrise/sunset times at the bottom: "Sunrise: 06:47:36 | Sunset: 17:01:59"
-
-**JSON API: https://wttr.in/{city}?format=j1**
-This API provides comprehensive weather data including:
-- `current_condition`: Real-time temperature, humidity, wind, pressure, UV index, visibility
-- `weather[0..2]`: 3-day forecast with daily max/min/avg temperatures
-- `weather[*].hourly`: 8 time slots per day (0,3,6,9,12,15,18,21 hours)
-- `weather[*].astronomy`: Sunrise/sunset, moonrise/moonset, moon phase
-- Hourly data includes: temperature, feels-like, dew point, wind chill, heat index,
-  wind speed/direction/gusts, precipitation, humidity, cloud cover, UV, visibility,
-  and probability forecasts (rain, snow, thunder, fog, frost, overcast, sunshine)
-"""
-
-    async def generate_task(
-        self,
-        seed: int,
-        template_name: str = None,
-        variant: int = None,
-    ) -> SubTask:
-        """Generate a weather query task using templates"""
-        rng = random.Random(seed)
-
-        # Select a template
-        if template_name and template_name in self._template_instances:
-            selected_template_name = template_name
-        else:
-            selected_template_name = rng.choice(list(self._template_instances.keys()))
-        template = self._template_instances[selected_template_name]
-
-        # Generate question using template (pass variant for deterministic selection)
-        question: GeneratedQuestion = template.generate(seed, variant=variant)
-
-        # Convert to SubTask (no start_url - Agent decides navigation)
-        return SubTask(
-            plugin_name=self.name,
-            intent=question.question_text,
-            validation_info={
-                "template_name": selected_template_name,
-                **question.validation_info,
-            },
-            answer_tag="",  # Will be set by TaskManager
-        )
-
-    async def validate_answer(
-        self,
-        answer: str,
-        validation_info: dict
-    ) -> ValidationResult:
-        """Validate answer using the appropriate template"""
-        template_name = validation_info.get("template_name", "location_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            # Fallback to first available template
-            template = list(self._template_instances.values())[0]
-
-        result = await template.validate_answer(answer, validation_info)
-
-        # Convert template ValidationResult to plugin ValidationResult
-        return ValidationResult(
-            score=result.score,
-            is_correct=result.is_correct,
-            expected=result.expected,
-            actual=result.actual,
-            details=result.details,
-        )
-
-    async def get_ground_truth(self, validation_info: dict):
-        """Get ground truth from the appropriate template"""
-        template_name = validation_info.get("template_name", "location_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            return GroundTruthResult.fail(f"Unknown template: {template_name}")
-
-        return await template.get_ground_truth(validation_info)
-
-    def get_validation_rules(self, validation_info: dict) -> str:
-        """Get validation rules from the appropriate template"""
-        template_name = validation_info.get("template_name", "location_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            template = list(self._template_instances.values())[0]
-
-        return template.get_validation_rules(validation_info)
-
-    def get_ground_truth_trigger(self, validation_info: dict):
-        """Get trigger from the appropriate template"""
-        template_name = validation_info.get("template_name", "location_name")
-        template = self._template_instances.get(template_name)
-
-        if template is None:
-            template = list(self._template_instances.values())[0]
-
-        return template.get_ground_truth_trigger(validation_info)
-
-    def register_template(self, name: str, template_class: Type[QuestionTemplate]):
+    async def fetch_api_data(self, url: str) -> Dict[str, Any]:
         """
-        Register a new question template at runtime.
+        Fetch API data for a wttr.in weather page.
 
-        For new templates, prefer using the @register_template decorator instead.
-        This method is for dynamic registration at runtime.
+        Extracts location from URL and fetches weather data.
+
+        Args:
+            url: Page URL (e.g., https://wttr.in/London)
+
+        Returns:
+            Complete weather JSON data from wttr.in
         """
-        try:
-            self._template_instances[name] = template_class(use_chinese=self.use_chinese)
-        except TypeError:
-            self._template_instances[name] = template_class()
+        location = self._extract_location(url)
+        if not location:
+            return {}
+
+        data = await fetch_single_location_data(location)
+        return data if data else {}
+
+    def _extract_location(self, url: str) -> str:
+        """
+        Extract location from wttr.in URL.
+
+        Examples:
+            https://wttr.in/London -> London
+            https://wttr.in/New+York -> New+York
+            https://v2.wttr.in/Tokyo,Japan -> Tokyo,Japan
+        """
+        parsed = urlparse(url)
+        path = parsed.path.strip("/")
+
+        if not path:
+            return ""
+
+        # Decode URL encoding
+        location = unquote(path)
+
+        # Remove format suffix if present
+        location = re.sub(r'\?.*$', '', location)
+
+        return location

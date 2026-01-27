@@ -10,6 +10,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult,
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from ..utils import get_crypto_24h_change, get_stooq_24h_change
 
 
@@ -101,6 +102,8 @@ class HybridTopPerformerTemplate(QuestionTemplate):
     SFT limitation: Can only teach "check all in order X", but optimal
     order varies. RL can learn adaptive strategies.
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Cross-site aggregation
 
     PATTERNS = [
         "Which of these assets has the highest 24-hour percentage change: {assets}?",
@@ -327,3 +330,12 @@ class HybridTopPerformerTemplate(QuestionTemplate):
             domains=["stooq.com"],
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "hybrid"
+
+    def get_api_fields(self):
+        """All fields require API aggregation."""
+        return ["top_performer", "24h_changes"]

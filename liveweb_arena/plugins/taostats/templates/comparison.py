@@ -10,6 +10,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from .variables import _fetch_active_subnet_ids, _fetch_subnet_name
 
 
@@ -38,6 +39,8 @@ class ComparisonTemplate(QuestionTemplate):
 
     Only fetches 2 subnets from SDK, so it's fast.
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Multi-subnet comparison via SDK
 
     PATTERNS: Dict[ComparisonMetric, List[str]] = {
         ComparisonMetric.PRICE: [
@@ -206,3 +209,8 @@ class ComparisonTemplate(QuestionTemplate):
         """Comparison: LAST for multi-page browsing."""
         trigger = UrlPatternTrigger(domains=["taostats.io"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.LAST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "taostats"

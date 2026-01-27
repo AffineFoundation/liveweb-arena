@@ -161,3 +161,17 @@ class CoinGeckoRankTemplate(QuestionTemplate):
             url_contains=coin_id if coin_id else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "coingecko"
+
+    def get_gt_source(self):
+        """Market cap rank is visible on the coin page."""
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.PAGE_ONLY
+
+    def get_page_fields(self):
+        """Fields extractable from CoinGecko page."""
+        return ["market_cap_rank"]

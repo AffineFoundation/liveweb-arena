@@ -9,6 +9,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from .price import CoinVariable, CoinSpec
 from ..api_client import CoinGeckoClient
 
@@ -25,6 +26,8 @@ class CoinGeckoComparisonTemplate(QuestionTemplate):
     - Is Solana's market cap larger than Cardano's?
     - Which coin has more 24h trading volume, DOGE or SHIB?
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY  # Multi-coin comparison
 
     # Comparison types
     PRICE_PATTERNS = [
@@ -242,3 +245,16 @@ class CoinGeckoComparisonTemplate(QuestionTemplate):
             url_contains=coin2_id if coin2_id else None,
         )
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.FIRST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "coingecko"
+
+    def get_gt_source(self):
+        """
+        Comparison requires fetching data for both coins simultaneously.
+        Use API_ONLY to ensure consistent comparison at the same time point.
+        """
+        from liveweb_arena.core.gt_collector import GTSourceType
+        return GTSourceType.API_ONLY

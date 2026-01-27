@@ -1,191 +1,319 @@
-"""Base plugin interface and data structures"""
+"""
+Base Plugin Interface.
+
+Defines the interface that all website plugins must implement.
+
+To create a new plugin:
+1. Create a directory under plugins/
+2. Create plugin.py implementing BasePlugin
+3. Create templates/*.py with question templates
+
+Example:
+    class CoinGeckoPlugin(BasePlugin):
+        name = "coingecko"
+        allowed_domains = ["coingecko.com", "www.coingecko.com"]
+
+        async def fetch_api_data(self, url: str) -> Dict[str, Any]:
+            # Extract coin_id from URL and fetch from CoinGecko API
+            coin_id = self._extract_coin_id(url)
+            return await CoinGeckoClient.get_coin_data(coin_id)
+"""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, TYPE_CHECKING, Union
+from typing import Any, Dict, List, Optional
 
-# Import ValidationResult from validators to avoid duplication
-from ..core.validators.base import ValidationResult
-
-if TYPE_CHECKING:
-    from ..core.ground_truth_trigger import GroundTruthResult
+from liveweb_arena.core.cache import normalize_url
 
 
 @dataclass
 class SubTask:
-    """A single sub-task within a composite task"""
+    """
+    A single sub-task within a composite task.
+
+    This is a bridge structure for backward compatibility during migration.
+    New code should use GeneratedQuestion directly.
+    """
     plugin_name: str
     intent: str
     validation_info: dict
     answer_tag: str  # "answer1"..."answer4"
-    expected_steps: int = 5  # Expected steps for this subtask
-    # Note: start_url removed - Agent should decide which URL to visit
+    expected_steps: int = 5
+    # Reference to the generated question (new architecture)
+    question: Optional[Any] = None
+
+
+@dataclass
+class ValidationResult:
+    """
+    Result of answer validation.
+
+    Kept for backward compatibility with existing code.
+    """
+    score: float
+    is_correct: bool
+    expected: Optional[str]
+    actual: Optional[str]
+    details: Optional[str] = None
 
 
 class BasePlugin(ABC):
     """
     Base class for all website plugins.
 
-    Each plugin is responsible for:
-    1. Providing description and usage hints for the Agent
-    2. generate_task(): Generate a sub-task with deterministic seed
-    3. validate_answer(): Validate answer against real-time API ground truth
+    Each plugin must define:
+    - name: Unique plugin identifier
+    - allowed_domains: List of domains the agent can visit
+    - fetch_api_data(): Method to get API data for a page URL
+
+    Optional:
+    - blocked_url_patterns: URL patterns to block (e.g., direct API access)
+    - normalize_url(): Custom URL normalization logic
     """
 
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Unique plugin name (e.g., 'weather', 'stock')"""
-        pass
+    # ===== Required class attributes =====
 
-    @property
-    @abstractmethod
-    def supported_sites(self) -> List[str]:
-        """List of supported website domains"""
-        pass
+    name: str
+    """Unique plugin name (e.g., 'coingecko', 'stooq')"""
 
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """
-        Short description of what this plugin provides.
-        Used in system prompt to help Agent understand available tools.
-        """
-        pass
+    allowed_domains: List[str]
+    """List of allowed domain names (e.g., ['coingecko.com', 'www.coingecko.com'])"""
 
-    @property
-    @abstractmethod
-    def usage_hint(self) -> str:
-        """
-        Detailed usage instructions for the Agent.
-        Should include:
-        - Website URL patterns
-        - How to navigate and find information
-        - Data format on the website
-        """
-        pass
+    # ===== Required methods =====
 
     @abstractmethod
-    async def generate_task(
-        self,
-        seed: int,
-        template_name: str = None,
-        variant: int = None,
-    ) -> SubTask:
+    async def fetch_api_data(self, url: str) -> Dict[str, Any]:
         """
-        Generate a sub-task deterministically based on seed.
+        Fetch API data for a given page URL.
+
+        This method should:
+        1. Extract the asset identifier from the URL (e.g., coin_id, stock_symbol)
+        2. Call the appropriate API to get the data
+        3. Return the complete API response (not just specific fields)
 
         Args:
-            seed: Random seed for deterministic generation
-            template_name: Optional specific template to use
-            variant: Optional variant index for deterministic question type selection.
-                     If None, random selection is used. If specified, selects a specific
-                     question variant (0-indexed).
+            url: The page URL (e.g., https://www.coingecko.com/en/coins/bitcoin)
 
         Returns:
-            SubTask with intent and validation_info
-            Note: Does NOT include start_url - Agent decides navigation
+            Complete API data dictionary for the asset
+
+        Example:
+            async def fetch_api_data(self, url: str) -> Dict[str, Any]:
+                coin_id = self._extract_coin_id(url)  # "bitcoin"
+                return await CoinGeckoClient.get_coin_market_data(coin_id)
         """
         pass
 
-    @abstractmethod
-    async def validate_answer(
-        self, answer: str, validation_info: dict
-    ) -> ValidationResult:
+    # ===== Optional methods (with default implementations) =====
+
+    def get_blocked_patterns(self) -> List[str]:
         """
-        Validate answer against real-time API ground truth.
-
-        Args:
-            answer: The answer string from the agent
-            validation_info: Parameters for validation (from SubTask)
-
-        Returns:
-            ValidationResult with score and details
-        """
-        pass
-
-    @abstractmethod
-    async def get_ground_truth(
-        self, validation_info: dict
-    ) -> Union["GroundTruthResult", Any]:
-        """
-        Get ground truth value for LLM-based validation.
-
-        Args:
-            validation_info: Parameters for fetching ground truth (from SubTask)
-
-        Returns:
-            GroundTruthResult with success/failure status, or raw value (legacy)
-        """
-        pass
-
-    def get_validation_rules(self, validation_info: dict) -> str:
-        """
-        Get task-specific validation rules for LLM validator.
-
-        Override this method to provide task-specific scoring rules.
-        These rules will be included in the LLM validation prompt.
-
-        Args:
-            validation_info: Parameters for validation (from SubTask)
-
-        Returns:
-            Task-specific validation rules as a string
-        """
-        return ""  # Default: no specific rules
-
-    def get_ground_truth_trigger(self, validation_info: dict):
-        """
-        Get trigger condition for ground truth fetching.
-
-        Override this method to delegate to template's trigger method.
-
-        Args:
-            validation_info: Parameters for the subtask
-
-        Returns:
-            TriggerConfig or None (None means fetch at end as fallback)
-        """
-        return None
-
-    @property
-    def blocked_url_patterns(self) -> List[str]:
-        """
-        URL patterns to block during evaluation.
+        Return URL patterns to block during evaluation.
 
         Use this to prevent agents from accessing APIs directly,
         forcing them to interact with the actual website.
 
         Returns:
             List of URL patterns (supports * wildcard)
-            Example: ["*api.example.com*", "*//example.com/api/*"]
+            Example: ["*api.coingecko.com*"]
         """
         return []
 
-    @property
-    def allowed_domains(self) -> List[str]:
+    def normalize_url(self, url: str) -> str:
         """
-        Domains the agent is allowed to visit for this plugin.
+        Normalize URL for cache lookup.
 
-        By default, returns supported_sites. Override to add additional
-        allowed domains (e.g., CDN domains, authentication domains).
+        Override to implement custom normalization logic.
+        Default implementation: lowercase domain, remove tracking params.
+
+        Args:
+            url: Original URL
 
         Returns:
-            List of allowed domain names (without protocol)
+            Normalized URL
         """
-        return self.supported_sites
+        return normalize_url(url)
+
+    # ===== Deprecated methods (for backward compatibility) =====
+    # These will be removed after full migration
+
+    @property
+    def supported_sites(self) -> List[str]:
+        """Deprecated: Use allowed_domains instead."""
+        return self.allowed_domains
+
+    @property
+    def description(self) -> str:
+        """Deprecated: Plugin description."""
+        return f"{self.name} plugin"
+
+    @property
+    def usage_hint(self) -> str:
+        """Deprecated: Usage hint for the agent."""
+        return f"Use {', '.join(self.allowed_domains)} to find information."
+
+    @property
+    def blocked_url_patterns(self) -> List[str]:
+        """Deprecated: Use get_blocked_patterns() instead."""
+        return self.get_blocked_patterns()
 
     @property
     def cache_sources(self) -> List[str]:
-        """
-        Cache sources required by this plugin.
+        """Deprecated: Cache sources for this plugin."""
+        return [self.name]
 
-        By default, returns [self.name] assuming 1:1 mapping between
-        plugin name and cache source. Override for plugins that:
-        - Use multiple sources (e.g., hybrid)
-        - Use no caching (e.g., taostats with live API)
+    async def generate_task(self, seed: int, template_name: str = None, variant: int = None) -> SubTask:
+        """
+        Generate a task using registered templates.
+
+        Args:
+            seed: Random seed for reproducibility
+            template_name: Specific template name (optional)
+            variant: Template variant index (optional)
 
         Returns:
-            List of cache source names
+            SubTask with question and validation info
         """
-        return [self.name]
+        from liveweb_arena.core.validators.base import get_registered_templates, get_template
+        import random
+
+        # Get templates for this plugin
+        all_templates = get_registered_templates()
+        plugin_templates = {
+            name: cls for name, cls in all_templates.items()
+            if hasattr(cls, 'get_cache_source') and cls.get_cache_source() == self.name
+        }
+
+        if not plugin_templates:
+            raise ValueError(f"No templates registered for plugin {self.name}")
+
+        # Select template
+        if template_name:
+            # Try exact name first, then with plugin prefix
+            template_cls = get_template(template_name)
+            if not template_cls:
+                # Try with plugin prefix (e.g., "rank" -> "coingecko_rank")
+                prefixed_name = f"{self.name}_{template_name}"
+                template_cls = get_template(prefixed_name)
+            if not template_cls:
+                raise ValueError(f"Template not found: {template_name}")
+        else:
+            rng = random.Random(seed)
+            template_cls = rng.choice(list(plugin_templates.values()))
+
+        # Generate question
+        template = template_cls()
+        question = template.generate(seed, variant=variant)
+
+        # Ensure template_name is in validation_info for later use
+        validation_info = dict(question.validation_info)
+        validation_info["template_name"] = question.template_name
+
+        return SubTask(
+            plugin_name=self.name,
+            intent=question.question_text,
+            validation_info=validation_info,
+            answer_tag="answer1",
+            expected_steps=question.expected_steps,
+            question=question,
+        )
+
+    async def validate_answer(self, answer: str, validation_info: dict) -> ValidationResult:
+        """Validate answer using template's validator."""
+        from liveweb_arena.core.validators.base import get_template
+
+        template_name = validation_info.get("template_name") or validation_info.get("_template_name")
+        if not template_name:
+            return ValidationResult(
+                score=0.0,
+                is_correct=False,
+                expected=None,
+                actual=answer,
+                details="No template name in validation_info",
+            )
+
+        template_cls = get_template(template_name)
+        if not template_cls:
+            return ValidationResult(
+                score=0.0,
+                is_correct=False,
+                expected=None,
+                actual=answer,
+                details=f"Template not found: {template_name}",
+            )
+
+        template = template_cls()
+        return await template.validate_answer(answer, validation_info)
+
+    async def get_ground_truth(self, validation_info: dict):
+        """Get ground truth using template's method."""
+        from liveweb_arena.core.validators.base import get_template
+
+        template_name = validation_info.get("template_name") or validation_info.get("_template_name")
+        if not template_name:
+            return None
+
+        template_cls = get_template(template_name)
+        if not template_cls:
+            return None
+
+        template = template_cls()
+        result = await template.get_ground_truth(validation_info)
+        return result.value if result and result.success else None
+
+    def get_validation_rules(self, validation_info: dict) -> str:
+        """Get validation rules from template."""
+        from liveweb_arena.core.validators.base import get_template
+
+        template_name = validation_info.get("template_name") or validation_info.get("_template_name")
+        if not template_name:
+            return ""
+
+        template_cls = get_template(template_name)
+        if not template_cls:
+            return ""
+
+        template = template_cls()
+        if hasattr(template, 'get_validation_rules'):
+            return template.get_validation_rules(validation_info)
+        return ""
+
+    def get_ground_truth_trigger(self, validation_info: dict):
+        """Get ground truth trigger configuration from template."""
+        from liveweb_arena.core.validators.base import get_template
+
+        template_name = validation_info.get("template_name") or validation_info.get("_template_name")
+        if not template_name:
+            return None
+
+        template_cls = get_template(template_name)
+        if not template_cls:
+            return None
+
+        template = template_cls()
+        if hasattr(template, 'get_ground_truth_trigger'):
+            return template.get_ground_truth_trigger(validation_info)
+        return None
+
+    def get_gt_source(self, validation_info: dict):
+        """
+        Get GT source type from template.
+
+        Returns:
+            GTSourceType enum value (PAGE_ONLY, API_ONLY, or HYBRID)
+        """
+        from liveweb_arena.core.validators.base import get_template
+        from liveweb_arena.core.gt_collector import GTSourceType
+
+        template_name = validation_info.get("template_name") or validation_info.get("_template_name")
+        if not template_name:
+            return GTSourceType.PAGE_ONLY
+
+        template_cls = get_template(template_name)
+        if not template_cls:
+            return GTSourceType.PAGE_ONLY
+
+        template = template_cls()
+        if hasattr(template, 'get_gt_source'):
+            return template.get_gt_source()
+        return GTSourceType.PAGE_ONLY

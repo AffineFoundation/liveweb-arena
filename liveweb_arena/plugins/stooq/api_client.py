@@ -8,15 +8,11 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from liveweb_arena.utils.logger import log
+from liveweb_arena.plugins.base_client import BaseAPIClient, RateLimiter
 
 logger = logging.getLogger(__name__)
 
-# Cache source name
 CACHE_SOURCE = "stooq"
-
-# Global cache context reference (set by env.py during evaluation)
-_cache_context: Optional[Any] = None
 
 # Rate limit tracking - once hit, don't retry until reset
 _rate_limited: bool = False
@@ -25,17 +21,6 @@ _rate_limited: bool = False
 class StooqRateLimitError(Exception):
     """Raised when Stooq API rate limit is exceeded."""
     pass
-
-
-def set_stooq_cache_context(context: Optional[Any]):
-    """Set the cache context for Stooq API calls."""
-    global _cache_context
-    _cache_context = context
-
-
-def get_stooq_cache_context() -> Optional[Any]:
-    """Get the current cache context."""
-    return _cache_context
 
 
 def is_stooq_rate_limited() -> bool:
@@ -49,30 +34,69 @@ def reset_stooq_rate_limit():
     _rate_limited = False
 
 
-class StooqClient:
+def _parse_stooq_csv(csv_text: str, symbol: str = "") -> Optional[Dict[str, Any]]:
     """
-    Centralized Stooq API client with caching support.
+    Parse Stooq CSV response into price data dict.
 
-    Uses CSV download endpoint for price data.
+    Args:
+        csv_text: Raw CSV text from Stooq API
+        symbol: Optional symbol to include in result
+
+    Returns:
+        Dict with price data or None if parsing fails
     """
+    # Normalize line endings
+    csv_text = csv_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = csv_text.strip().split("\n")
+
+    if len(lines) < 2:
+        return None
+
+    headers = lines[0].lower().split(",")
+    today_values = lines[-1].split(",")
+    today_data = dict(zip(headers, today_values))
+
+    def parse_float(val):
+        try:
+            return float(val) if val else None
+        except (ValueError, TypeError):
+            return None
+
+    close = parse_float(today_data.get("close"))
+    if close is None:
+        return None
+
+    # Calculate daily change from previous day
+    daily_change = None
+    daily_change_pct = None
+    if len(lines) >= 3:
+        prev_values = lines[-2].split(",")
+        prev_data = dict(zip(headers, prev_values))
+        prev_close = parse_float(prev_data.get("close"))
+        if prev_close and prev_close > 0:
+            daily_change = close - prev_close
+            daily_change_pct = (daily_change / prev_close) * 100
+
+    result = {
+        "date": today_data.get("date", ""),
+        "open": parse_float(today_data.get("open")),
+        "high": parse_float(today_data.get("high")),
+        "low": parse_float(today_data.get("low")),
+        "close": close,
+        "volume": parse_float(today_data.get("volume")) or 0,
+        "daily_change": daily_change,
+        "daily_change_pct": daily_change_pct,
+    }
+    if symbol:
+        result["symbol"] = symbol
+    return result
+
+
+class StooqClient(BaseAPIClient):
+    """Stooq CSV API client with rate limiting."""
 
     CSV_URL = "https://stooq.com/q/d/l/"
-
-    # Rate limiting
-    _last_request_time: float = 0
-    _min_request_interval: float = 0.5  # seconds between requests
-    _lock = asyncio.Lock()
-
-    @classmethod
-    async def _rate_limit(cls):
-        """Apply rate limiting."""
-        async with cls._lock:
-            import time
-            now = time.time()
-            elapsed = now - cls._last_request_time
-            if elapsed < cls._min_request_interval:
-                await asyncio.sleep(cls._min_request_interval - elapsed)
-            cls._last_request_time = time.time()
+    _rate_limiter = RateLimiter(min_interval=0.5)
 
     @classmethod
     async def get_price_data(
@@ -106,24 +130,6 @@ class StooqClient:
         """
         global _rate_limited
 
-        # Try cache first
-        ctx = get_stooq_cache_context()
-        if ctx is not None:
-            api_data = ctx.get_api_data("stooq")
-            if api_data:
-                assets = api_data.get("assets", {})
-                asset_data = assets.get(symbol)
-                if asset_data:
-                    log("GT", f"CACHE HIT - Stooq: {symbol}", force=True)
-                    return asset_data
-
-                # Cache mode but data not found - this is an error
-                log("GT", f"CACHE MISS - Stooq: {symbol} not in cache ({len(assets)} assets cached)", force=True)
-                return None
-            else:
-                log("GT", f"Stooq api_data empty - rebuild cache with --force", force=True)
-
-        # No cache context - use live API (non-cache mode)
         # If already rate limited, raise immediately
         if _rate_limited:
             raise StooqRateLimitError(
@@ -150,57 +156,12 @@ class StooqClient:
             # Check for rate limit error
             if "Exceeded the daily hits limit" in csv_text:
                 _rate_limited = True
-                logger.error(
-                    "Stooq API daily limit exceeded! No more API calls will succeed "
-                    "until the limit resets (typically at midnight UTC)."
-                )
+                logger.error("Stooq API daily limit exceeded!")
                 raise StooqRateLimitError(
                     "Stooq API daily limit exceeded. Wait for reset or use cached data."
                 )
 
-            # Normalize line endings (Windows -> Unix)
-            csv_text = csv_text.replace("\r\n", "\n").replace("\r", "\n")
-            reader = csv.DictReader(io.StringIO(csv_text))
-            rows = list(reader)
-
-            if not rows:
-                return None
-
-            latest = rows[-1]
-
-            def parse_float(val):
-                try:
-                    return float(val) if val else None
-                except (ValueError, TypeError):
-                    return None
-
-            close = parse_float(latest.get("Close"))
-            open_price = parse_float(latest.get("Open"))
-            high = parse_float(latest.get("High"))
-            low = parse_float(latest.get("Low"))
-            volume = parse_float(latest.get("Volume"))
-
-            # Calculate daily change if we have previous data
-            daily_change = None
-            daily_change_pct = None
-            if len(rows) >= 2:
-                prev = rows[-2]
-                prev_close = parse_float(prev.get("Close"))
-                if prev_close and close:
-                    daily_change = close - prev_close
-                    daily_change_pct = (daily_change / prev_close) * 100
-
-            return {
-                "symbol": symbol,
-                "date": latest.get("Date"),
-                "open": open_price,
-                "high": high,
-                "low": low,
-                "close": close,
-                "volume": volume,
-                "daily_change": daily_change,
-                "daily_change_pct": daily_change_pct,
-            }
+            return _parse_stooq_csv(csv_text, symbol)
 
         except asyncio.TimeoutError:
             logger.warning(f"Stooq timeout for {symbol}")
@@ -310,48 +271,13 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
                             return
 
                         text = await response.text()
-
-                        # Check for rate limit
                         if "Exceeded the daily hits limit" in text:
-                            logger.warning(f"Stooq rate limit exceeded for {symbol}")
                             failed += 1
                             return
 
-                        # Parse CSV
-                        lines = text.strip().split("\n")
-                        if len(lines) < 2:
-                            failed += 1
-                            return
-
-                        headers = lines[0].lower().split(",")
-
-                        # Get last row (today)
-                        today_values = lines[-1].split(",")
-                        today_data = dict(zip(headers, today_values))
-
-                        close = float(today_data.get("close", 0))
-
-                        # Calculate daily change if we have previous day data
-                        daily_change = None
-                        daily_change_pct = None
-                        if len(lines) >= 3:  # header + at least 2 data rows
-                            prev_values = lines[-2].split(",")
-                            prev_data = dict(zip(headers, prev_values))
-                            prev_close = float(prev_data.get("close", 0))
-                            if prev_close > 0:
-                                daily_change = close - prev_close
-                                daily_change_pct = (daily_change / prev_close) * 100
-
-                        result["assets"][symbol] = {
-                            "date": today_data.get("date", ""),
-                            "open": float(today_data.get("open", 0)),
-                            "high": float(today_data.get("high", 0)),
-                            "low": float(today_data.get("low", 0)),
-                            "close": close,
-                            "volume": float(today_data.get("volume", 0) or 0),
-                            "daily_change": daily_change,
-                            "daily_change_pct": daily_change_pct,
-                        }
+                        parsed = _parse_stooq_csv(text, symbol)
+                        if parsed:
+                            result["assets"][symbol] = parsed
 
             except Exception as e:
                 logger.debug(f"Failed to fetch {symbol}: {e}")
@@ -365,25 +291,31 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
     return result
 
 
+async def fetch_homepage_api_data() -> Dict[str, Any]:
+    """
+    Fetch API data for Stooq homepage (all assets).
+
+    Returns homepage format:
+    {
+        "assets": {
+            "aapl.us": {<price_data>},
+            "gc.f": {<price_data>},
+            ...
+        }
+    }
+    """
+    data = await fetch_cache_api_data()
+    if data and data.get("assets"):
+        return {"assets": data["assets"]}
+    return {"assets": {}}
+
+
 async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch price data for a single asset.
-
-    Used by page-based cache: each page caches its own asset's data.
-
-    Args:
-        symbol: Stooq symbol (e.g., "aapl.us", "gc.f")
-
-    Returns:
-        Dict with asset price data, or empty dict on error
-    """
+    """Fetch price data for a single asset."""
     global _rate_limited
 
     if _rate_limited:
-        logger.warning(f"Stooq rate limited, skipping {symbol}")
         return {}
-
-    logger.debug(f"Fetching Stooq data for {symbol}...")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -394,53 +326,14 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
                 headers={"User-Agent": "Mozilla/5.0"},
             ) as response:
                 if response.status != 200:
-                    logger.warning(f"Stooq error for {symbol}: {response.status}")
                     return {}
 
                 text = await response.text()
-
-                # Check for rate limit
                 if "Exceeded the daily hits limit" in text:
                     _rate_limited = True
-                    logger.warning(f"Stooq rate limit exceeded")
                     return {}
 
-                # Parse CSV
-                lines = text.strip().split("\n")
-                if len(lines) < 2:
-                    return {}
+                return _parse_stooq_csv(text, symbol) or {}
 
-                headers = lines[0].lower().split(",")
-
-                # Get last row (today)
-                today_values = lines[-1].split(",")
-                today_data = dict(zip(headers, today_values))
-
-                close = float(today_data.get("close", 0))
-
-                # Calculate daily change if we have previous day data
-                daily_change = None
-                daily_change_pct = None
-                if len(lines) >= 3:  # header + at least 2 data rows
-                    prev_values = lines[-2].split(",")
-                    prev_data = dict(zip(headers, prev_values))
-                    prev_close = float(prev_data.get("close", 0))
-                    if prev_close > 0:
-                        daily_change = close - prev_close
-                        daily_change_pct = (daily_change / prev_close) * 100
-
-                return {
-                    "symbol": symbol,
-                    "date": today_data.get("date", ""),
-                    "open": float(today_data.get("open", 0)),
-                    "high": float(today_data.get("high", 0)),
-                    "low": float(today_data.get("low", 0)),
-                    "close": close,
-                    "volume": float(today_data.get("volume", 0) or 0),
-                    "daily_change": daily_change,
-                    "daily_change_pct": daily_change_pct,
-                }
-
-    except Exception as e:
-        logger.debug(f"Failed to fetch {symbol}: {e}")
+    except Exception:
         return {}

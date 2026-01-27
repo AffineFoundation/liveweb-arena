@@ -10,6 +10,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
+from liveweb_arena.core.gt_collector import GTSourceType
 from .variables import _fetch_active_subnet_ids, _fetch_subnet_name
 
 
@@ -45,6 +46,8 @@ class AnalysisTemplate(QuestionTemplate):
 
     Ground truth is calculated from Bittensor SDK data.
     """
+
+    GT_SOURCE = GTSourceType.API_ONLY
 
     PATTERNS: Dict[AnalysisType, List[str]] = {
         AnalysisType.HIGHEST_PRICE_TO_STAKE: [
@@ -244,3 +247,8 @@ class AnalysisTemplate(QuestionTemplate):
         """Analysis: LAST for multi-page analysis."""
         trigger = UrlPatternTrigger(domains=["taostats.io"])
         return TriggerConfig(trigger=trigger, strategy=FetchStrategy.LAST)
+
+    @classmethod
+    def get_cache_source(cls) -> str:
+        """Return the cache source name for this template."""
+        return "taostats"
