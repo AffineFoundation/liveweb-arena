@@ -14,17 +14,22 @@ from liveweb_arena.core.gt_collector import GTSourceType, get_current_gt_collect
 
 
 class RankingMetric(Enum):
-    """Metrics for subnet ranking queries"""
+    """Metrics for subnet ranking queries - only metrics visible on list page"""
     PRICE = "price"
-    TAO_STAKED = "tao_staked"
+    # TAO_STAKED removed: not visible on subnets list page table
 
 
 class RankPosition(Enum):
-    """Ordinal positions for ranking queries (limited to top 5 for first-page visibility)"""
+    """Ordinal positions for ranking queries (all rows visible with ALL button)"""
     SECOND = (2, "2nd", "second")
     THIRD = (3, "3rd", "third")
     FOURTH = (4, "4th", "fourth")
     FIFTH = (5, "5th", "fifth")
+    SIXTH = (6, "6th", "sixth")
+    SEVENTH = (7, "7th", "seventh")
+    EIGHTH = (8, "8th", "eighth")
+    NINTH = (9, "9th", "ninth")
+    TENTH = (10, "10th", "tenth")
 
     def __init__(self, num: int, ordinal: str, word: str):
         self.num = num
@@ -42,6 +47,7 @@ class RankingTemplate(QuestionTemplate):
 
     GT_SOURCE = GTSourceType.HYBRID
 
+    # Only include metrics visible on taostats.io/subnets list page
     PATTERNS: Dict[RankingMetric, List[str]] = {
         RankingMetric.PRICE: [
             "Which subnet has the {position} highest alpha price on taostats.io?",
@@ -49,12 +55,7 @@ class RankingTemplate(QuestionTemplate):
             "Find the {position} most expensive subnet by alpha price on taostats.io.",
             "On taostats.io, which subnet has the {position} highest price?",
         ],
-        RankingMetric.TAO_STAKED: [
-            "Which subnet has the {position} most TAO staked? Check taostats.io/subnets.",
-            "What subnet ranks #{rank_num} in terms of TAO staked on taostats.io?",
-            "Find the subnet with the {position} highest TAO in value on taostats.io.",
-            "Go to taostats.io and identify the {position} largest subnet by TAO staked.",
-        ],
+        # TAO_STAKED patterns removed: column not visible on list page
     }
 
     def __init__(self):
@@ -127,12 +128,16 @@ class RankingTemplate(QuestionTemplate):
         if len(subnets_data) < target_rank:
             return GroundTruthResult.fail(f"Not enough subnets for rank {target_rank}")
 
-        # Build and sort subnet list
+        # Build and sort subnet list (exclude "Unknown" named subnets for meaningful ranking)
         subnet_list = []
         for netuid, data in subnets_data.items():
             price = float(data.get("price", 0) or 0)
             tao_in = float(data.get("tao_in", 0) or 0)
-            name = data.get("name", f"Subnet {netuid}")
+            name = data.get("name", "")
+
+            # Skip subnets without meaningful names
+            if not name or name.lower() == "unknown":
+                continue
 
             subnet_list.append({
                 "netuid": netuid,

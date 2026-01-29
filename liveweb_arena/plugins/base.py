@@ -151,6 +151,26 @@ class BasePlugin(ABC):
         """
         return True
 
+    async def setup_page_for_cache(self, page, url: str) -> None:
+        """
+        Perform page interactions before caching (e.g., click 'Show All').
+
+        Override to implement custom page setup logic. This is called after
+        initial page load but before capturing HTML and accessibility tree.
+
+        Args:
+            page: Playwright Page object
+            url: The page URL being cached
+
+        Example:
+            async def setup_page_for_cache(self, page, url: str) -> None:
+                if '/subnets' in url:
+                    # Click "ALL" to show all rows
+                    await page.click('text=ALL')
+                    await page.wait_for_timeout(1000)
+        """
+        pass
+
     # ===== Deprecated methods (for backward compatibility) =====
     # These will be removed after full migration
 

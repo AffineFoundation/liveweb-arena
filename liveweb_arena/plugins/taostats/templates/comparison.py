@@ -11,7 +11,7 @@ from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
 from liveweb_arena.core.gt_collector import GTSourceType, get_current_gt_collector
-from .variables import _fetch_top_subnet_ids, _fetch_subnet_name
+from .variables import _fetch_active_subnet_ids, _fetch_subnet_name
 
 
 class ComparisonMetric(Enum):
@@ -23,10 +23,9 @@ class ComparisonMetric(Enum):
 def _get_subnet_pairs(rng: random.Random, count: int = 2) -> List[Tuple[int, str]]:
     """Dynamically fetch subnet IDs and names for comparison.
 
-    Uses top 10 subnets by emission to ensure visibility on first page
-    (taostats.io defaults to 10 rows sorted by emission).
+    Uses all active subnets (page shows ALL rows with ALL button).
     """
-    subnet_ids = _fetch_top_subnet_ids(top_n=10)
+    subnet_ids = _fetch_active_subnet_ids()
     if len(subnet_ids) < count:
         return []
 

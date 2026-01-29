@@ -67,6 +67,16 @@ async def fetch_all_subnets() -> Dict[str, Any]:
                         "tao_in": float(pool.get("total_tao", 0) or 0),
                         "alpha_in": float(pool.get("alpha_in_pool", 0) or 0),
                         "market_cap": float(pool.get("market_cap", 0) or 0),
+                        # Price changes
+                        "price_change_1h": float(pool.get("price_change_1_hour", 0) or 0),
+                        "price_change_24h": float(pool.get("price_change_1_day", 0) or 0),
+                        "price_change_1w": float(pool.get("price_change_1_week", 0) or 0),
+                        "price_change_1m": float(pool.get("price_change_1_month", 0) or 0),
+                        # Volume
+                        "volume_24h": float(pool.get("tao_volume_24_hr", 0) or 0),
+                        # Other metrics
+                        "liquidity": float(pool.get("liquidity", 0) or 0),
+                        "rank": int(pool.get("rank", 0) or 0),
                     }
 
             # Fetch subnet data for owner info

@@ -59,7 +59,7 @@ class SubnetInfoTemplate(QuestionTemplate):
 
     def __init__(self):
         super().__init__("taostats_subnet_info")
-        # Use top 10 subnets visible on first page of list
+        # Use all subnets (page shows ALL rows)
         self.register_variable(SubnetVariable())
         # Only use metrics visible on list page (NAME, PRICE)
         # OWNER and TAO_IN require detail pages which may not be cached
@@ -99,7 +99,7 @@ class SubnetInfoTemplate(QuestionTemplate):
 
         return GeneratedQuestion(
             question_text=question_text,
-            # Use list page as start - top 10 subnets are visible there
+            # Use list page as start - ALL subnets are visible
             start_url="https://taostats.io/subnets",
             variables={"subnet": subnet, "metric": metric},
             validation_info=validation_info,

@@ -14,11 +14,9 @@ from liveweb_arena.core.gt_collector import GTSourceType
 
 
 class RankingMetric(Enum):
-    """Metrics for ranking instruments"""
+    """Metrics for ranking instruments (only metrics computable from cached data)"""
     CHANGE_PERCENT = "change_percent"  # Today's percentage change
     CURRENT_PRICE = "current_price"  # Current price
-    WEEK52_GAIN = "week52_gain"  # Gain from 52-week low (%)
-    DISTANCE_FROM_HIGH = "distance_from_high"  # Distance from 52-week high (%)
 
 
 class RankPosition(Enum):
@@ -114,33 +112,7 @@ class StooqRankingTemplate(QuestionTemplate):
                 "Which of {instruments} is the {position} cheapest?",
             ],
         },
-        RankingMetric.WEEK52_GAIN: {
-            "highest": [
-                "Among {instruments}, which has gained the {position} most from its 52-week low?",
-                "Looking at {instruments}, which has the {position} highest gain from its 52-week low?",
-                "Which of {instruments} has rallied the {position} most from its annual low?",
-            ],
-            "lowest": [
-                "Among {instruments}, which has gained the {position} least from its 52-week low?",
-                "Looking at {instruments}, which has the {position} smallest gain from its 52-week low?",
-                "Which of {instruments} is {position} closest to its annual low?",
-            ],
-        },
-        RankingMetric.DISTANCE_FROM_HIGH: {
-            "highest": [
-                "Among {instruments}, which is {position} furthest from its 52-week high?",
-                "Looking at {instruments}, which is the {position} most below its 52-week high?",
-                "Which of {instruments} has fallen the {position} most from its annual high?",
-            ],
-            "lowest": [
-                "Among {instruments}, which is {position} closest to its 52-week high?",
-                "Looking at {instruments}, which is the {position} nearest to its 52-week high?",
-                "Which of {instruments} is {position} closest to its annual high?",
-            ],
-        },
     }
-
-    STOOQ_CSV_URL = "https://stooq.com/q/d/l/"
 
     def __init__(self):
         super().__init__("stooq_ranking")
@@ -152,7 +124,7 @@ class StooqRankingTemplate(QuestionTemplate):
         Args:
             seed: Random seed for reproducible generation
             variant: Optional variant index for selecting ranking metric.
-                     0=CHANGE_PERCENT, 1=CURRENT_PRICE, 2=WEEK52_GAIN, 3=DISTANCE_FROM_HIGH
+                     0=CHANGE_PERCENT, 1=CURRENT_PRICE
         """
         rng = random.Random(seed)
 
@@ -246,8 +218,6 @@ class StooqRankingTemplate(QuestionTemplate):
         metric_desc = {
             "change_percent": "daily percentage change",
             "current_price": "current price",
-            "week52_gain": "gain from 52-week low",
-            "distance_from_high": "distance from 52-week high",
         }.get(metric, metric)
 
         return f"""Task-Specific Rules (Ranking: {position} {direction} {metric_desc}):
@@ -262,18 +232,7 @@ The agent must:
 3. Rank them correctly and identify the {position} {direction}"""
 
     async def _fetch_instrument_data(self, symbol: str, metric: str) -> GroundTruthResult:
-        """Fetch data for a single instrument from collected API data (no network fallback).
-
-        Note: Only current_price and change_percent metrics are supported.
-        week52_gain and distance_from_high require historical data not available in collected cache.
-        """
-        # Check if metric requires historical data
-        if metric in ["week52_gain", "distance_from_high"]:
-            return GroundTruthResult.fail(
-                f"Metric '{metric}' requires historical data not available in collected cache. "
-                "Only 'current_price' and 'change_percent' are supported in cache mode."
-            )
-
+        """Fetch data for a single instrument from collected API data."""
         from liveweb_arena.core.gt_collector import get_current_gt_collector
         gt_collector = get_current_gt_collector()
         if gt_collector is None:
@@ -298,8 +257,6 @@ The agent must:
             "symbol": symbol,
             "current_price": current_price,
             "change_percent": change_percent,
-            "week52_gain": None,  # Not available in collected data
-            "distance_from_high": None,  # Not available in collected data
         })
 
     def _parse_float(self, value: Any) -> Optional[float]:
@@ -311,14 +268,7 @@ The agent must:
             return None
 
     async def get_ground_truth(self, validation_info: Dict[str, Any]) -> GroundTruthResult:
-        """
-        Calculate ground truth by fetching all instruments and ranking them.
-
-        Returns GroundTruthResult with the name of the instrument at the specified ranking position.
-
-        Note: In cache mode, only 'current_price' and 'change_percent' metrics are supported.
-        Metrics requiring historical data (week52_gain, distance_from_high) will fail.
-        """
+        """Calculate ground truth by fetching all instruments and ranking them."""
         instruments = validation_info.get("instruments", [])
         metric = validation_info.get("metric", "change_percent")
         direction = validation_info.get("direction", "highest")
@@ -326,13 +276,6 @@ The agent must:
 
         if not instruments:
             return GroundTruthResult.fail("No instruments provided")
-
-        # Check if metric requires historical data
-        if metric in ["week52_gain", "distance_from_high"]:
-            return GroundTruthResult.fail(
-                f"Metric '{metric}' requires historical data not available in collected cache. "
-                "Only 'current_price' and 'change_percent' are supported in cache mode."
-            )
 
         all_data = []
         errors = []

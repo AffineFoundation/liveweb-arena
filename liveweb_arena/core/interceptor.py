@@ -367,9 +367,11 @@ class CacheInterceptor:
         parsed = urlparse(url)
         domain = parsed.netloc
         path = parsed.path
-        if len(path) > 40:
-            path = path[:37] + "..."
-        return f"{domain}{path}"
+        query = f"?{parsed.query}" if parsed.query else ""
+        display = f"{domain}{path}{query}"
+        if len(display) > 80:
+            display = display[:77] + "..."
+        return display
 
     def get_stats(self) -> dict:
         """Get interception statistics."""

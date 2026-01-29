@@ -11,7 +11,7 @@ from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, FetchStrategy, TriggerConfig, GroundTruthResult
 )
 from liveweb_arena.core.gt_collector import GTSourceType, get_current_gt_collector
-from .variables import _fetch_top_subnet_ids, _fetch_subnet_name
+from .variables import _fetch_active_subnet_ids, _fetch_subnet_name
 
 
 class AnalysisType(Enum):
@@ -26,10 +26,9 @@ class AnalysisType(Enum):
 def _get_subnet_list(rng: random.Random, count: int) -> List[Tuple[int, str]]:
     """Dynamically fetch subnet IDs and names for analysis.
 
-    Uses top 10 subnets by emission to ensure visibility on first page
-    (taostats.io defaults to 10 rows sorted by emission).
+    Uses all active subnets (page shows ALL rows with ALL button).
     """
-    subnet_ids = _fetch_top_subnet_ids(top_n=10)
+    subnet_ids = _fetch_active_subnet_ids()
     if len(subnet_ids) < count:
         count = len(subnet_ids)
 
@@ -81,7 +80,7 @@ class AnalysisTemplate(QuestionTemplate):
     def generate(self, seed: int, variant: Optional[int] = None) -> GeneratedQuestion:
         rng = random.Random(seed)
 
-        # Dynamically select 3-5 subnets from top subnets (visible on first page)
+        # Dynamically select 3-5 subnets from all active subnets
         num_subnets = rng.randint(3, 5)
         selected = _get_subnet_list(rng, num_subnets)
         if len(selected) < 2:

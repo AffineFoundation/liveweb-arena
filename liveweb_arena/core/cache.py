@@ -224,9 +224,11 @@ def url_display(url: str) -> str:
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     path = parsed.path
-    if len(path) > 40:
-        path = path[:37] + '...'
-    return f"{domain}{path}"
+    query = f"?{parsed.query}" if parsed.query else ""
+    display = f"{domain}{path}{query}"
+    if len(display) > 80:
+        display = display[:77] + '...'
+    return display
 
 
 class CacheManager:
@@ -303,7 +305,7 @@ class CacheManager:
 
             # Fetch page HTML and accessibility tree - must succeed
             try:
-                html, accessibility_tree = await self._fetch_page(url)
+                html, accessibility_tree = await self._fetch_page(url, plugin)
             except Exception as e:
                 raise CacheFatalError(
                     f"Page fetch failed (browser cannot load): {e}",
@@ -388,9 +390,13 @@ class CacheManager:
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(cached.to_dict(), f, ensure_ascii=False)
 
-    async def _fetch_page(self, url: str) -> tuple:
+    async def _fetch_page(self, url: str, plugin=None) -> tuple:
         """
         Fetch page HTML and accessibility tree using Playwright.
+
+        Args:
+            url: Page URL to fetch
+            plugin: Optional plugin for page setup (e.g., click "Show All")
 
         Returns:
             (html, accessibility_tree) tuple
@@ -416,6 +422,13 @@ class CacheManager:
                     await page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     pass
+
+                # Plugin-specific page setup (e.g., click "ALL" to show all rows)
+                if plugin and hasattr(plugin, 'setup_page_for_cache'):
+                    try:
+                        await plugin.setup_page_for_cache(page, url)
+                    except Exception as e:
+                        log("Cache", f"Page setup failed (continuing): {e}")
 
                 # Scroll to trigger lazy loading
                 for pos in [0, 500, 1000, 2000]:

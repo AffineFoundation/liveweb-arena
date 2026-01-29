@@ -132,7 +132,7 @@ class LLMClient:
 
             except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_error = e
-                log("LLM", f"Connection error, attempt {attempt + 1}/{self.MAX_RETRIES}: {type(e).__name__}")
+                log("LLM", f"Connection error, attempt {attempt + 1}/{self.MAX_RETRIES}: {e}")
                 await self._backoff(attempt)
 
             except Exception as e:
@@ -146,7 +146,7 @@ class LLMClient:
                         attempts=attempt + 1,
                     )
                 last_error = e
-                log("LLM", f"Error, attempt {attempt + 1}/{self.MAX_RETRIES}: {type(e).__name__}")
+                log("LLM", f"Error, attempt {attempt + 1}/{self.MAX_RETRIES}: {e}")
                 await self._backoff(attempt)
 
         # All retries exhausted

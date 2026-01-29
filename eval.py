@@ -102,9 +102,9 @@ async def main():
         help="Output file for results (default: eval/yyyy_mm_dd_hh_mm_ss.json)",
     )
     parser.add_argument(
-        "--verbose",
+        "--quiet",
         action="store_true",
-        help="Print verbose output",
+        help="Suppress verbose output",
     )
     parser.add_argument(
         "--templates",
@@ -143,8 +143,9 @@ async def main():
             print(f"Error: task_id must be between 1 and {max_task_id()}")
             sys.exit(1)
 
-    # Set verbose mode globally
-    set_verbose(args.verbose)
+    # Set verbose mode globally (on by default, --quiet disables)
+    verbose = not args.quiet
+    set_verbose(verbose)
 
     # Get API key
     api_key = args.api_key or os.getenv("CHUTES_API_KEY")
@@ -177,7 +178,7 @@ async def main():
         num_tasks = args.num_tasks if args.num_tasks != 1 else task_config["num_tasks"]
         templates = task_config["templates"]
 
-        if args.verbose:
+        if verbose:
             print(f"Task ID: {args.task_id}")
             print(f"  Templates: {templates}")
             print(f"  Num tasks: {num_tasks}")
@@ -187,7 +188,7 @@ async def main():
         num_tasks = args.num_tasks
         templates = parse_templates(args.templates)
 
-    if args.verbose:
+    if verbose:
         config_parts = [f"model={args.model}"]
         if args.task_id:
             config_parts.append(f"task_id={args.task_id}")
@@ -290,7 +291,7 @@ async def main():
     except Exception as e:
         import traceback
         print(f"\nError: {e}")
-        if args.verbose:
+        if verbose:
             traceback.print_exc()
         return 1
 

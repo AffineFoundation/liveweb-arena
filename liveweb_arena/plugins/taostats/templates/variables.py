@@ -15,6 +15,12 @@ class SubnetMetric(Enum):
     OWNER = "owner"
     PRICE = "price"  # Alpha token price
     TAO_IN = "tao_in"  # TAO staked
+    MARKET_CAP = "market_cap"
+    # Price changes
+    PRICE_CHANGE_1H = "price_change_1h"
+    PRICE_CHANGE_24H = "price_change_24h"
+    PRICE_CHANGE_1W = "price_change_1w"
+    PRICE_CHANGE_1M = "price_change_1m"
 
 
 @dataclass
@@ -139,22 +145,26 @@ class SubnetVariable(Variable):
     Variable for Bittensor subnet selection.
 
     Uses taostats API to get active subnets.
-    Limited to top 10 by emission to ensure data is visible on list page.
+    With ALL rows visible on the page, can sample from all subnets.
     """
 
-    def __init__(self, subnet_ids: List[int] = None, top_n: int = 10):
+    def __init__(self, subnet_ids: List[int] = None, use_all: bool = True, top_n: int = 10):
         """
         Initialize subnet variable.
 
         Args:
-            subnet_ids: Specific subnet IDs to sample from (if None, uses top N by emission)
-            top_n: Number of top subnets to use (default 10 for list page visibility)
+            subnet_ids: Specific subnet IDs to sample from (if None, uses all or top N)
+            use_all: If True, use all active subnets (default). If False, use top N.
+            top_n: Number of top subnets to use (only if use_all=False)
         """
         super().__init__("subnet", VariableType.NUMERIC)
         if subnet_ids:
             self.subnet_ids = subnet_ids
+        elif use_all:
+            # Use all active subnets (page shows ALL rows now)
+            self.subnet_ids = _fetch_active_subnet_ids()
         else:
-            # Use top N subnets that are visible on the first page of taostats.io/subnets
+            # Use top N subnets by emission
             self.subnet_ids = _fetch_top_subnet_ids(top_n)
 
     def sample(self, rng: random.Random) -> SubnetSpec:
@@ -190,6 +200,26 @@ class MetricVariable(Variable):
         SubnetMetric.TAO_IN: MetricSpec(
             SubnetMetric.TAO_IN, "TAO staked", unit="τ", is_numeric=True,
             tolerance_pct=10.0
+        ),
+        SubnetMetric.MARKET_CAP: MetricSpec(
+            SubnetMetric.MARKET_CAP, "market cap", unit="τ", is_numeric=True,
+            tolerance_pct=10.0
+        ),
+        SubnetMetric.PRICE_CHANGE_1H: MetricSpec(
+            SubnetMetric.PRICE_CHANGE_1H, "1-hour price change", unit="%", is_numeric=True,
+            tolerance_pct=20.0  # Higher tolerance for volatile metrics
+        ),
+        SubnetMetric.PRICE_CHANGE_24H: MetricSpec(
+            SubnetMetric.PRICE_CHANGE_24H, "24-hour price change", unit="%", is_numeric=True,
+            tolerance_pct=20.0
+        ),
+        SubnetMetric.PRICE_CHANGE_1W: MetricSpec(
+            SubnetMetric.PRICE_CHANGE_1W, "1-week price change", unit="%", is_numeric=True,
+            tolerance_pct=20.0
+        ),
+        SubnetMetric.PRICE_CHANGE_1M: MetricSpec(
+            SubnetMetric.PRICE_CHANGE_1M, "1-month price change", unit="%", is_numeric=True,
+            tolerance_pct=20.0
         ),
     }
 

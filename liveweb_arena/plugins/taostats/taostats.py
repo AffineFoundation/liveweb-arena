@@ -111,3 +111,30 @@ class TaostatsPlugin(BasePlugin):
             return match.group(1)
 
         return ""
+
+    async def setup_page_for_cache(self, page, url: str) -> None:
+        """
+        Setup page before caching - click "ALL" to show all subnets.
+
+        On taostats.io/subnets, the default view shows only 10-25 rows.
+        Click "ALL" to show all ~128 subnets for complete visibility.
+        """
+        if not self._is_list_page(url):
+            return
+
+        try:
+            # Click the "ALL" option in the rows selector
+            # The selector shows: 10, 25, 50, 100, ALL
+            all_button = page.locator('text="ALL"').first
+            if await all_button.is_visible(timeout=3000):
+                await all_button.click()
+                # Wait for table to update with all rows
+                await page.wait_for_timeout(2000)
+                # Wait for network to settle after loading all rows
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+        except Exception:
+            # If "ALL" button not found or click fails, continue with default view
+            pass

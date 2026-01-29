@@ -48,7 +48,6 @@ class TaskRegistry:
         11: ("stooq", "stooq_comparison"),
         12: ("stooq", "stooq_ranking"),
         13: ("stooq", "stooq_sector_analysis"),
-        14: ("stooq", "stooq_52week"),
         15: ("stooq", "stooq_currency"),
 
         # Taostats templates

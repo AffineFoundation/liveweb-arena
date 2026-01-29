@@ -45,3 +45,34 @@ Fixed question pool + fixed answers = memorizable. Models can "cheat" by recalli
 - **Easy**: Single-hop, direct URL navigation, one data point extraction
 - **Medium**: Search required, or multiple data points from same page
 - **Hard**: Multi-page navigation, cross-reference, or aggregation across multiple sources
+
+### 5. Template Validation Checklist
+
+**Testing method**: Run `eval.py` with ONE template and ONE seed, then analyze the full output against each checkpoint below. Do not batch test - analyze each case individually.
+
+When testing a template, check these in order:
+
+**Step 1: GT Calculation** - Does ground truth compute successfully?
+- ✅ PASS: GT returns a concrete value (e.g., `GT = 42`, `GT = "Bitcoin"`)
+- ❌ FAIL: GT returns error (e.g., `"data not found"`, `"API failed"`)
+- If GT fails, the template is **broken** - fix before proceeding
+
+**Step 2: GT Data Source** - Is GT using page-bound cache data?
+- ✅ PASS: GT is computed from `api_data` collected when agent visits the page
+- ❌ FAIL: GT fetches data independently (causes agent sees X, GT uses Y)
+- Check: Look for `[GT] Visit xxx → +N items` in logs, GT must use this collected data
+
+**Step 3: Data Visibility** - Can the agent see the data needed to answer?
+- ✅ PASS: Required data appears in page accessibility tree or visible content
+- ❌ FAIL: Data exists in API but not displayed on page (agent cannot see it)
+- Check: Is the data in the cached page? Does scrolling/pagination reveal it?
+
+**Step 4: Theoretical Solvability** - Can a perfect agent complete this task?
+- ✅ PASS: Clear path exists from start URL to answer
+- ❌ FAIL: Requires authentication, broken links, or impossible navigation
+
+**Validation Result Interpretation:**
+- Agent timeout/wrong answer + GT success = Agent capability issue (OK, template works)
+- GT failure = Template mechanism issue (NOT OK, must fix)
+- GT uses different data than page shows = Data binding issue (NOT OK, must fix)
+- Data not visible on page = Template design issue (NOT OK, must fix)
