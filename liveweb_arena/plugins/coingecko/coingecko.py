@@ -13,6 +13,21 @@ from .api_client import fetch_single_coin_data, fetch_homepage_api_data
 from liveweb_arena.utils.logger import log
 
 
+# URL slug to API coin ID mapping for coins where they differ
+# CoinGecko sometimes uses different identifiers in URLs vs API
+URL_SLUG_TO_COIN_ID = {
+    "polygon": "polygon-ecosystem-token",  # Polygon rebranded MATIC to POL
+    "matic-network": "polygon-ecosystem-token",
+    "avalanche": "avalanche-2",
+    "hedera": "hedera-hashgraph",
+    "lido-staked-ether": "staked-ether",
+    "render": "render-token",
+    "fetch": "fetch-ai",
+    "graph": "the-graph",
+    "injective": "injective-protocol",
+}
+
+
 class CoinGeckoPlugin(BasePlugin):
     """
     CoinGecko plugin for cryptocurrency data.
@@ -83,9 +98,11 @@ class CoinGeckoPlugin(BasePlugin):
         """
         Extract coin ID from CoinGecko URL.
 
+        Handles URL slug to API coin ID translation for coins where they differ.
+
         Examples:
             https://www.coingecko.com/en/coins/bitcoin -> bitcoin
-            https://www.coingecko.com/en/coins/ethereum -> ethereum
+            https://www.coingecko.com/en/coins/polygon -> polygon-ecosystem-token
         """
         parsed = urlparse(url)
         path = parsed.path
@@ -93,6 +110,8 @@ class CoinGeckoPlugin(BasePlugin):
         # Pattern: /en/coins/{coin_id} or /coins/{coin_id}
         match = re.search(r'/coins/([^/?#]+)', path)
         if match:
-            return match.group(1).lower()
+            url_slug = match.group(1).lower()
+            # Translate URL slug to API coin ID if mapping exists
+            return URL_SLUG_TO_COIN_ID.get(url_slug, url_slug)
 
         return ""

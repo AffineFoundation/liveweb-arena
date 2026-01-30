@@ -176,11 +176,8 @@ class GTCollector:
             elif "id" in api_data:
                 # Detail page: always overwrite (more accurate)
                 coin_id = api_data["id"]
-                change = api_data.get("price_change_percentage_24h")
                 self._collected_api_data[coin_id] = api_data
-                if change is not None:
-                    return f"{coin_id} 24h={change:+.2f}%"
-                return f"{coin_id}"
+                return coin_id
 
         elif "stooq.com" in url_lower:
             if "assets" in api_data:
@@ -196,11 +193,8 @@ class GTCollector:
             elif "symbol" in api_data:
                 # Detail page: always overwrite (more accurate)
                 symbol = api_data["symbol"]
-                change = api_data.get("daily_change_pct")
                 self._collected_api_data[symbol] = api_data
-                if change is not None:
-                    return f"{symbol} 24h={change:+.2f}%"
-                return f"{symbol}"
+                return symbol
 
         elif "wttr.in" in url_lower or "weather" in url_lower:
             # Extract location from api_data["location"], URL path, or nearest_area

@@ -532,15 +532,9 @@ class Actor:
 
         # Alternating user (environment) and assistant (agent) turns
         for step in trajectory:
-            obs_content = (
-                f"URL: {step.observation.url}\n"
-                f"Title: {step.observation.title}\n"
-                f"Page Content:\n{step.observation.accessibility_tree}"
-            )
-
             conversation.append({
                 "role": "user",
-                "content": obs_content,
+                "content": step.prompt,
                 "metadata": {
                     "type": "environment",
                     "step": step.step_num,

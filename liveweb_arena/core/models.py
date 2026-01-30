@@ -41,3 +41,4 @@ class TrajectoryStep:
     thought: Optional[str] = None
     action: Optional[BrowserAction] = None
     action_result: str = ""
+    prompt: Optional[str] = None  # Actual prompt sent to LLM

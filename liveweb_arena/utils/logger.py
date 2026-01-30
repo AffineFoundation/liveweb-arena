@@ -20,17 +20,20 @@ def is_verbose() -> bool:
     return _verbose
 
 
-def log(tag: str, message: str, force: bool = False):
+def log(tag: str, message: str = "", force: bool = False):
     """
     Print a log message if verbose mode is enabled.
 
     Args:
-        tag: Component tag (e.g., "LLM", "Agent", "Actor")
+        tag: Component tag (e.g., "LLM", "Agent", "Actor"). Empty for blank line.
         message: Log message
         force: Print even if verbose is disabled (for errors/warnings)
     """
     if _verbose or force:
-        print(f"[{tag}] {message}", file=sys.stderr, flush=True)
+        if tag:
+            print(f"[{tag}] {message}", file=sys.stderr, flush=True)
+        else:
+            print(file=sys.stderr, flush=True)
 
 
 def progress(tag: str, elapsed: float, timeout: float, extra: str = ""):

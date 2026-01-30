@@ -127,8 +127,14 @@ Title: {title}
 ### Recent Actions
 {recent_actions}
 
+**Step {current_step}/{max_steps}** ({remaining_steps} steps remaining){last_step_warning}
+
 What is your next action? Remember: output ONLY a JSON object, no markdown or extra text.
 """
+
+LAST_STEP_WARNING = """
+
+**THIS IS YOUR LAST STEP!** You MUST use the "stop" action now and provide your best answers based on the information you have gathered. Do not attempt any other action."""
 
 
 class AgentPolicy:
@@ -179,6 +185,8 @@ class AgentPolicy:
         self,
         obs: BrowserObservation,
         trajectory: List[TrajectoryStep],
+        current_step: int = 1,
+        max_steps: int = 30,
     ) -> str:
         """Build step prompt with current observation and recent history"""
         # Format recent actions WITH thoughts (so model remembers its reasoning)
@@ -199,11 +207,18 @@ class AgentPolicy:
         else:
             recent_actions = "(no actions yet)"
 
+        remaining_steps = max_steps - current_step
+        last_step_warning = LAST_STEP_WARNING if remaining_steps == 0 else ""
+
         return STEP_PROMPT_TEMPLATE.format(
             url=obs.url,
             title=obs.title,
             accessibility_tree=obs.accessibility_tree,
             recent_actions=recent_actions,
+            current_step=current_step,
+            max_steps=max_steps,
+            remaining_steps=remaining_steps,
+            last_step_warning=last_step_warning,
         )
 
     def parse_response(self, raw: str) -> Tuple[Optional[str], Optional[BrowserAction]]:

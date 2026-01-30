@@ -179,6 +179,7 @@ class AgentLoop:
             # Reset error page counter on valid page
             consecutive_error_pages = 0
             effective_step += 1
+            log("")  # Blank line between steps
             log("Agent", f"Step {effective_step}/{self._max_steps}, url={obs.url[:50]}")
 
             # Fire observation callback for real-time GT collection (before action)
@@ -191,7 +192,9 @@ class AgentLoop:
             # Pre-save observation so it's not lost if LLM call times out
             current_obs = obs
             step_num = effective_step - 1  # 0-indexed step number for trajectory
-            user_prompt = self._policy.build_step_prompt(current_obs, self._trajectory)
+            user_prompt = self._policy.build_step_prompt(
+                current_obs, self._trajectory, effective_step, self._max_steps
+            )
 
             try:
                 raw_response, usage = await self._llm_client.chat(
@@ -217,6 +220,7 @@ class AgentLoop:
                     thought=f"LLM error: {e}",
                     action=BrowserAction(action_type="wait", params={"seconds": 2}),
                     action_result="LLM call failed",
+                    prompt=user_prompt,
                 ))
 
                 if consecutive_errors >= max_consecutive:
@@ -249,6 +253,7 @@ class AgentLoop:
                     thought=thought,
                     action=action,
                     action_result="Task completed",
+                    prompt=user_prompt,
                 )
                 self._trajectory.append(step)
 
@@ -287,6 +292,7 @@ class AgentLoop:
                 thought=thought,
                 action=action,
                 action_result=action_result,
+                prompt=user_prompt,
             )
             self._trajectory.append(step)
 

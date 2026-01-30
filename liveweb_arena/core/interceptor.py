@@ -218,7 +218,6 @@ class CacheInterceptor:
 
         if page:
             self.stats.hits += 1
-            log("Intercept", f"HIT document - {self._url_display(url)}")
 
             # Store cached accessibility tree for deterministic evaluation
             if page.accessibility_tree:
