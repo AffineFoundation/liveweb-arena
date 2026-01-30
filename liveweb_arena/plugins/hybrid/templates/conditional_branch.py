@@ -31,47 +31,47 @@ class AssetSpec:
     symbol: str
 
 
-# Condition assets (volatile crypto - good for branching)
+# Condition assets - top crypto by market cap (extremely stable)
 CONDITION_ASSETS = [
     AssetSpec("bitcoin", "Bitcoin", "coingecko", ""),
     AssetSpec("ethereum", "Ethereum", "coingecko", ""),
     AssetSpec("solana", "Solana", "coingecko", ""),
     AssetSpec("dogecoin", "Dogecoin", "coingecko", ""),
     AssetSpec("cardano", "Cardano", "coingecko", ""),
+    AssetSpec("tron", "TRON", "coingecko", ""),
+    AssetSpec("ripple", "XRP", "coingecko", ""),
     AssetSpec("avalanche-2", "Avalanche", "coingecko", ""),
+    AssetSpec("chainlink", "Chainlink", "coingecko", ""),
     AssetSpec("polkadot", "Polkadot", "coingecko", ""),
-    AssetSpec("sui", "Sui", "coingecko", ""),
+    AssetSpec("litecoin", "Litecoin", "coingecko", ""),
 ]
 
-# Target assets for each branch (different domains)
+# Target assets for each branch - mega-cap stocks only ($100B+)
 POSITIVE_TARGETS = [
-    # Tech stocks - tend to correlate with crypto bull runs
+    # Tech/growth stocks
     AssetSpec("nvda.us", "NVIDIA", "stooq", "nvda.us"),
     AssetSpec("tsla.us", "Tesla", "stooq", "tsla.us"),
-    AssetSpec("amd.us", "AMD", "stooq", "amd.us"),
-    AssetSpec("coin.us", "Coinbase", "stooq", "coin.us"),
     AssetSpec("meta.us", "Meta", "stooq", "meta.us"),
     AssetSpec("amzn.us", "Amazon", "stooq", "amzn.us"),
-    AssetSpec("msft.us", "Microsoft", "stooq", "msft.us"),
+    AssetSpec("googl.us", "Google", "stooq", "googl.us"),
 ]
 
 NEGATIVE_TARGETS = [
-    # Safe havens - tend to rise when crypto falls
-    AssetSpec("xauusd", "Gold", "stooq", "xauusd"),
-    AssetSpec("xagusd", "Silver", "stooq", "xagusd"),
-    AssetSpec("tlt.us", "Treasury Bonds ETF", "stooq", "tlt.us"),
+    # Stable/defensive stocks
+    AssetSpec("msft.us", "Microsoft", "stooq", "msft.us"),
+    AssetSpec("aapl.us", "Apple", "stooq", "aapl.us"),
     AssetSpec("jpm.us", "JPMorgan", "stooq", "jpm.us"),
+    AssetSpec("v.us", "Visa", "stooq", "v.us"),
     AssetSpec("wmt.us", "Walmart", "stooq", "wmt.us"),
+    AssetSpec("ko.us", "Coca-Cola", "stooq", "ko.us"),
 ]
 
 NEUTRAL_TARGETS = [
-    # Market indices - for neutral conditions
-    AssetSpec("^spx", "S&P 500", "stooq", "^spx"),
-    AssetSpec("^dji", "Dow Jones", "stooq", "^dji"),
-    AssetSpec("^ndx", "NASDAQ 100", "stooq", "^ndx"),
-    AssetSpec("^dax", "DAX", "stooq", "^dax"),
-    AssetSpec("^ukx", "FTSE 100", "stooq", "^ukx"),
-    AssetSpec("^nkx", "Nikkei 225", "stooq", "^nkx"),
+    # Mixed stocks for neutral branch
+    AssetSpec("nvda.us", "NVIDIA", "stooq", "nvda.us"),
+    AssetSpec("msft.us", "Microsoft", "stooq", "msft.us"),
+    AssetSpec("aapl.us", "Apple", "stooq", "aapl.us"),
+    AssetSpec("xom.us", "Exxon Mobil", "stooq", "xom.us"),
 ]
 
 

@@ -24,59 +24,42 @@ class AssetSpec:
 
 
 # Asset pool - mixed crypto and traditional finance
+# ONLY include assets that appear on the homepage data (top 10-20)
+# Only include highly stable assets that will exist for years
+# Criteria: Top 15 market cap coins, $100B+ market cap stocks
 CRYPTO_ASSETS = [
-    # Major cryptocurrencies (all cached in CoinGecko adapter)
+    # Top 10 by market cap - extremely stable, will exist for years
     AssetSpec("bitcoin", "Bitcoin", "coingecko", ""),
     AssetSpec("ethereum", "Ethereum", "coingecko", ""),
-    AssetSpec("solana", "Solana", "coingecko", ""),
-    AssetSpec("ripple", "XRP", "coingecko", ""),
-    AssetSpec("cardano", "Cardano", "coingecko", ""),
-    AssetSpec("dogecoin", "Dogecoin", "coingecko", ""),
-    AssetSpec("avalanche-2", "Avalanche", "coingecko", ""),
-    AssetSpec("polkadot", "Polkadot", "coingecko", ""),
-    AssetSpec("chainlink", "Chainlink", "coingecko", ""),
-    AssetSpec("litecoin", "Litecoin", "coingecko", ""),
-    AssetSpec("uniswap", "Uniswap", "coingecko", ""),
-    AssetSpec("stellar", "Stellar", "coingecko", ""),
-    AssetSpec("cosmos", "Cosmos", "coingecko", ""),
-    AssetSpec("near", "NEAR", "coingecko", ""),
-    AssetSpec("aptos", "Aptos", "coingecko", ""),
-    AssetSpec("sui", "Sui", "coingecko", ""),
-    AssetSpec("bittensor", "TAO", "coingecko", ""),
-    # Additional cached coins
     AssetSpec("tether", "Tether", "coingecko", ""),
     AssetSpec("binancecoin", "BNB", "coingecko", ""),
+    AssetSpec("ripple", "XRP", "coingecko", ""),
+    AssetSpec("solana", "Solana", "coingecko", ""),
+    AssetSpec("dogecoin", "Dogecoin", "coingecko", ""),
+    AssetSpec("cardano", "Cardano", "coingecko", ""),
     AssetSpec("tron", "TRON", "coingecko", ""),
-    AssetSpec("bitcoin-cash", "Bitcoin Cash", "coingecko", ""),
-    AssetSpec("internet-computer", "Internet Computer", "coingecko", ""),
-    AssetSpec("filecoin", "Filecoin", "coingecko", ""),
-    AssetSpec("hedera", "Hedera", "coingecko", ""),
+    # Top 11-15 - established projects
+    AssetSpec("avalanche-2", "Avalanche", "coingecko", ""),
+    AssetSpec("chainlink", "Chainlink", "coingecko", ""),
+    AssetSpec("polkadot", "Polkadot", "coingecko", ""),
+    AssetSpec("litecoin", "Litecoin", "coingecko", ""),
+    AssetSpec("uniswap", "Uniswap", "coingecko", ""),
 ]
 
 TRADITIONAL_ASSETS = [
-    # Commodities (using forex-style symbols that work on Stooq)
-    AssetSpec("xauusd", "Gold", "stooq", "xauusd"),
-    AssetSpec("xagusd", "Silver", "stooq", "xagusd"),
-    # Indices
-    AssetSpec("^spx", "S&P 500", "stooq", "^spx"),
-    AssetSpec("^dji", "Dow Jones", "stooq", "^dji"),
-    AssetSpec("^ndx", "NASDAQ 100", "stooq", "^ndx"),
-    AssetSpec("^dax", "DAX", "stooq", "^dax"),
-    AssetSpec("^ukx", "FTSE 100", "stooq", "^ukx"),
-    AssetSpec("^nkx", "Nikkei 225", "stooq", "^nkx"),
-    # US Stocks (all cached)
+    # Mega-cap stocks ($100B+) - extremely stable, unlikely to delist
     AssetSpec("aapl.us", "Apple", "stooq", "aapl.us"),
     AssetSpec("msft.us", "Microsoft", "stooq", "msft.us"),
-    AssetSpec("nvda.us", "NVIDIA", "stooq", "nvda.us"),
-    AssetSpec("tsla.us", "Tesla", "stooq", "tsla.us"),
     AssetSpec("googl.us", "Google", "stooq", "googl.us"),
     AssetSpec("amzn.us", "Amazon", "stooq", "amzn.us"),
+    AssetSpec("nvda.us", "NVIDIA", "stooq", "nvda.us"),
     AssetSpec("meta.us", "Meta", "stooq", "meta.us"),
+    AssetSpec("tsla.us", "Tesla", "stooq", "tsla.us"),
     AssetSpec("jpm.us", "JPMorgan", "stooq", "jpm.us"),
     AssetSpec("v.us", "Visa", "stooq", "v.us"),
     AssetSpec("wmt.us", "Walmart", "stooq", "wmt.us"),
-    AssetSpec("amd.us", "AMD", "stooq", "amd.us"),
-    AssetSpec("coin.us", "Coinbase", "stooq", "coin.us"),
+    AssetSpec("xom.us", "Exxon Mobil", "stooq", "xom.us"),
+    AssetSpec("ko.us", "Coca-Cola", "stooq", "ko.us"),
 ]
 
 

@@ -63,10 +63,11 @@ class CoinGeckoSupplyTemplate(QuestionTemplate):
         "{coin}: what fraction of max supply is circulating?",
     ]
 
-    # Coins with known max supply (good for percentage questions)
+    # Coins with verified max supply caps (for max_supply and percentage questions)
+    # Bitcoin: 21M, Cardano: 45B, Ripple: 100B, Litecoin: 84M
+    # Avoided: Polkadot, Avalanche, Stellar, Chainlink, Uniswap (inflationary or no cap)
     COINS_WITH_MAX_SUPPLY = [
-        "bitcoin", "cardano", "ripple", "litecoin", "stellar",
-        "chainlink", "uniswap", "avalanche-2", "polkadot",
+        "bitcoin", "cardano", "ripple", "litecoin",
     ]
 
     def __init__(self):

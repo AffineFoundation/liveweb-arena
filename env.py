@@ -322,9 +322,19 @@ class Actor:
                 on_observation=on_observation,
             )
 
-            # Track failure reasons
+            # Failure tracking:
+            #   failure_reason: what happened (always set on failure, goes into extra)
+            #   error_message: set = evaluation is INVALID (mechanism issue, not agent capability)
+            #     Valid failures (no error_message): max_steps_reached
+            #     Invalid failures (error_message set): llm_error, browser_error, cache_error, agent_timeout, gt_failure
             failure_reason = None
-            fatal_error_message = None
+            error_message = None
+
+            _FATAL_ERROR_MAP = {
+                LLMFatalError: "llm_error",
+                BrowserFatalError: "browser_error",
+                CacheFatalError: "cache_error",
+            }
 
             try:
                 trajectory, final_answer, usage = await asyncio.wait_for(
@@ -336,28 +346,15 @@ class Actor:
                     log("Actor", "Max steps reached without completion - marking as failed", force=True)
             except asyncio.TimeoutError:
                 failure_reason = "agent_timeout"
-                log("Actor", f"Agent timeout after {timeout}s", force=True)
-                trajectory = agent_loop.get_trajectory()
-                final_answer = agent_loop.get_final_answer()
-                usage = agent_loop.get_usage()
-            except LLMFatalError as e:
-                failure_reason = "llm_error"
-                fatal_error_message = str(e)
-                log("Actor", f"LLM fatal error: {e}", force=True)
-                trajectory = agent_loop.get_trajectory()
-                final_answer = agent_loop.get_final_answer()
-                usage = agent_loop.get_usage()
-            except BrowserFatalError as e:
-                failure_reason = "browser_error"
-                fatal_error_message = str(e)
-                log("Actor", f"Browser fatal error: {e}", force=True)
-                trajectory = agent_loop.get_trajectory()
-                final_answer = agent_loop.get_final_answer()
-                usage = agent_loop.get_usage()
-            except CacheFatalError as e:
-                failure_reason = "cache_error"
-                fatal_error_message = str(e)
-                log("Actor", f"Cache fatal error (page not loadable): {e}", force=True)
+                error_message = f"Agent timeout after {timeout}s"
+                log("Actor", error_message, force=True)
+            except (LLMFatalError, BrowserFatalError, CacheFatalError) as e:
+                failure_reason = _FATAL_ERROR_MAP[type(e)]
+                error_message = f"{failure_reason}: {e}"
+                log("Actor", f"Fatal error - {error_message}", force=True)
+
+            # Exception path: recover partial state from agent loop
+            if failure_reason and failure_reason != "max_steps_reached":
                 trajectory = agent_loop.get_trajectory()
                 final_answer = agent_loop.get_final_answer()
                 usage = agent_loop.get_usage()
@@ -481,8 +478,15 @@ class Actor:
                 },
             }
 
-            if fatal_error_message:
-                result["error"] = fatal_error_message
+            # GT failure is also a mechanism issue — set error if not already set
+            if not error_message and gt_extraction_failures:
+                failure_details = "; ".join(
+                    f"[{tag}] {reason}" for tag, reason in gt_extraction_failures.items()
+                )
+                error_message = f"GT extraction failed: {failure_details}"
+
+            if error_message:
+                result["error"] = error_message
 
             return result
 
