@@ -43,7 +43,8 @@ def _parse_stooq_csv(csv_text: str, symbol: str = "") -> Optional[Dict[str, Any]
         symbol: Optional symbol to include in result
 
     Returns:
-        Dict with price data or None if parsing fails
+        Dict with price data or None if parsing fails.
+        Includes 'history' field with recent daily data for historical queries.
     """
     # Normalize line endings
     csv_text = csv_text.replace("\r\n", "\n").replace("\r", "\n")
@@ -89,6 +90,26 @@ def _parse_stooq_csv(csv_text: str, symbol: str = "") -> Optional[Dict[str, Any]
     }
     if symbol:
         result["symbol"] = symbol
+
+    # Parse historical data (last 30 days for historical queries)
+    history = []
+    data_lines = lines[1:]  # Skip header
+    for line in data_lines[-30:]:  # Last 30 days
+        values = line.split(",")
+        if len(values) >= len(headers):
+            row_data = dict(zip(headers, values))
+            row_close = parse_float(row_data.get("close"))
+            if row_close is not None:
+                history.append({
+                    "date": row_data.get("date", ""),
+                    "open": parse_float(row_data.get("open")),
+                    "high": parse_float(row_data.get("high")),
+                    "low": parse_float(row_data.get("low")),
+                    "close": row_close,
+                    "volume": parse_float(row_data.get("volume")) or 0,
+                })
+    result["history"] = history
+
     return result
 
 

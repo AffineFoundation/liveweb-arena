@@ -159,8 +159,8 @@ class StooqHistoricalTemplate(QuestionTemplate):
         """
         Calculate ground truth from collected API data.
 
-        Note: Historical queries require multi-day data which is not available in the standard
-        collected cache that only stores current day data. This template only works in live mode.
+        Uses the 'history' field from collected Stooq data which contains
+        the last 30 days of price data.
         """
         symbol = validation_info.get("symbol", "")
         query_type = validation_info.get("query_type", "highest_close")
@@ -169,12 +169,52 @@ class StooqHistoricalTemplate(QuestionTemplate):
         if not symbol:
             return GroundTruthResult.fail("No symbol provided")
 
-        return GroundTruthResult.fail(
-            f"Historical query '{query_type}' for '{symbol}' over {num_days} days "
-            "requires multi-day historical data. "
-            "This data is not available in collected cache which only stores current day data. "
-            "Historical templates are only supported in live mode."
-        )
+        # Get collected data from GT collector
+        from liveweb_arena.core.gt_collector import get_current_gt_collector
+        gt_collector = get_current_gt_collector()
+        if not gt_collector:
+            return GroundTruthResult.fail("GT collector not available")
+
+        collected = gt_collector.get_collected_api_data()
+        asset_data = collected.get(symbol)
+        if not asset_data:
+            # Try with .us suffix
+            asset_data = collected.get(f"{symbol}.us")
+        if not asset_data:
+            available = list(collected.keys())[:5]
+            return GroundTruthResult.fail(
+                f"Stooq data for '{symbol}' not collected. Available: {available}"
+            )
+
+        # Get history from collected data
+        history = asset_data.get("history", [])
+        if not history or len(history) < num_days:
+            return GroundTruthResult.fail(
+                f"Insufficient historical data for '{symbol}': need {num_days} days, got {len(history)}"
+            )
+
+        # Get the last N days (most recent first after reversing)
+        recent_days = history[-num_days:]
+        closes = [day["close"] for day in recent_days if day.get("close") is not None]
+
+        if len(closes) < num_days:
+            return GroundTruthResult.fail(
+                f"Missing close prices in historical data for '{symbol}'"
+            )
+
+        # Calculate result based on query type
+        if query_type == "highest_close":
+            result = max(closes)
+        elif query_type == "lowest_close":
+            result = min(closes)
+        elif query_type == "average_close":
+            result = sum(closes) / len(closes)
+        elif query_type == "price_range":
+            result = max(closes) - min(closes)
+        else:
+            return GroundTruthResult.fail(f"Unknown query type: {query_type}")
+
+        return GroundTruthResult.ok(f"{result:.2f}")
 
     def _parse_float(self, value: Any) -> Optional[float]:
         if value is None:
