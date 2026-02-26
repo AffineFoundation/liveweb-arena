@@ -1,6 +1,7 @@
 """Stooq API client with caching support"""
 
 import asyncio
+import contextvars
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -13,8 +14,11 @@ logger = logging.getLogger(__name__)
 CACHE_SOURCE = "stooq"
 
 # Rate limit tracking - once hit, don't retry until reset.
-# Global by design: the limit is per-API-key, not per-evaluation.
-_rate_limited: bool = False
+# Per-context: each evaluation gets its own rate limit state via contextvars,
+# so concurrent evaluations don't interfere with each other.
+_rate_limited: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_stooq_rate_limited", default=False
+)
 
 
 class StooqRateLimitError(Exception):
@@ -137,10 +141,8 @@ class StooqClient(BaseAPIClient):
         Raises:
             StooqRateLimitError: If API rate limit is exceeded
         """
-        global _rate_limited
-
         # If already rate limited, raise immediately
-        if _rate_limited:
+        if _rate_limited.get():
             raise StooqRateLimitError(
                 "Stooq API daily limit exceeded. Cache is empty. "
                 "Wait for daily reset or manually populate cache."
@@ -164,7 +166,7 @@ class StooqClient(BaseAPIClient):
 
             # Check for rate limit error
             if "Exceeded the daily hits limit" in csv_text:
-                _rate_limited = True
+                _rate_limited.set(True)
                 logger.error("Stooq API daily limit exceeded!")
                 raise StooqRateLimitError(
                     "Stooq API daily limit exceeded. Wait for reset or use cached data."
@@ -285,9 +287,7 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
     Tries the symbol as-is first, then with common suffixes (.us)
     since Stooq's CSV API requires suffixed symbols for some markets.
     """
-    global _rate_limited
-
-    if _rate_limited:
+    if _rate_limited.get():
         return {}
 
     # Try .us suffix first for bare symbols (canonical form for US stocks)
@@ -309,7 +309,7 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
 
                     text = await response.text()
                     if "Exceeded the daily hits limit" in text:
-                        _rate_limited = True
+                        _rate_limited.set(True)
                         return {}
 
                     if "No data" in text:

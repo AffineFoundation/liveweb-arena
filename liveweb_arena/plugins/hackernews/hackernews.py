@@ -5,8 +5,9 @@ Plugin for browsing and querying Hacker News content.
 Supports external navigation to story link destinations.
 """
 
+import contextvars
 import re
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse, parse_qs
 
 from liveweb_arena.plugins.base import BasePlugin
@@ -15,6 +16,16 @@ from .api_client import (
     fetch_category_api_data,
     fetch_item_api_data,
     fetch_user_api_data,
+)
+
+# Per-evaluation state via contextvars.
+# Each evaluation context gets its own external URL tracking,
+# so concurrent evaluations don't pollute each other's URL whitelists.
+_external_urls_var: contextvars.ContextVar[Optional[Dict[str, Dict[str, Any]]]] = (
+    contextvars.ContextVar("_hn_external_urls", default=None)
+)
+_external_domains_var: contextvars.ContextVar[Optional[Set[str]]] = (
+    contextvars.ContextVar("_hn_external_domains", default=None)
 )
 
 
@@ -44,10 +55,23 @@ class HackerNewsPlugin(BasePlugin):
         "news.ycombinator.com",
     ]
 
-    # Track legitimate external URLs from HN stories (for anti-cheat).
-    # Class variables: cleared between evaluations via clear_external_urls().
-    _external_urls: Dict[str, Dict[str, Any]] = {}
-    _external_domains: Set[str] = set()
+    @classmethod
+    def _get_urls(cls) -> Dict[str, Dict[str, Any]]:
+        """Get per-context external URLs dict, initializing if needed."""
+        urls = _external_urls_var.get()
+        if urls is None:
+            urls = {}
+            _external_urls_var.set(urls)
+        return urls
+
+    @classmethod
+    def _get_domains(cls) -> Set[str]:
+        """Get per-context external domains set, initializing if needed."""
+        domains = _external_domains_var.get()
+        if domains is None:
+            domains = set()
+            _external_domains_var.set(domains)
+        return domains
 
     def get_blocked_patterns(self) -> List[str]:
         """Block direct API access to force agents to use the website."""
@@ -64,6 +88,8 @@ class HackerNewsPlugin(BasePlugin):
         This enables anti-cheat: only URLs that appear in actual HN stories
         are allowed for external navigation.
         """
+        urls = cls._get_urls()
+        domains = cls._get_domains()
         stories = api_data.get("stories", {})
         for story_id, story in stories.items():
             url = story.get("url")
@@ -79,8 +105,8 @@ class HackerNewsPlugin(BasePlugin):
                     if domain.startswith("www."):
                         domain = domain[4:]
                     if domain:
-                        cls._external_urls[url] = story
-                        cls._external_domains.add(domain)
+                        urls[url] = story
+                        domains.add(domain)
                 except Exception:
                     pass
 
@@ -92,7 +118,7 @@ class HackerNewsPlugin(BasePlugin):
         Returns:
             Set of domain names that can be navigated to
         """
-        return cls._external_domains.copy()
+        return cls._get_domains().copy()
 
     @classmethod
     def get_external_urls(cls) -> Dict[str, Dict[str, Any]]:
@@ -102,7 +128,7 @@ class HackerNewsPlugin(BasePlugin):
         Returns:
             Dict mapping URL to story data
         """
-        return cls._external_urls.copy()
+        return cls._get_urls().copy()
 
     @classmethod
     def _normalize_url_for_matching(cls, url: str) -> str:
@@ -135,20 +161,23 @@ class HackerNewsPlugin(BasePlugin):
         Returns:
             True if URL appears in HN story data or domain was linked from HN
         """
+        urls = cls._get_urls()
+        domains = cls._get_domains()
+
         # Exact match
-        if url in cls._external_urls:
+        if url in urls:
             return True
 
         # Check without trailing slash variations
         url_clean = url.rstrip('/')
-        if url_clean in cls._external_urls:
+        if url_clean in urls:
             return True
-        if url_clean + '/' in cls._external_urls:
+        if url_clean + '/' in urls:
             return True
 
         # Normalized URL matching (handles www, scheme differences)
         normalized = cls._normalize_url_for_matching(url)
-        for stored_url in cls._external_urls:
+        for stored_url in urls:
             if cls._normalize_url_for_matching(stored_url) == normalized:
                 return True
 
@@ -161,7 +190,7 @@ class HackerNewsPlugin(BasePlugin):
                 domain = domain.split(":")[0]
             if domain.startswith("www."):
                 domain = domain[4:]
-            if domain in cls._external_domains:
+            if domain in domains:
                 return True
         except Exception:
             pass
@@ -171,8 +200,8 @@ class HackerNewsPlugin(BasePlugin):
     @classmethod
     def clear_external_urls(cls) -> None:
         """Clear tracked external URLs (call between evaluations)."""
-        cls._external_urls.clear()
-        cls._external_domains.clear()
+        _external_urls_var.set(None)
+        _external_domains_var.set(None)
 
     def _get_external_url_data(self, url: str) -> Dict[str, Any]:
         """
@@ -192,19 +221,21 @@ class HackerNewsPlugin(BasePlugin):
             "is_external": True,
         }
 
+        urls = self._get_urls()
+
         # Try to find the HN story that links to this URL
         # First try exact match
         url_clean = url.rstrip('/')
         story_data = (
-            self._external_urls.get(url) or
-            self._external_urls.get(url_clean) or
-            self._external_urls.get(url_clean + '/')
+            urls.get(url) or
+            urls.get(url_clean) or
+            urls.get(url_clean + '/')
         )
 
         # If no exact match, try normalized matching
         if not story_data:
             normalized = self._normalize_url_for_matching(url)
-            for stored_url, stored_story in self._external_urls.items():
+            for stored_url, stored_story in urls.items():
                 if self._normalize_url_for_matching(stored_url) == normalized:
                     story_data = stored_story
                     break
@@ -219,7 +250,7 @@ class HackerNewsPlugin(BasePlugin):
                 if domain.startswith("www."):
                     domain = domain[4:]
                 # Find any story linking to this domain
-                for stored_url, stored_story in self._external_urls.items():
+                for stored_url, stored_story in urls.items():
                     stored_parsed = urlparse(stored_url.lower())
                     stored_domain = stored_parsed.netloc
                     if stored_domain.startswith("www."):
