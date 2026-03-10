@@ -1,12 +1,12 @@
 """Subject multi-condition filter template for Open Library - HARD DIFFICULTY
 
 RL-friendly design:
-- Requires scanning search results for a subject and checking multiple books
+- Requires browsing a subject page and checking multiple books
 - Requires evaluating TWO conditions simultaneously (cannot sort single column)
 - Large exploration space: subject × condition × thresholds
 - Dynamic data: edition counts and publish years shift as new editions appear
 - Combinatorial question space prevents memorization
-- All data visible on search results page: edition counts, publish years, fulltext
+- All data visible on subject page: edition counts, publish years, fulltext
 """
 
 import random
@@ -20,7 +20,7 @@ from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, TriggerConfig, GroundTruthResult,
 )
 from liveweb_arena.core.gt_collector import GTSourceType
-from liveweb_arena.plugins.openlibrary.api_client import fetch_search_api_data
+from liveweb_arena.plugins.openlibrary.api_client import fetch_subject_api_data
 
 
 class ConditionType(Enum):
@@ -41,10 +41,10 @@ THRESHOLDS = {
         (700, 1870),
     ],
     ConditionType.EDITION_RANGE: [
-        (500, 1000),
-        (700, 1500),
-        (1000, 2000),
-        (300, 800),
+        (300, 1200),
+        (500, 2000),
+        (800, 2500),
+        (1000, 3000),
     ],
     ConditionType.OLD_WITH_FULLTEXT: [
         (1800,),
@@ -77,19 +77,19 @@ STORY_COUNTS = [10, 15, 20]
 
 PATTERNS = {
     ConditionType.HIGH_EDITIONS_OLD: [
-        "On Open Library, search for \"{subject}\" books sorted by most editions. Among the first {n} results, how many have more than {t1} editions AND were first published before {t2}?",
-        "Search Open Library for \"{subject}\" books (sort: most editions). Of the top {n} results, count how many have {t1}+ editions and a first publish year before {t2}.",
-        "On Open Library, look up \"{subject}\" books by most editions. How many of the first {n} are classic works (before {t2}) with more than {t1} editions?",
+        "On the Open Library \"{subject}\" subject page, among the first {n} books listed, how many have more than {t1} editions AND were first published before {t2}?",
+        "Browse the \"{subject}\" subject on Open Library. Of the first {n} books shown, count how many have {t1}+ editions and a first publish year before {t2}.",
+        "On Open Library, look at the \"{subject}\" subject listing. How many of the first {n} books are classic works (before {t2}) with more than {t1} editions?",
     ],
     ConditionType.EDITION_RANGE: [
-        "On Open Library, search for \"{subject}\" books sorted by most editions. Among the first {n} results, how many have between {t1} and {t2} editions?",
-        "Search Open Library for \"{subject}\" books (sort: most editions). Of the top {n} results, count how many have edition counts between {t1} and {t2}.",
-        "On Open Library, look up \"{subject}\" books by most editions. How many of the first {n} have a number of editions in the range {t1}–{t2}?",
+        "On the Open Library \"{subject}\" subject page, among the first {n} books listed, how many have between {t1} and {t2} editions?",
+        "Browse the \"{subject}\" subject on Open Library. Of the first {n} books shown, count how many have edition counts between {t1} and {t2}.",
+        "On Open Library, look at the \"{subject}\" subject listing. How many of the first {n} books have a number of editions in the range {t1}\u2013{t2}?",
     ],
     ConditionType.OLD_WITH_FULLTEXT: [
-        "On Open Library, search for \"{subject}\" books sorted by most editions. Among the first {n} results, how many were first published before {t1} and have full text available (borrowable)?",
-        "Search Open Library for \"{subject}\" books (sort: most editions). Of the top {n} results, count how many are older works (pre-{t1}) with full text available.",
-        "On Open Library, look up \"{subject}\" books by most editions. How many of the first {n} classic works (before {t1}) have their full text available for borrowing?",
+        "On the Open Library \"{subject}\" subject page, among the first {n} books listed, how many were first published before {t1} and have full text available (borrowable)?",
+        "Browse the \"{subject}\" subject on Open Library. Of the first {n} books shown, count how many are older works (pre-{t1}) with full text available.",
+        "On Open Library, look at the \"{subject}\" subject listing. How many of the first {n} classic works (before {t1}) have their full text available for borrowing?",
     ],
 }
 
@@ -97,17 +97,17 @@ PATTERNS = {
 @register_template("openlibrary_subject_multi_condition")
 class OpenLibrarySubjectMultiConditionTemplate(QuestionTemplate):
     """
-    Template for multi-condition count queries on Open Library search results.
+    Template for multi-condition count queries on Open Library subject pages.
 
     HARD difficulty: Requires checking multiple conditions across books
-    in search results for a subject. Cannot be solved by sorting a single column.
+    on a subject page. Cannot be solved by sorting a single column.
 
     RL value:
-    - Exploration space: Must scan search results and evaluate each book
+    - Exploration space: Must scan subject listing and evaluate each book
     - Delayed reward: Must check multiple books before answering
     - Strategy: Can skip obviously non-matching books
     - Uncertainty: Cannot predict count without checking each book
-    - All data visible: edition counts, publish years, fulltext on search page
+    - All data visible: edition counts, publish years, fulltext on subject page
     """
 
     GT_SOURCE = GTSourceType.API_ONLY
@@ -137,11 +137,7 @@ class OpenLibrarySubjectMultiConditionTemplate(QuestionTemplate):
         pattern = rng.choice(patterns)
         question_text = pattern.format(n=n, subject=display_subject, t1=t1, t2=t2)
 
-        start_url = (
-            f"https://openlibrary.org/search"
-            f"?q=subject_key%3A%22{subject}%22"
-            f"&sort=editions"
-        )
+        start_url = f"https://openlibrary.org/subjects/{subject}"
 
         validation_info = {
             "condition_type": condition.value[0],
@@ -173,8 +169,8 @@ class OpenLibrarySubjectMultiConditionTemplate(QuestionTemplate):
 - Score 1.0: Exact count match
 - Score 0.5: Count within ±1 of correct answer
 - Score 0.0: Wrong count or no answer
-- Search for the subject on Open Library, sort by most editions
-- Edition counts, publish years, and borrowability visible in search results"""
+- Data is on the subject page on Open Library
+- Edition counts, publish years, and borrowability visible on the subject listing"""
 
     async def get_ground_truth(self, validation_info: Dict[str, Any]) -> GroundTruthResult:
         condition_type = validation_info.get("condition_type", "")
@@ -183,17 +179,11 @@ class OpenLibrarySubjectMultiConditionTemplate(QuestionTemplate):
         t2 = validation_info.get("threshold2", 0)
         subject = validation_info.get("subject", "")
 
-        # Direct API call with subject_key:{subject} query format.
-        # CRITICAL: The plain q={subject} API returns different results than
-        # the HTML search page (different ranking/filtering backend).
-        # The subject_key:{subject} format is the ONLY query that produces
-        # results identical to the HTML page at the start_url:
-        #   /search?q=subject_key:"{subject}"&sort=editions
-        # This was verified by comparing API output against Playwright
-        # accessibility tree scrapes of the rendered page.
+        # Use /subjects/{subject}.json API — returns the exact same data
+        # as the HTML subjects page at /subjects/{subject}.
+        # This ensures GT and page data share the same source (CLAUDE.md).
         try:
-            api_query = f'subject_key:"{subject}"'
-            data = await fetch_search_api_data(api_query, limit=n, sort="editions")
+            data = await fetch_subject_api_data(subject, limit=n)
         except Exception as e:
             return GroundTruthResult.fail(f"API call failed: {e}")
 
@@ -204,7 +194,7 @@ class OpenLibrarySubjectMultiConditionTemplate(QuestionTemplate):
                 f"(need {n}). Subject may not have enough results."
             )
 
-        # Sort by rank and take top n
+        # Sort by rank and take top n (rank = order on the subject page)
         works = sorted(works_dict.values(), key=lambda x: x.get("rank", 999))[:n]
 
         # Count matching works
