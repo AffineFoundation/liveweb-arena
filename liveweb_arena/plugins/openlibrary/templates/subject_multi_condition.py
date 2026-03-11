@@ -19,8 +19,7 @@ from liveweb_arena.core.validators.base import (
 from liveweb_arena.core.ground_truth_trigger import (
     UrlPatternTrigger, TriggerConfig, GroundTruthResult,
 )
-from liveweb_arena.core.gt_collector import GTSourceType
-from liveweb_arena.plugins.openlibrary.api_client import fetch_search_api_data
+from liveweb_arena.core.gt_collector import GTSourceType, get_current_gt_collector
 
 
 class ConditionType(Enum):
@@ -110,7 +109,7 @@ class OpenLibrarySubjectMultiConditionTemplate(QuestionTemplate):
     - All data visible: edition counts, publish years, fulltext on search page
     """
 
-    GT_SOURCE = GTSourceType.API_ONLY
+    GT_SOURCE = GTSourceType.PAGE_ONLY
 
     def __init__(self):
         super().__init__("openlibrary_subject_multi_condition")
@@ -184,15 +183,37 @@ class OpenLibrarySubjectMultiConditionTemplate(QuestionTemplate):
         t1 = validation_info.get("threshold1", 0)
         t2 = validation_info.get("threshold2", 0)
         subject = validation_info.get("subject", "")
-
-        # Use the search API with the same plain query as the HTML search page.
-        # The agent sees /search?q={subject}&sort=editions; GT uses the same
-        # query via /search.json to ensure data binding (CLAUDE.md).
         display_subject = subject.replace("_", " ")
-        try:
-            data = await fetch_search_api_data(display_subject, limit=n, sort="editions")
-        except Exception as e:
-            return GroundTruthResult.fail(f"API call failed: {e}")
+
+        # PAGE_ONLY: use collected API data from agent's page visits.
+        # Data is stored by gt_collector.on_page_visit → _merge_api_data
+        # when the agent visits /search?q={subject}&sort=editions.
+        # This ensures GT uses the same data bound to the page (CLAUDE.md).
+        gt_collector = get_current_gt_collector()
+        if gt_collector is None:
+            return GroundTruthResult.fail("No GT collector available")
+
+        collected = gt_collector.get_collected_api_data()
+
+        # Find the collected search data matching our subject + sort=editions
+        data = None
+        for key, entry in collected.items():
+            if not key.startswith("ol:"):
+                continue
+            if not isinstance(entry.get("works"), dict):
+                continue
+            if (entry.get("query", "").lower() == display_subject.lower()
+                    and entry.get("sort") == "editions"):
+                data = entry
+                break
+
+        if data is None:
+            ol_keys = [k for k in collected if k.startswith("ol:")][:5]
+            return GroundTruthResult.fail(
+                f"Agent did not visit Open Library search page for "
+                f"'{display_subject}' sorted by editions. "
+                f"Collected OL keys: {ol_keys}"
+            )
 
         works_dict = data.get("works", {})
         if len(works_dict) < n:

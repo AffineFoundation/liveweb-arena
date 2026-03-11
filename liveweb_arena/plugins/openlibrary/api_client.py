@@ -10,6 +10,27 @@ from liveweb_arena.plugins.base_client import APIFetchError, BaseAPIClient, Rate
 
 logger = logging.getLogger(__name__)
 
+# Shared session for connection reuse across requests
+_session: Optional[aiohttp.ClientSession] = None
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    """Get or create the shared aiohttp session."""
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(
+            headers={"User-Agent": "LiveWebArena/1.0"},
+        )
+    return _session
+
+
+async def close_session():
+    """Close the shared session. Call during shutdown."""
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+    _session = None
+
 CACHE_SOURCE = "openlibrary"
 
 OL_API_BASE = "https://openlibrary.org"
@@ -47,32 +68,30 @@ class OpenLibraryClient(BaseAPIClient):
         timeout: float = 30.0,
     ) -> Optional[Any]:
         url = f"{OL_API_BASE}{endpoint}"
+        session = await _get_session()
+        req_timeout = aiohttp.ClientTimeout(total=timeout)
 
-        async with aiohttp.ClientSession(
-            headers={"User-Agent": "LiveWebArena/1.0"},
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as session:
-            for attempt in range(cls.MAX_RETRIES):
-                await cls._rate_limit()
-                try:
-                    async with session.get(url, params=params) as response:
-                        if response.status == 200:
-                            return await response.json(content_type=None)
-                        if response.status >= 500 and attempt < cls.MAX_RETRIES - 1:
-                            wait = 2 ** attempt
-                            logger.info(f"OL API {response.status} for {endpoint}, retry in {wait}s")
-                            await asyncio.sleep(wait)
-                            continue
-                        logger.warning(f"OL API error: status={response.status} for {endpoint}")
-                        return None
-                except Exception as e:
-                    if attempt < cls.MAX_RETRIES - 1:
+        for attempt in range(cls.MAX_RETRIES):
+            await cls._rate_limit()
+            try:
+                async with session.get(url, params=params, timeout=req_timeout) as response:
+                    if response.status == 200:
+                        return await response.json(content_type=None)
+                    if response.status >= 500 and attempt < cls.MAX_RETRIES - 1:
                         wait = 2 ** attempt
-                        logger.info(f"OL API failed for {endpoint}: {e}, retry in {wait}s")
+                        logger.info(f"OL API {response.status} for {endpoint}, retry in {wait}s")
                         await asyncio.sleep(wait)
                         continue
-                    logger.warning(f"OL API request failed for {endpoint}: {e}")
+                    logger.warning(f"OL API error: status={response.status} for {endpoint}")
                     return None
+            except Exception as e:
+                if attempt < cls.MAX_RETRIES - 1:
+                    wait = 2 ** attempt
+                    logger.info(f"OL API failed for {endpoint}: {e}, retry in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                logger.warning(f"OL API request failed for {endpoint}: {e}")
+                return None
         return None
 
     @classmethod
