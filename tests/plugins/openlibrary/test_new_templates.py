@@ -533,10 +533,10 @@ def test_titles_match_rejects_short_substring():
 
 
 def test_titles_match_accepts_close_length_variants():
-    """'Fahrenheit 451' should match 'Fahrenheit 451 A Novel' if ratio ≥ 0.7."""
+    """Substring matching requires ≥ 0.85 length ratio."""
     from liveweb_arena.plugins.openlibrary.templates.common import titles_match
     assert titles_match("Fahrenheit 451", "Fahrenheit 451")
-    # 'fahrenheit 451' (14 chars) vs 'fahrenheit 451 a novel' (22 chars) → 14/22 = 0.636 < 0.7
+    # 'fahrenheit 451' (14 chars) vs 'fahrenheit 451 a novel' (22 chars) → 14/22 = 0.636 < 0.85
     assert not titles_match("Fahrenheit 451", "Fahrenheit 451 A Novel")
     # Punctuation difference only → exact after normalize
     assert titles_match("Catch-22", "Catch 22")

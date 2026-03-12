@@ -20,9 +20,8 @@ def titles_match(expected: str, actual: str) -> bool:
     """Fuzzy title comparison resilient to punctuation and casing.
 
     Uses a length-ratio guard for substring matching: the shorter normalized
-    string must be at least 70% of the longer one to qualify as a match.
-    This prevents 'the road' from matching 'on the road' while still
-    allowing 'Fahrenheit 451' to match 'Fahrenheit 451 A Novel'.
+    string must be at least 85% of the longer one to qualify as a match.
+    This prevents 'the road' from matching 'on the road'.
     """
     lhs = normalize_text(expected)
     rhs = normalize_text(actual)
