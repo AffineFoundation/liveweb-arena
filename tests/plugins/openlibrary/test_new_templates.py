@@ -127,8 +127,10 @@ def test_author_editions_generate(seed):
     assert q.template_name == "openlibrary_author_editions"
     assert "author_name" in q.validation_info
     assert "author_query" in q.validation_info
+    assert "search_query" in q.validation_info
     assert "sort" in q.validation_info
     assert "work_count" in q.validation_info
+    assert "q=author%3A%22" in q.start_url
     assert "sort=editions" in q.start_url
 
 
@@ -326,7 +328,7 @@ def test_search_ranking_not_enough_results():
 def test_author_editions_sums_first_n_results():
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:dickens": _make_search_entry("charles dickens", "editions", [
+        "ol:search:dickens": _make_search_entry('author:"charles dickens"', "editions", [
             {"key": "/works/OL10W", "rank": 1, "title": "A Tale of Two Cities", "edition_count": 100},
             {"key": "/works/OL11W", "rank": 2, "title": "Oliver Twist", "edition_count": 200},
             {"key": "/works/OL12W", "rank": 3, "title": "Great Expectations", "edition_count": 300},
@@ -334,6 +336,7 @@ def test_author_editions_sums_first_n_results():
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
         "author_name": "Charles Dickens", "author_query": "charles dickens",
+        "search_query": 'author:"charles dickens"',
         "sort": "editions", "work_count": 2,
     }))
     assert result.success is True
@@ -343,7 +346,7 @@ def test_author_editions_sums_first_n_results():
 def test_author_editions_top_3():
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:dickens": _make_search_entry("charles dickens", "editions", [
+        "ol:search:dickens": _make_search_entry('author:"charles dickens"', "editions", [
             {"key": "/works/OL10W", "rank": 1, "title": "A", "edition_count": 1000},
             {"key": "/works/OL11W", "rank": 2, "title": "B", "edition_count": 900},
             {"key": "/works/OL12W", "rank": 3, "title": "C", "edition_count": 800},
@@ -352,40 +355,43 @@ def test_author_editions_top_3():
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
         "author_name": "Charles Dickens", "author_query": "charles dickens",
+        "search_query": 'author:"charles dickens"',
         "sort": "editions", "work_count": 3,
     }))
     assert result.success is True
     assert result.value == "2700"  # 1000 + 900 + 800
 
 
-def test_author_editions_flexible_match_with_books_suffix():
-    """Agent searched 'mark twain books' but author_query is 'mark twain'."""
+def test_author_editions_matches_author_filter_query():
+    """Canonical author-filter query should be accepted."""
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:twain": _make_search_entry("mark twain books", "editions", [
+        "ol:search:twain": _make_search_entry('author:"mark twain"', "editions", [
             {"key": "/works/OL20W", "rank": 1, "title": "Huck Finn", "edition_count": 500},
             {"key": "/works/OL21W", "rank": 2, "title": "Tom Sawyer", "edition_count": 300},
         ]),
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
         "author_name": "Mark Twain", "author_query": "mark twain",
+        "search_query": 'author:"mark twain"',
         "sort": "editions", "work_count": 2,
     }))
     assert result.success is True
     assert result.value == "800"
 
 
-def test_author_editions_flexible_match_with_quoted_query():
-    """Agent searched '"mark twain" books' — quotes get stripped."""
+def test_author_editions_matches_author_filter_query_with_spaces_and_case():
+    """Case/spacing variation of author-filter syntax should still match."""
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:twain": _make_search_entry('"mark twain" books', "editions", [
+        "ol:search:twain": _make_search_entry('AUTHOR: "Mark Twain"', "editions", [
             {"key": "/works/OL20W", "rank": 1, "title": "Huck Finn", "edition_count": 400},
             {"key": "/works/OL21W", "rank": 2, "title": "Tom Sawyer", "edition_count": 200},
         ]),
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
         "author_name": "Mark Twain", "author_query": "mark twain",
+        "search_query": 'author:"mark twain"',
         "sort": "editions", "work_count": 2,
     }))
     assert result.success is True
@@ -393,50 +399,51 @@ def test_author_editions_flexible_match_with_quoted_query():
 
 
 def test_author_editions_punctuated_name_matching():
-    """H.G. Wells: author_query 'h g wells' should match collected 'h g wells books'."""
+    """H. G. Wells should match punctuated author-filter query."""
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:wells": _make_search_entry("h g wells books", "editions", [
+        "ol:search:wells": _make_search_entry('author:"h.g. wells"', "editions", [
             {"key": "/works/OL30W", "rank": 1, "title": "War of the Worlds", "edition_count": 600},
             {"key": "/works/OL31W", "rank": 2, "title": "Time Machine", "edition_count": 400},
         ]),
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
-        "author_name": "H.G. Wells", "author_query": "h g wells",
+        "author_name": "H. G. Wells", "author_query": "h g wells",
+        "search_query": 'author:"h g wells"',
         "sort": "editions", "work_count": 2,
     }))
     assert result.success is True
     assert result.value == "1000"
 
 
-def test_author_editions_punctuated_collected_query():
-    """Reviewer repro: agent types 'h.g. wells' (with dots) in search box.
-    _tokenize_query('h.g. wells') should produce {'h','g','wells'},
-    matching author_query 'h g wells' → {'h','g','wells'}."""
+def test_author_editions_rejects_plain_text_query_without_author_filter():
+    """Plain text query is semantically ambiguous for author-specific questions."""
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:wells": _make_search_entry("h.g. wells", "editions", [
+        "ol:search:wells": _make_search_entry("mark twain", "editions", [
             {"key": "/works/OL30W", "rank": 1, "title": "War of the Worlds", "edition_count": 600},
             {"key": "/works/OL31W", "rank": 2, "title": "Time Machine", "edition_count": 400},
         ]),
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
-        "author_name": "H.G. Wells", "author_query": "h g wells",
+        "author_name": "Mark Twain", "author_query": "mark twain",
+        "search_query": 'author:"mark twain"',
         "sort": "editions", "work_count": 2,
     }))
-    assert result.success is True
-    assert result.value == "1000"
+    assert result.success is False
+    assert result.is_data_not_collected()
 
 
 def test_author_editions_not_collected_wrong_author():
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:dickens": _make_search_entry("charles dickens", "editions", [
+        "ol:search:dickens": _make_search_entry('author:"charles dickens"', "editions", [
             {"key": "/works/OL10W", "rank": 1, "title": "X", "edition_count": 100},
         ]),
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
         "author_name": "Unknown Author", "author_query": "unknown author",
+        "search_query": 'author:"unknown author"',
         "sort": "editions", "work_count": 3,
     }))
     assert result.success is False
@@ -446,13 +453,14 @@ def test_author_editions_not_collected_wrong_author():
 def test_author_editions_missing_edition_count():
     tmpl = OpenLibraryAuthorEditionsTemplate()
     collected = {
-        "ol:search:dickens": _make_search_entry("charles dickens", "editions", [
+        "ol:search:dickens": _make_search_entry('author:"charles dickens"', "editions", [
             {"key": "/works/OL10W", "rank": 1, "title": "A", "edition_count": 100},
             {"key": "/works/OL11W", "rank": 2, "title": "B"},  # missing edition_count
         ]),
     }
     result = _run_gt(collected, tmpl.get_ground_truth({
         "author_name": "Charles Dickens", "author_query": "charles dickens",
+        "search_query": 'author:"charles dickens"',
         "sort": "editions", "work_count": 2,
     }))
     assert result.success is False
