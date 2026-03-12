@@ -17,7 +17,7 @@ from liveweb_arena.core.validators.base import (
     register_template,
 )
 from .book_stats import BOOK_POOL
-from .common import get_collected_data, iter_collected_works, parse_numeric, titles_match
+from .common import get_collected_data, iter_collected_works, normalize_text, parse_numeric, titles_match
 
 
 class ComparisonMetric(Enum):
@@ -161,7 +161,7 @@ class OpenLibraryBookComparisonTemplate(QuestionTemplate):
                 continue
 
             # Exact normalized title match is preferred over substring match.
-            quality = 2 if title.casefold() == work_title.casefold() else 1
+            quality = 2 if normalize_text(title) == normalize_text(work_title) else 1
             if quality >= latest_match_quality:
                 latest_match_quality = quality
                 latest_value = value

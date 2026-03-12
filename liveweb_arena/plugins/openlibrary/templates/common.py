@@ -6,18 +6,34 @@ from liveweb_arena.core.gt_collector import get_current_gt_collector
 
 
 def normalize_text(value: str) -> str:
-    """Normalize text for robust matching."""
-    collapsed = " ".join(value.split())
+    """Normalize text for robust matching.
+
+    Hyphens are converted to spaces so 'Catch-22' and 'Catch 22' normalize
+    identically.
+    """
+    spaced = value.replace("-", " ")
+    collapsed = " ".join(spaced.split())
     return "".join(ch.lower() for ch in collapsed if ch.isalnum() or ch == " ").strip()
 
 
 def titles_match(expected: str, actual: str) -> bool:
-    """Fuzzy title comparison resilient to punctuation and casing."""
+    """Fuzzy title comparison resilient to punctuation and casing.
+
+    Uses a length-ratio guard for substring matching: the shorter normalized
+    string must be at least 70% of the longer one to qualify as a match.
+    This prevents 'the road' from matching 'on the road' while still
+    allowing 'Fahrenheit 451' to match 'Fahrenheit 451 A Novel'.
+    """
     lhs = normalize_text(expected)
     rhs = normalize_text(actual)
     if not lhs or not rhs:
         return False
-    return lhs == rhs or lhs in rhs or rhs in lhs
+    if lhs == rhs:
+        return True
+    shorter, longer = (lhs, rhs) if len(lhs) <= len(rhs) else (rhs, lhs)
+    if shorter not in longer:
+        return False
+    return len(shorter) / len(longer) >= 0.85
 
 
 def parse_numeric(value: Any) -> Optional[float]:

@@ -160,9 +160,17 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
         return GroundTruthResult.ok(str(total_editions))
 
     @staticmethod
-    def _normalize_token(token: str) -> str:
-        """Strip punctuation from a token for robust matching."""
-        return "".join(ch for ch in token.lower() if ch.isalnum())
+    def _tokenize_query(query: str) -> set:
+        """Normalize an entire query string, then split into tokens.
+
+        Replaces all non-alphanumeric characters with spaces first, so that
+        "h.g. wells" becomes "h g wells" → {"h", "g", "wells"} — matching
+        the same tokens as the pre-normalized author_query "h g wells".
+        """
+        normalized = "".join(ch if ch.isalnum() else " " for ch in query.lower())
+        return {t for t in normalized.split() if t}
+
+    FILLER_TOKENS = frozenset({"books", "book", "by"})
 
     @classmethod
     def _find_author_search_entry(
@@ -179,14 +187,10 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
         - "mark twain"
         - "Mark Twain books"
         - "\"Mark Twain\" books"
-        - "h g wells" (normalized from "H.G. Wells")
+        - "h.g. wells" (punctuation normalized to spaces before tokenizing)
         """
         target_normalized = author_query.strip().lower()
-        author_tokens = {
-            cls._normalize_token(t)
-            for t in author_query.lower().split()
-            if cls._normalize_token(t)
-        }
+        author_tokens = cls._tokenize_query(author_query)
         matched_entry: Optional[Dict[str, Any]] = None
 
         for key, entry in collected.items():
@@ -207,12 +211,8 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
                 matched_entry = entry
                 continue
 
-            # Flexible token match: strip punctuation, ignore filler words
-            entry_tokens = {
-                cls._normalize_token(t)
-                for t in entry_query.split()
-                if cls._normalize_token(t) not in {"books", "book", "by"}
-            }
+            # Flexible token match: normalize punctuation → spaces, ignore filler words
+            entry_tokens = cls._tokenize_query(entry_query) - cls.FILLER_TOKENS
             if author_tokens and author_tokens.issubset(entry_tokens):
                 matched_entry = entry
 
