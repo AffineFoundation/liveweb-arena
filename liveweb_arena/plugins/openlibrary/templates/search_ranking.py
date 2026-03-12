@@ -100,12 +100,13 @@ class OpenLibrarySearchRankingTemplate(QuestionTemplate):
                 "rank": rank,
             },
             template_name=self.name,
-            expected_steps=6,
+            expected_steps=8,
         )
 
     def get_validation_rules(self, validation_info: Dict[str, Any]) -> str:
         query = validation_info.get("query", "")
-        rank = validation_info.get("rank", "")
+        rank_value = validation_info.get("rank")
+        rank = rank_value if isinstance(rank_value, int) else "unknown"
         sort_label = validation_info.get("sort_label", "")
         return f"""Task-Specific Rules (Open Library Search Ranking):
 - Query: "{query}"
