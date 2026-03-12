@@ -60,9 +60,13 @@ class OpenLibraryBookComparisonTemplate(QuestionTemplate):
         metrics = list(ComparisonMetric)
         metric = metrics[variant % len(metrics)] if variant is not None else rng.choice(metrics)
 
-        book_a_title, _ = rng.choice(BOOK_POOL)
-        candidates = [book for book in BOOK_POOL if book[0] != book_a_title]
-        book_b_title, _ = rng.choice(candidates)
+        (book_a_title, book_a_query), (book_b_title, book_b_query) = rng.sample(BOOK_POOL, 2)
+
+        # Randomly swap order to prevent systematic position bias
+        if rng.random() > 0.5:
+            book_a_title, book_a_query, book_b_title, book_b_query = (
+                book_b_title, book_b_query, book_a_title, book_a_query,
+            )
 
         pattern = rng.choice(PATTERNS)
         question_text = (
@@ -74,9 +78,11 @@ class OpenLibraryBookComparisonTemplate(QuestionTemplate):
             + " If equal, choose the title that comes first alphabetically."
         )
 
+        start_url = f"https://openlibrary.org/search?q={book_a_query.replace(' ', '+')}"
+
         return GeneratedQuestion(
             question_text=question_text,
-            start_url="https://openlibrary.org/",
+            start_url=start_url,
             variables={
                 "metric": metric.value[0],
                 "book_a": book_a_title,
@@ -86,7 +92,9 @@ class OpenLibraryBookComparisonTemplate(QuestionTemplate):
                 "metric": metric.value[0],
                 "metric_label": metric.value[1],
                 "book_a": book_a_title,
+                "book_a_query": book_a_query,
                 "book_b": book_b_title,
+                "book_b_query": book_b_query,
             },
             template_name=self.name,
             expected_steps=8,

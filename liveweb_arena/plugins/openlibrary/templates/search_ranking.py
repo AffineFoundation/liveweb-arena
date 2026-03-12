@@ -130,8 +130,10 @@ class OpenLibrarySearchRankingTemplate(QuestionTemplate):
 
         data = find_search_entry(collected, query=query, sort=sort)
         if data is None:
+            ol_keys = [k for k in collected if k.startswith("ol:")][:5]
             return GroundTruthResult.not_collected(
-                f"Did not collect search data for query '{query}' with sort '{sort}'"
+                f"Did not collect search data for query '{query}' with sort '{sort}'. "
+                f"Collected OL keys: {ol_keys}"
             )
 
         works_dict = data.get("works")

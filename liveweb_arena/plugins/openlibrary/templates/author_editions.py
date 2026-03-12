@@ -17,27 +17,27 @@ from liveweb_arena.core.validators.base import (
 )
 from .common import get_collected_data, parse_numeric
 
-AUTHORS = [
-    "Charles Dickens",
-    "Jane Austen",
-    "William Shakespeare",
-    "Mark Twain",
-    "Leo Tolstoy",
-    "Fyodor Dostoevsky",
-    "Virginia Woolf",
-    "George Orwell",
-    "Agatha Christie",
-    "Ernest Hemingway",
-    "Jules Verne",
-    "H. G. Wells",
-    "Arthur Conan Doyle",
-    "Mary Shelley",
-    "Franz Kafka",
-    "Herman Melville",
-    "Victor Hugo",
-    "Emily Bronte",
-    "Miguel de Cervantes",
-    "Alexandre Dumas",
+AUTHOR_POOL = [
+    ("Charles Dickens", "charles dickens"),
+    ("Jane Austen", "jane austen"),
+    ("William Shakespeare", "william shakespeare"),
+    ("Mark Twain", "mark twain"),
+    ("Leo Tolstoy", "leo tolstoy"),
+    ("Fyodor Dostoevsky", "fyodor dostoevsky"),
+    ("Virginia Woolf", "virginia woolf"),
+    ("George Orwell", "george orwell"),
+    ("Agatha Christie", "agatha christie"),
+    ("Ernest Hemingway", "ernest hemingway"),
+    ("Jules Verne", "jules verne"),
+    ("H.G. Wells", "h g wells"),
+    ("Arthur Conan Doyle", "arthur conan doyle"),
+    ("Mary Shelley", "mary shelley"),
+    ("Franz Kafka", "franz kafka"),
+    ("Herman Melville", "herman melville"),
+    ("Victor Hugo", "victor hugo"),
+    ("Emily Bronte", "emily bronte"),
+    ("Miguel de Cervantes", "miguel de cervantes"),
+    ("Alexandre Dumas", "alexandre dumas"),
 ]
 
 RESULT_COUNTS = [3, 5, 7]
@@ -68,26 +68,25 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
 
     def generate(self, seed: int, variant: Optional[int] = None) -> GeneratedQuestion:
         rng = random.Random(seed)
-        author = rng.choice(AUTHORS)
+        author_name, author_query = rng.choice(AUTHOR_POOL)
         count = RESULT_COUNTS[variant % len(RESULT_COUNTS)] if variant is not None else rng.choice(RESULT_COUNTS)
-        search_query = f"{author} books"
 
         pattern = rng.choice(PATTERNS)
-        question_text = pattern.format(author=author, n=count)
-        query_encoded = search_query.replace(" ", "+")
+        question_text = pattern.format(author=author_name, n=count)
+        query_encoded = author_query.replace(" ", "+")
         start_url = f"https://openlibrary.org/search?q={query_encoded}&sort=editions"
 
         return GeneratedQuestion(
             question_text=question_text,
             start_url=start_url,
             variables={
-                "author": author,
+                "author": author_name,
                 "work_count": count,
             },
             validation_info={
-                "query": search_query,
+                "author_name": author_name,
+                "author_query": author_query,
                 "sort": "editions",
-                "author": author,
                 "work_count": count,
             },
             template_name=self.name,
@@ -95,7 +94,7 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
         )
 
     def get_validation_rules(self, validation_info: Dict[str, Any]) -> str:
-        author = validation_info.get("author", "")
+        author = validation_info.get("author_name", "")
         count = validation_info.get("work_count", "")
         return f"""Task-Specific Rules (Open Library Author Editions):
 - Author query: "{author}"
@@ -109,13 +108,13 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
         if not collected:
             return GroundTruthResult.fail("No Open Library data collected")
 
-        query = validation_info.get("query")
-        author = validation_info.get("author")
+        author_name = validation_info.get("author_name")
+        author_query = validation_info.get("author_query")
         sort = validation_info.get("sort")
         work_count = validation_info.get("work_count")
         if (
-            not isinstance(query, str)
-            or not isinstance(author, str)
+            not isinstance(author_name, str)
+            or not isinstance(author_query, str)
             or not isinstance(sort, str)
             or not isinstance(work_count, int)
         ):
@@ -123,10 +122,14 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
         if work_count <= 0:
             return GroundTruthResult.fail(f"Invalid work_count: {work_count}")
 
-        data = self._find_author_search_entry(collected, author=author, fallback_query=query, sort=sort)
+        data = self._find_author_search_entry(
+            collected, author_query=author_query, sort=sort,
+        )
         if data is None:
+            ol_keys = [k for k in collected if k.startswith("ol:")][:5]
             return GroundTruthResult.not_collected(
-                f"Did not collect search data for author '{author}' sorted by '{sort}'"
+                f"Did not collect search data for author '{author_name}' "
+                f"sorted by '{sort}'. Collected OL keys: {ol_keys}"
             )
 
         works_dict = data.get("works")
@@ -134,7 +137,7 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
             return GroundTruthResult.fail("Collected search data missing works dictionary")
         if len(works_dict) < work_count:
             return GroundTruthResult.fail(
-                f"Only {len(works_dict)} works collected for '{query}', need {work_count}"
+                f"Only {len(works_dict)} works collected for '{author_query}', need {work_count}"
             )
 
         ranked_works = []
@@ -157,23 +160,33 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
         return GroundTruthResult.ok(str(total_editions))
 
     @staticmethod
+    def _normalize_token(token: str) -> str:
+        """Strip punctuation from a token for robust matching."""
+        return "".join(ch for ch in token.lower() if ch.isalnum())
+
+    @classmethod
     def _find_author_search_entry(
+        cls,
         collected: Dict[str, Dict[str, Any]],
         *,
-        author: str,
-        fallback_query: str,
+        author_query: str,
         sort: str,
     ) -> Optional[Dict[str, Any]]:
         """
         Find search data for an author while tolerating natural query variants.
 
         Agents may search for:
-        - "Mark Twain"
+        - "mark twain"
         - "Mark Twain books"
         - "\"Mark Twain\" books"
+        - "h g wells" (normalized from "H.G. Wells")
         """
-        author_tokens = {token for token in author.lower().split() if token}
-        fallback_normalized = fallback_query.strip().lower()
+        target_normalized = author_query.strip().lower()
+        author_tokens = {
+            cls._normalize_token(t)
+            for t in author_query.lower().split()
+            if cls._normalize_token(t)
+        }
         matched_entry: Optional[Dict[str, Any]] = None
 
         for key, entry in collected.items():
@@ -189,12 +202,18 @@ class OpenLibraryAuthorEditionsTemplate(QuestionTemplate):
             if not entry_query:
                 continue
 
-            if entry_query == fallback_normalized:
+            # Exact match on the pre-normalized query
+            if entry_query == target_normalized:
                 matched_entry = entry
                 continue
 
-            tokens = {token for token in entry_query.split() if token not in {"books", "book", "by"}}
-            if author_tokens and author_tokens.issubset(tokens):
+            # Flexible token match: strip punctuation, ignore filler words
+            entry_tokens = {
+                cls._normalize_token(t)
+                for t in entry_query.split()
+                if cls._normalize_token(t) not in {"books", "book", "by"}
+            }
+            if author_tokens and author_tokens.issubset(entry_tokens):
                 matched_entry = entry
 
         return matched_entry
