@@ -278,11 +278,13 @@ class AgentPolicy:
         """
         Extract valid JSON object from surrounding text.
 
-        No repair is performed — malformed JSON indicates model failure.
+        Performs minimal structural recovery for truncated outputs where the
+        model omits trailing closing braces.
 
         Strategies (in order):
         1. Extract from markdown code block (```json ... ```)
         2. Find complete JSON objects by brace matching
+        3. Repair truncated top-level JSON by appending missing trailing braces
         """
         # Strategy 1: Markdown code block
         code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -297,4 +299,49 @@ class AgentPolicy:
             if result:
                 return result
 
+        # Strategy 3: recover truncated JSON with missing trailing braces
+        repaired = self._repair_truncated_json(text)
+        if repaired:
+            return repaired
+
         return None
+
+    def _repair_truncated_json(self, text: str) -> Optional[dict]:
+        """
+        Attempt to recover a truncated JSON object by closing open braces.
+
+        This handles common model output truncation where content is valid JSON
+        except for missing trailing "}" at the end.
+        """
+        stripped = text.strip()
+        if not stripped or stripped[0] != "{":
+            return None
+
+        depth = 0
+        in_string = False
+        escape = False
+
+        for ch in stripped:
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth < 0:
+                    return None
+
+        if in_string or depth <= 0:
+            return None
+
+        repaired = stripped + ("}" * depth)
+        return self._try_parse_as_dict(repaired)
