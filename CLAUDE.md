@@ -64,7 +64,7 @@ Test with `eval.py` using ONE template and ONE seed. Check in order:
 2. **GT Data Source** - GT must use `api_data` from page cache, not independent fetches. Check logs for `[GT] Visit xxx → +N items`.
 3. **Data Visibility** - Required data must appear in the page accessibility tree or visible content, not just in the API.
 4. **Theoretical Solvability** - A clear navigation path must exist from start URL to answer.
-5. **Red Team Review** - Must pass all checks in the Red Team Review section before merge.
+5. **Red Team Review (Self-Attack pass)** - Before submission, run a deliberate self-attack using all checks in the **Red Team Review** section below. Any failed check requires template redesign before PR.
 
 **Interpreting results:**
 - Agent fails + GT succeeds = agent capability issue (template is fine)
