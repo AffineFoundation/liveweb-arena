@@ -22,7 +22,7 @@ from liveweb_arena.core.reward import StepwiseRewardCalculator, RewardConfig, Re
 from liveweb_arena.plugins.base import BasePlugin
 from liveweb_arena.plugins import get_all_plugins
 from liveweb_arena.core.validators.llm_validator import validate_answers_with_llm
-from liveweb_arena.utils.llm_client import LLMClient, LLMFatalError
+from liveweb_arena.utils.llm_client import LLMClient, LLMFatalError, MultiServerLLMRouter
 from liveweb_arena.utils.logger import log
 from urllib.parse import urlparse
 
@@ -170,6 +170,7 @@ class Actor:
         api_key: str = None,
         cache_dir: Optional[Path] = None,
         use_cache: bool = True,
+        llm_router: Optional[MultiServerLLMRouter] = None,
     ):
         """
         Initialize Actor.
@@ -185,6 +186,7 @@ class Actor:
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._lock = asyncio.Lock()
         self.use_cache = use_cache
+        self.llm_router = llm_router
 
         # Episode storage for OpenEnv interface
         self._episodes: Dict[str, EpisodeState] = {}
@@ -242,7 +244,7 @@ class Actor:
     async def evaluate(
         self,
         model: str,
-        base_url: str,
+        base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         seed: Optional[int] = None,
         num_subtasks: Optional[int] = None,
@@ -252,6 +254,8 @@ class Actor:
         temperature: float = 0.7,
         max_concurrency: int = 2,
         task_id: Optional[int] = None,
+        mode: str = "eval",
+        route_key: Optional[str] = None,
     ) -> dict:
         """
         Run a single evaluation.
@@ -268,6 +272,8 @@ class Actor:
             temperature: LLM temperature
             max_concurrency: Container-local concurrency limit
             task_id: Optional task ID for deterministic question type
+            mode: "eval" for scored evaluation, "collect" for lightweight trajectory collection
+            route_key: Optional key for sticky LLM routing
 
         Returns:
             Evaluation result dict with scores and metadata
@@ -296,24 +302,44 @@ class Actor:
         # Allow per-call API key override
         current_api_key = api_key or self.api_key
 
+        if self.llm_router is None and not base_url:
+            raise ValueError("base_url is required when Actor is not configured with llm_router")
+
         # Initialize semaphore for concurrency control
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(max_concurrency)
 
         async with self._semaphore:
             try:
-                result = await self._run_evaluation(
-                    model=model,
-                    base_url=base_url,
-                    api_key=current_api_key,
-                    seed=seed,
-                    num_subtasks=num_subtasks,
-                    templates=templates,
-                    max_steps=max_steps,
-                    timeout=timeout,
-                    temperature=temperature,
-                    task_id=task_id,
-                )
+                effective_route_key = route_key or f"{mode}:task:{task_id or 'none'}:seed:{seed}"
+                if mode == "collect":
+                    result = await self._run_collection(
+                        model=model,
+                        base_url=base_url,
+                        api_key=current_api_key,
+                        seed=seed,
+                        num_subtasks=num_subtasks,
+                        templates=templates,
+                        max_steps=max_steps,
+                        timeout=timeout,
+                        temperature=temperature,
+                        task_id=task_id,
+                        route_key=effective_route_key,
+                    )
+                else:
+                    result = await self._run_evaluation(
+                        model=model,
+                        base_url=base_url,
+                        api_key=current_api_key,
+                        seed=seed,
+                        num_subtasks=num_subtasks,
+                        templates=templates,
+                        max_steps=max_steps,
+                        timeout=timeout,
+                        temperature=temperature,
+                        task_id=task_id,
+                        route_key=effective_route_key,
+                    )
             except Exception as e:
                 import traceback
                 result = {
@@ -333,10 +359,107 @@ class Actor:
         result["time_taken"] = time.time() - start_time
         return result
 
+    def _build_llm_client(
+        self,
+        base_url: Optional[str],
+        api_key: str,
+        route_key: str,
+        *,
+        max_retries: Optional[int] = None,
+        strict_serial: bool = False,
+    ) -> LLMClient:
+        if self.llm_router is not None:
+            return LLMClient(
+                api_key=api_key,
+                router=self.llm_router,
+                route_key=route_key,
+                max_retries=max_retries,
+                strict_serial=strict_serial,
+            )
+        return LLMClient(
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=max_retries,
+            strict_serial=strict_serial,
+        )
+
+    async def _run_agent_loop(
+        self,
+        task: CompositeTask,
+        session,
+        llm_client: LLMClient,
+        protocol,
+        model: str,
+        max_steps: int,
+        timeout: int,
+        temperature: float,
+        seed: int,
+        allowed_domains: Set[str],
+        on_navigation=None,
+        on_observation=None,
+    ):
+        agent_loop = AgentLoop(
+            session=session,
+            llm_client=llm_client,
+            protocol=protocol,
+            max_steps=max_steps,
+            on_navigation=on_navigation,
+            on_observation=on_observation,
+        )
+
+        failure_reason = None
+        error_message = None
+        fatal_error_map = {
+            LLMFatalError: "llm_error",
+            CacheFatalError: "cache_error",
+        }
+
+        try:
+            trajectory, final_answer, usage = await asyncio.wait_for(
+                agent_loop.run(task=task, model=model, temperature=temperature, seed=seed),
+                timeout=timeout,
+            )
+            if agent_loop.is_parse_failed():
+                failure_reason = "parse_failed"
+                log("Actor", "Parse failed - model output not valid JSON", force=True)
+            elif agent_loop.is_max_steps_reached():
+                failure_reason = "max_steps_reached"
+                log("Actor", "Max steps reached without completion - marking as failed", force=True)
+        except asyncio.TimeoutError:
+            failure_reason = "agent_timeout"
+            error_message = f"Agent timeout after {timeout}s"
+            log("Actor", error_message, force=True)
+        except BrowserFatalError as e:
+            is_required_domain = False
+            if e.url:
+                for domain in allowed_domains:
+                    if _url_matches_domain(e.url, domain):
+                        is_required_domain = True
+                        break
+
+            if is_required_domain:
+                failure_reason = "site_unreachable"
+                error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
+                log("Actor", f"Infrastructure error: {error_message}", force=True)
+            else:
+                failure_reason = "browser_error"
+                log("Actor", f"Browser error (agent issue): {e}", force=True)
+        except (LLMFatalError, CacheFatalError) as e:
+            failure_reason = fatal_error_map[type(e)]
+            error_message = f"{failure_reason}: {e}"
+            log("Actor", f"Fatal error - {error_message}", force=True)
+
+        if failure_reason and failure_reason not in ("max_steps_reached", "parse_failed"):
+            trajectory = agent_loop.get_trajectory()
+            final_answer = agent_loop.get_final_answer()
+            usage = agent_loop.get_usage()
+
+        return trajectory, final_answer, usage, failure_reason, error_message, agent_loop
+
     async def _run_evaluation(
         self,
         model: str,
-        base_url: str,
+        base_url: Optional[str],
         api_key: str,
         seed: int,
         num_subtasks: int,
@@ -345,6 +468,7 @@ class Actor:
         timeout: int,
         temperature: float,
         task_id: Optional[int] = None,
+        route_key: Optional[str] = None,
     ) -> dict:
         """Internal evaluation logic."""
         await self._ensure_browser()
@@ -393,7 +517,14 @@ class Actor:
                 session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
             )
 
-            llm_client = LLMClient(base_url=base_url, api_key=api_key)
+            base_route_key = route_key or f"eval:task:{task_id or 'none'}:seed:{seed}"
+            agent_llm_client = self._build_llm_client(
+                base_url=base_url,
+                api_key=api_key,
+                route_key=f"{base_route_key}:agent",
+                max_retries=1,
+                strict_serial=True,
+            )
 
             # Initialize unified GT collector
             gt_collector = GTCollector(
@@ -415,72 +546,20 @@ class Actor:
                 )
 
             active_protocol = FunctionCallingProtocol()
-            agent_loop = AgentLoop(
+            trajectory, final_answer, usage, failure_reason, error_message, _ = await self._run_agent_loop(
+                task=task,
                 session=session,
-                llm_client=llm_client,
+                llm_client=agent_llm_client,
                 protocol=active_protocol,
+                model=model,
                 max_steps=effective_max_steps,
+                timeout=timeout,
+                temperature=temperature,
+                seed=seed,
+                allowed_domains=allowed_domains,
                 on_navigation=on_navigation,
                 on_observation=on_observation,
             )
-
-            # Failure tracking:
-            #   failure_reason: what happened (always set on failure, goes into extra)
-            #   error_message: set = evaluation is INVALID (mechanism issue, not agent capability)
-            #     Valid failures (no error_message): max_steps_reached
-            #     Invalid failures (error_message set): llm_error, browser_error, cache_error, agent_timeout, gt_failure
-            failure_reason = None
-            error_message = None
-
-            # Fatal errors that invalidate evaluation (system issues, not agent capability)
-            _FATAL_ERROR_MAP = {
-                LLMFatalError: "llm_error",
-                CacheFatalError: "cache_error",
-            }
-
-            try:
-                trajectory, final_answer, usage = await asyncio.wait_for(
-                    agent_loop.run(task=task, model=model, temperature=temperature, seed=seed),
-                    timeout=timeout,
-                )
-                if agent_loop.is_parse_failed():
-                    failure_reason = "parse_failed"
-                    log("Actor", "Parse failed - model output not valid JSON", force=True)
-                elif agent_loop.is_max_steps_reached():
-                    failure_reason = "max_steps_reached"
-                    log("Actor", "Max steps reached without completion - marking as failed", force=True)
-            except asyncio.TimeoutError:
-                failure_reason = "agent_timeout"
-                error_message = f"Agent timeout after {timeout}s"
-                log("Actor", error_message, force=True)
-            except BrowserFatalError as e:
-                # Check if the failed URL belongs to a required domain
-                # If so, it's an infrastructure issue (site unreachable), not agent error
-                is_required_domain = False
-                if e.url:
-                    for domain in allowed_domains:
-                        if _url_matches_domain(e.url, domain):
-                            is_required_domain = True
-                            break
-
-                if is_required_domain:
-                    failure_reason = "site_unreachable"
-                    error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
-                    log("Actor", f"Infrastructure error: {error_message}", force=True)
-                else:
-                    failure_reason = "browser_error"
-                    log("Actor", f"Browser error (agent issue): {e}", force=True)
-            except (LLMFatalError, CacheFatalError) as e:
-                failure_reason = _FATAL_ERROR_MAP[type(e)]
-                error_message = f"{failure_reason}: {e}"
-                log("Actor", f"Fatal error - {error_message}", force=True)
-
-            # Exception path: recover partial state from agent loop
-            # (parse_failed and max_steps_reached are normal exits, not exceptions)
-            if failure_reason and failure_reason not in ("max_steps_reached", "parse_failed"):
-                trajectory = agent_loop.get_trajectory()
-                final_answer = agent_loop.get_final_answer()
-                usage = agent_loop.get_usage()
 
             # GT is collected in real-time via on_observation callback
             # For API_ONLY and HYBRID templates, fetch remaining API GT
@@ -546,8 +625,13 @@ class Actor:
             answer_validations = pre_failed_validations.copy()
 
             if subtasks_to_validate:
+                validator_llm_client = self._build_llm_client(
+                    base_url=base_url,
+                    api_key=api_key,
+                    route_key=f"{base_route_key}:validator",
+                )
                 llm_validations = await validate_answers_with_llm(
-                    llm_client=llm_client,
+                    llm_client=validator_llm_client,
                     subtasks=subtasks_to_validate,
                     answers=parsed_answers,
                     ground_truths=ground_truths,
@@ -664,6 +748,104 @@ class Actor:
             set_current_gt_collector(None)
             if gt_collector is not None:
                 gt_collector.cleanup()
+            if interceptor is not None:
+                interceptor.cleanup()
+            cached_pages.clear()
+            if session is not None:
+                await session.close()
+
+    async def _run_collection(
+        self,
+        model: str,
+        base_url: Optional[str],
+        api_key: str,
+        seed: int,
+        num_subtasks: int,
+        templates: Optional[List[tuple]],
+        max_steps: Optional[int],
+        timeout: int,
+        temperature: float,
+        task_id: Optional[int] = None,
+        route_key: Optional[str] = None,
+    ) -> dict:
+        await self._ensure_browser()
+
+        task = await self.task_manager.generate_composite_task(
+            seed=seed,
+            num_subtasks=num_subtasks,
+            templates=templates,
+        )
+        log("Actor", f"[collect] Generated {len(task.subtasks)} subtasks, seed={seed}")
+
+        total_expected_steps = sum(st.expected_steps for st in task.subtasks)
+        effective_max_steps = max(max_steps or 0, total_expected_steps) if max_steps is not None else total_expected_steps
+        plugins_used, allowed_domains, blocked_patterns = self._collect_plugin_info(task)
+        cached_pages: Dict[str, CachedPage] = {}
+
+        session = None
+        interceptor = None
+        try:
+            session = await self.browser.new_session()
+            interceptor = await self._setup_interceptor(
+                session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
+            )
+            active_protocol = FunctionCallingProtocol()
+            base_route_key = route_key or f"collect:task:{task_id or 'none'}:seed:{seed}"
+            llm_client = self._build_llm_client(
+                base_url=base_url,
+                api_key=api_key,
+                route_key=f"{base_route_key}:agent",
+                max_retries=1,
+                strict_serial=True,
+            )
+
+            async def on_navigation(url: str):
+                await _handle_navigation_event(
+                    interceptor, cached_pages, plugins_used, url, self.use_cache,
+                )
+
+            trajectory, final_answer, usage, failure_reason, error_message, _ = await self._run_agent_loop(
+                task=task,
+                session=session,
+                llm_client=llm_client,
+                protocol=active_protocol,
+                model=model,
+                max_steps=effective_max_steps,
+                timeout=timeout,
+                temperature=temperature,
+                seed=seed,
+                allowed_domains=allowed_domains,
+                on_navigation=on_navigation,
+                on_observation=None,
+            )
+
+            interceptor_stats = interceptor.get_stats()
+            final_url = trajectory[-1].observation.url if trajectory else None
+            conversation = self._build_conversation(task, trajectory, active_protocol)
+
+            result = {
+                "task_name": f"liveweb_arena_collect:{num_subtasks}tasks",
+                "score": 0.0,
+                "success": final_answer is not None and failure_reason is None,
+                "time_taken": 0.0,
+                "extra": {
+                    "mode": "collect",
+                    "task_id": task_id,
+                    "seed": seed,
+                    "num_subtasks": num_subtasks,
+                    "final_url": final_url,
+                    "usage": usage,
+                    "final_answer": final_answer,
+                    "conversation": conversation,
+                    "failure_reason": failure_reason,
+                    "cache_stats": interceptor_stats,
+                    "trajectory_steps": len(trajectory),
+                },
+            }
+            if error_message:
+                result["error"] = error_message
+            return result
+        finally:
             if interceptor is not None:
                 interceptor.cleanup()
             cached_pages.clear()

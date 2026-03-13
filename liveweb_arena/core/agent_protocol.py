@@ -14,6 +14,7 @@ The protocol controls:
 """
 
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -270,6 +271,14 @@ class FunctionCallingProtocol(AgentProtocol):
             "You are a web automation agent that interacts with real websites to complete tasks.\n\n"
             "You have access to a browser and can navigate to any website to gather information.\n"
             "Use the provided tools to interact with the browser.\n\n"
+            "## Response Rules\n\n"
+            "- You must use OpenAI function calling / tool calls for every action.\n"
+            "- Do not output natural language explanations before or after a tool call.\n"
+            "- Do not output chain-of-thought, hidden reasoning, analysis, or planning text.\n"
+            "- Do not output <think>, </think>, <tool_call>, XML, markdown code fences, or raw JSON in message text.\n"
+            "- Your assistant message should contain only the tool call selected by the model.\n"
+            "- If you have enough information, call the stop tool immediately with the final answers.\n"
+            "- Never describe what you are about to do in text; just call the correct tool.\n\n"
             f"{hints}"
             f"{task.combined_intent}\n\n"
             "## Tips\n\n"
@@ -277,6 +286,7 @@ class FunctionCallingProtocol(AgentProtocol):
             "- Use the goto tool to navigate to the appropriate URL\n"
             "- Homepage/list data may be inaccurate. Always visit detail pages for precise values\n"
             "- When done, use the stop tool with your answers\n"
+            "- Keep responses action-only; no commentary\n"
         )
 
     def build_step_prompt(
@@ -298,38 +308,29 @@ class FunctionCallingProtocol(AgentProtocol):
             obs, trajectory, current_step, max_steps,
             self._max_recent_steps, format_step,
         )
-        return prompt + "\nWhat is your next action? Use one of the available tools."
+        return (
+            prompt
+            + "\nWhat is your next action? Use one of the available tools."
+            + "\nReturn only a tool call. Do not output any text explanation, <think> block, XML tag, markdown, or raw JSON."
+        )
 
     def get_tools(self) -> List[dict]:
         return self._tools
 
     def parse_response(self, raw: str, tool_calls: Optional[List[Any]] = None) -> Optional[BrowserAction]:
-        """Parse tool_calls from LLM response."""
-        if not tool_calls:
+        """Parse tool_calls from LLM response.
+
+        Fallback support is intentionally narrow for Qwen-family outputs:
+        - <tool_call>{...}</tool_call>
+        - raw JSON object {"name": "...", "arguments": {...}}
+        """
+        parsed = self._parse_primary_tool_call(tool_calls)
+        if parsed is None and raw:
+            parsed = self._parse_qwen_fallback(raw)
+        if parsed is None:
             return None
 
-        # Use the first tool call — handle both OpenAI SDK objects and dicts
-        call = tool_calls[0]
-        if hasattr(call, 'function') and hasattr(call.function, 'name'):
-            # OpenAI SDK object (from streaming)
-            fn_name = call.function.name
-            fn_args = call.function.arguments
-        elif hasattr(call, 'function') and isinstance(call.function, dict):
-            # ToolCall dataclass (from chat_with_tools)
-            fn_name = call.function.get("name")
-            fn_args = call.function.get("arguments", "{}")
-        else:
-            # Plain dict
-            fn_name = call.get("function", {}).get("name")
-            fn_args = call.get("function", {}).get("arguments", "{}")
-
-        if not fn_name or fn_name not in VALID_ACTION_TYPES:
-            return None
-
-        try:
-            params = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
-        except json.JSONDecodeError:
-            return None
+        fn_name, params = parsed
 
         # Normalize stop action format for compatibility with existing agent_loop
         if fn_name == "stop":
@@ -337,6 +338,66 @@ class FunctionCallingProtocol(AgentProtocol):
             params = {"final": {"answers": answers}}
 
         return BrowserAction(action_type=fn_name, params=params)
+
+    def _parse_primary_tool_call(self, tool_calls: Optional[List[Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not tool_calls:
+            return None
+
+        call = tool_calls[0]
+        if hasattr(call, "function") and hasattr(call.function, "name"):
+            fn_name = call.function.name
+            fn_args = call.function.arguments
+        elif hasattr(call, "function") and isinstance(call.function, dict):
+            fn_name = call.function.get("name")
+            fn_args = call.function.get("arguments", "{}")
+        else:
+            fn_name = call.get("function", {}).get("name")
+            fn_args = call.get("function", {}).get("arguments", "{}")
+
+        return self._normalize_tool_call(fn_name, fn_args)
+
+    def _parse_qwen_fallback(self, raw: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        stripped = raw.strip()
+        if not stripped:
+            return None
+
+        stripped = re.sub(r"^\s*<think>.*?</think>\s*", "", stripped, flags=re.DOTALL)
+        if not stripped:
+            return None
+
+        candidate = None
+        tag_match = re.search(r"<tool_call>\s*(\{.*\})\s*</tool_call>", stripped, re.DOTALL)
+        if tag_match:
+            candidate = tag_match.group(1)
+        elif stripped.startswith("{") and stripped.endswith("}"):
+            candidate = stripped
+        else:
+            return None
+
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        fn_name = payload.get("name")
+        fn_args = payload.get("arguments", {})
+        return self._normalize_tool_call(fn_name, fn_args)
+
+    def _normalize_tool_call(self, fn_name: Any, fn_args: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not isinstance(fn_name, str) or fn_name not in VALID_ACTION_TYPES:
+            return None
+
+        try:
+            params = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(params, dict):
+            return None
+        return fn_name, params
 
     def serialize_step(self, step: TrajectoryStep) -> List[dict]:
         """Serialize as tool_call + tool response messages (standard OpenAI format)."""

@@ -106,6 +106,41 @@ def test_parse_uses_first_tool_call_only(protocol):
     assert action.action_type == "goto"
 
 
+def test_parse_qwen_tool_call_tag_fallback(protocol):
+    raw = """
+<think>
+</think>
+<tool_call>
+{"name":"goto","arguments":{"url":"https://example.com"}}
+</tool_call>
+"""
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "goto"
+    assert action.params["url"] == "https://example.com"
+
+
+def test_parse_qwen_stop_fallback(protocol):
+    raw = '{"name":"stop","arguments":{"answers":{"a1":"42"}}}'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_qwen_stop_after_think_fallback(protocol):
+    raw = '<think>\n</think>\n\n{"name":"stop","arguments":{"answers":{"a1":"42"}}}'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_qwen_fallback_rejects_natural_language(protocol):
+    raw = 'I should stop now. {"name":"stop","arguments":{"answers":{"a1":"42"}}}'
+    assert protocol.parse_response(raw, None) is None
+
+
 # ── serialize_step ─────────────────────────────────────────────────
 
 def _make_step(step_num, action_type, params, action_result="Success", prompt="obs"):

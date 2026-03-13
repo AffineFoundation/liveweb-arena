@@ -1,6 +1,7 @@
 """Agent loop for browser-based task execution"""
 
 import asyncio
+import os
 from typing import Any, Callable, List, Optional, Tuple
 
 from .browser import BrowserSession
@@ -76,6 +77,9 @@ class AgentLoop:
         self._on_navigation = on_navigation
         self._on_step_complete = on_step_complete
         self._on_observation = on_observation
+        self._failfast_action_failures = int(os.getenv("LIVEWEB_FAILFAST_ACTION_FAILURES", "5"))
+        self._failfast_error_pages = int(os.getenv("LIVEWEB_FAILFAST_ERROR_PAGES", "10"))
+        self._failfast_blank_observations = int(os.getenv("LIVEWEB_FAILFAST_BLANK_OBSERVATIONS", "4"))
 
         # Internal state for partial recovery
         self._trajectory: List[TrajectoryStep] = []
@@ -155,7 +159,9 @@ class AgentLoop:
         obs = await self._session.goto("about:blank")
         consecutive_errors = 0
         consecutive_error_pages = 0
-        max_error_page_retries = 10  # Prevent infinite loops on persistent network issues
+        consecutive_action_failures = 0
+        consecutive_blank_observations = 0
+        max_error_page_retries = self._failfast_error_pages
 
         effective_step = 0  # Count all steps including error pages (AI sees them)
         iteration = 0  # Total iterations (safety limit)
@@ -185,6 +191,19 @@ class AgentLoop:
             else:
                 # Reset error page counter on valid page
                 consecutive_error_pages = 0
+
+            obs_text = getattr(obs, "accessibility_tree", "") or ""
+            if obs.url == "about:blank" or len(obs_text.strip()) < 50:
+                consecutive_blank_observations += 1
+            else:
+                consecutive_blank_observations = 0
+
+            if consecutive_blank_observations >= self._failfast_blank_observations:
+                raise BrowserFatalError(
+                    f"Too many blank observations ({consecutive_blank_observations})",
+                    url=last_goto_url or obs.url,
+                    attempts=consecutive_blank_observations,
+                )
 
             effective_step += 1
             log("")  # Blank line between steps
@@ -283,6 +302,7 @@ class AgentLoop:
                 try:
                     obs = await self._session.execute_action(action)
                     action_result = "Success"
+                    consecutive_action_failures = 0
 
                     # Track goto URL for error context
                     if action.action_type == "goto":
@@ -299,6 +319,13 @@ class AgentLoop:
                 except Exception as e:
                     # Non-navigation action failed
                     action_result = f"Failed: {e}"
+                    consecutive_action_failures += 1
+                    if consecutive_action_failures >= self._failfast_action_failures:
+                        raise BrowserFatalError(
+                            f"Too many consecutive action failures ({consecutive_action_failures})",
+                            url=last_goto_url or current_obs.url,
+                            attempts=consecutive_action_failures,
+                        )
 
             step = TrajectoryStep(
                 step_num=step_num,
