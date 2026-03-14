@@ -1,11 +1,13 @@
 """OpenAI-compatible LLM client with retry, streaming, tool calls, and multi-server routing."""
 
 import asyncio
+import ipaddress
 import os
 import random
 import time
 import uuid
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -343,6 +345,32 @@ class LLMClient:
             return normalized[:-3]
         return normalized
 
+    @staticmethod
+    def _should_bypass_proxy(base_url: str) -> bool:
+        try:
+            hostname = (urlparse(base_url).hostname or "").strip()
+            if not hostname:
+                return False
+            if hostname in {"localhost", "127.0.0.1"}:
+                return True
+            ip = ipaddress.ip_address(hostname)
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            return False
+
+    def _build_httpx_client(
+        self,
+        *,
+        base_url: str,
+        timeout: httpx.Timeout,
+    ) -> httpx.AsyncClient:
+        # Local SGLang endpoints should bypass the host proxy, otherwise
+        # requests to the colocated router/servers can get sent to localhost:10812.
+        return httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=not self._should_bypass_proxy(base_url),
+        )
+
     async def _abort_request(
         self,
         lease: Optional[_ServerLease],
@@ -354,7 +382,10 @@ class LLMClient:
 
         abort_url = f"{self._server_root_url(lease.base_url)}/abort_request"
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            async with self._build_httpx_client(
+                base_url=lease.base_url,
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            ) as client:
                 response = await client.post(
                     abort_url,
                     json={
@@ -742,11 +773,13 @@ class LLMClient:
             pool=30.0,
         )
 
+        http_client = self._build_httpx_client(base_url=base_url, timeout=timeout_config)
         client = openai.AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout_config,
             max_retries=0,
+            http_client=http_client,
         )
 
         try:
@@ -820,11 +853,13 @@ class LLMClient:
             pool=30.0,
         )
 
+        http_client = self._build_httpx_client(base_url=base_url, timeout=timeout_config)
         client = openai.AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout_config,
             max_retries=0,
+            http_client=http_client,
         )
 
         try:

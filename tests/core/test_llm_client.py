@@ -67,6 +67,11 @@ class _FakeAsyncHTTPClient:
         return _FakeHTTPXResponse()
 
 
+class _FakeBuiltHTTPClient:
+    def __init__(self, recorder, *args, **kwargs):
+        recorder.append(kwargs)
+
+
 @pytest.mark.asyncio
 async def test_chat_with_tools_sends_request_id_in_extra_body(monkeypatch):
     requests = []
@@ -152,3 +157,43 @@ async def test_chat_with_tools_timeout_triggers_abort(monkeypatch):
     assert abort_url == "http://127.0.0.1:31050/abort_request"
     assert abort_payload["rid"] == requests[0]["extra_body"]["request_id"]
     assert abort_payload["abort_all"] is False
+
+
+@pytest.mark.parametrize(
+    ("base_url", "should_bypass"),
+    [
+        ("http://localhost:31050/v1", True),
+        ("http://127.0.0.1:31050/v1", True),
+        ("http://10.0.0.8:31050/v1", True),
+        ("http://192.168.1.10:31050/v1", True),
+        ("http://172.16.0.5:31050/v1", True),
+        ("http://169.254.0.20:31050/v1", True),
+        ("http://[::1]:31050/v1", True),
+        ("https://api.openai.com/v1", False),
+        ("https://example.com/v1", False),
+    ],
+)
+def test_should_bypass_proxy_for_local_and_private_addresses(base_url, should_bypass):
+    assert LLMClient._should_bypass_proxy(base_url) is should_bypass
+
+
+def test_build_httpx_client_disables_trust_env_for_local_routes(monkeypatch):
+    built_clients = []
+
+    def _httpx_factory(*args, **kwargs):
+        return _FakeBuiltHTTPClient(built_clients, *args, **kwargs)
+
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.httpx.AsyncClient", _httpx_factory)
+
+    client = LLMClient(base_url="http://127.0.0.1:31050/v1", api_key="local")
+    client._build_httpx_client(
+        base_url="http://127.0.0.1:31050/v1",
+        timeout=object(),
+    )
+    client._build_httpx_client(
+        base_url="https://api.openai.com/v1",
+        timeout=object(),
+    )
+
+    assert built_clients[0]["trust_env"] is False
+    assert built_clients[1]["trust_env"] is True
