@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from liveweb_arena.core.browser import BrowserEngine, BrowserSession
+from liveweb_arena.core.browser import BrowserEngine, BrowserSession, is_browser_transport_error
 from liveweb_arena.core.task_manager import TaskManager
 from liveweb_arena.core.agent_protocol import FunctionCallingProtocol
 from liveweb_arena.core.agent_loop import AgentLoop, BrowserFatalError
@@ -853,11 +853,11 @@ class Actor:
                 await session.close()
 
     async def _ensure_browser(self):
-        """Ensure browser is started (lazy initialization)."""
+        """Ensure browser is started and healthy."""
         async with self._lock:
             if self.browser is None:
                 self.browser = BrowserEngine(headless=True)
-                await self.browser.start()
+            await self.browser.ensure_healthy()
 
     async def shutdown(self):
         """Shutdown browser, cache manager, and cleanup resources."""
