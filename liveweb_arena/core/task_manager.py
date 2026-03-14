@@ -36,6 +36,54 @@ class TaskManager:
             self._plugin_instances[name] = plugin_cls()
         return self._plugin_instances[name]
 
+    @staticmethod
+    def derive_subtask_seed(seed: int, index: int) -> int:
+        """Derive a deterministic seed for one subtask inside a composite task."""
+        hash_input = f"{seed}:{index}".encode()
+        return int(hashlib.sha256(hash_input).hexdigest()[:8], 16)
+
+    def plan_subtasks(
+        self,
+        seed: int,
+        num_subtasks: int = 2,
+        templates: Optional[List[tuple]] = None,
+    ) -> List[Dict[str, object]]:
+        """
+        Plan deterministic subtask generation without constructing the full CompositeTask.
+
+        The returned plan is stable and matches the seeds/templates that
+        generate_composite_task() will use.
+        """
+        num_subtasks = max(1, min(4, num_subtasks))
+        rng = random.Random(seed)
+
+        if templates:
+            selected_templates = []
+            for i in range(num_subtasks):
+                t = templates[i % len(templates)]
+                if len(t) == 2:
+                    selected_templates.append((t[0], t[1], None))
+                else:
+                    selected_templates.append(t)
+        else:
+            available = list(self._plugin_classes.keys())
+            if len(available) == 0:
+                raise ValueError("No plugins available")
+            selected_templates = [(rng.choice(available), None, None) for _ in range(num_subtasks)]
+
+        plan = []
+        for i, (plugin_name, template_name, variant) in enumerate(selected_templates):
+            plan.append(
+                {
+                    "subtask_index": i,
+                    "plugin_name": plugin_name,
+                    "template_name": template_name,
+                    "variant": variant,
+                    "subtask_seed": self.derive_subtask_seed(seed, i),
+                }
+            )
+        return plan
+
     async def generate_composite_task(
         self,
         seed: int,
@@ -54,34 +102,10 @@ class TaskManager:
         Returns:
             CompositeTask with subtasks and combined_intent
         """
-        # Validate num_subtasks
-        num_subtasks = max(1, min(4, num_subtasks))
-
-        # Initialize RNG with seed for deterministic generation
-        rng = random.Random(seed)
-
-        # Build list of (plugin_name, template_name, variant) for each subtask
-        if templates:
-            # Use specified templates (cycle if not enough)
-            # Normalize to 3-element tuples
-            selected_templates = []
-            for i in range(num_subtasks):
-                t = templates[i % len(templates)]
-                if len(t) == 2:
-                    # (plugin, template_name) -> (plugin, template_name, None)
-                    selected_templates.append((t[0], t[1], None))
-                else:
-                    # Already (plugin, template_name, variant)
-                    selected_templates.append(t)
-        else:
-            # Random selection from available plugins (no specific template or variant)
-            available = list(self._plugin_classes.keys())
-            if len(available) == 0:
-                raise ValueError("No plugins available")
-            selected_templates = [(rng.choice(available), None, None) for _ in range(num_subtasks)]
+        plan = self.plan_subtasks(seed=seed, num_subtasks=num_subtasks, templates=templates)
 
         # Initialize plugins that will be used (some need API data before question generation)
-        plugins_to_use = set(p for p, _, _ in selected_templates)
+        plugins_to_use = {item["plugin_name"] for item in plan}
         for plugin_name in plugins_to_use:
             plugin = self._get_plugin(plugin_name)
             if hasattr(plugin, 'initialize'):
@@ -90,11 +114,12 @@ class TaskManager:
         # Generate sub-tasks
         subtasks: List[SubTask] = []
 
-        for i, (plugin_name, template_name, variant) in enumerate(selected_templates):
+        for i, item in enumerate(plan):
+            plugin_name = str(item["plugin_name"])
+            template_name = item["template_name"]
+            variant = item["variant"]
             plugin = self._get_plugin(plugin_name)
-            # Derive seed for this sub-task (hash-based to avoid collisions)
-            hash_input = f"{seed}:{i}".encode()
-            subtask_seed = int(hashlib.sha256(hash_input).hexdigest()[:8], 16)
+            subtask_seed = int(item["subtask_seed"])
             subtask = await plugin.generate_task(
                 subtask_seed,
                 template_name=template_name,

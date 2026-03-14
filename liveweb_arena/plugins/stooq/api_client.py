@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from liveweb_arena.plugins.base_client import RateLimiter
+from liveweb_arena.plugins.base_client import RateLimiter, create_http_session
 
 logger = logging.getLogger(__name__)
 
@@ -174,12 +174,11 @@ class StooqClient:
         await _global_csv_limiter.wait()
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with create_http_session(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as session:
                 params = {"s": symbol, "i": "d"}
                 async with session.get(
                     cls.CSV_URL,
                     params=params,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if response.status != 200:
                         logger.warning(f"Stooq error for {symbol}: {response.status}")
@@ -247,16 +246,13 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
     failed = 0
 
     # Sequential fetch with global rate limiter — avoid IP bans
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": "Mozilla/5.0"},
-    ) as session:
+    async with create_http_session(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as session:
         for symbol in assets:
             await _global_csv_limiter.wait()
             try:
                 url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
                 async with session.get(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as response:
                     if response.status != 200:
                         failed += 1
@@ -413,12 +409,10 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
     for sym in variants:
         await _global_csv_limiter.wait()
         try:
-            async with aiohttp.ClientSession() as session:
+            async with create_http_session(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as session:
                 url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
                 async with session.get(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    headers={"User-Agent": "Mozilla/5.0"},
                 ) as response:
                     if response.status != 200:
                         continue

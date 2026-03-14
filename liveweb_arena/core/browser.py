@@ -17,6 +17,21 @@ VIEW_MORE_OVERLAP = 2000    # Overlap between views for context continuity
 PAGE_TIMEOUT_MS = 30000
 NAVIGATION_TIMEOUT_MS = 30000
 
+_BROWSER_TRANSPORT_ERROR_PATTERNS = (
+    "handler is closed",
+    "transport closed",
+    "browser has been closed",
+    "target page, context or browser has been closed",
+    "connection closed",
+    "browser.new_context",
+)
+
+
+def is_browser_transport_error(exc: BaseException) -> bool:
+    """Return True when an exception indicates a dead Playwright/browser transport."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(pattern in text for pattern in _BROWSER_TRANSPORT_ERROR_PATTERNS)
+
 
 class BrowserSession:
     """
@@ -711,6 +726,37 @@ class BrowserEngine:
             "--disable-dev-shm-usage",
             "--disable-gpu",
         ]
+        self._dirty = False
+
+    def mark_dirty(self):
+        """Mark the shared browser state as unhealthy so the next session rebuilds it."""
+        self._dirty = True
+
+    def is_alive(self) -> bool:
+        """Best-effort health check for the shared browser transport."""
+        if self._playwright is None:
+            return False
+        if self._isolation_mode == "strict":
+            return True
+        if self._browser is None or self._dirty:
+            return False
+        try:
+            return bool(self._browser.is_connected())
+        except Exception:
+            return False
+
+    async def ensure_healthy(self):
+        """Ensure the underlying browser transport is healthy, rebuilding if needed."""
+        if self._isolation_mode == "strict":
+            if self._playwright is None:
+                await self.start()
+            return
+
+        if self.is_alive():
+            return
+
+        await self.stop()
+        await self.start()
 
     async def start(self):
         """Start Playwright and launch browser (for shared mode)"""
@@ -723,6 +769,7 @@ class BrowserEngine:
                     headless=self._headless,
                     args=self._browser_args,
                 )
+            self._dirty = False
 
     async def new_session(self) -> BrowserSession:
         """
@@ -731,8 +778,7 @@ class BrowserEngine:
         Returns:
             BrowserSession instance
         """
-        if self._playwright is None:
-            await self.start()
+        await self.ensure_healthy()
 
         # Prepare context options
         context_options = {
@@ -756,10 +802,19 @@ class BrowserEngine:
             if self._browser is None:
                 await self.start()
 
-            context = await self._browser.new_context(**context_options)
-            context.set_default_timeout(PAGE_TIMEOUT_MS)
-            page = await context.new_page()
-            return BrowserSession(context, page)
+            for attempt in range(2):
+                try:
+                    context = await self._browser.new_context(**context_options)
+                    context.set_default_timeout(PAGE_TIMEOUT_MS)
+                    page = await context.new_page()
+                    return BrowserSession(context, page)
+                except Exception as exc:
+                    if attempt == 0 and is_browser_transport_error(exc):
+                        log("Browser", f"Shared browser unhealthy during new_session(), rebuilding: {exc}", force=True)
+                        self.mark_dirty()
+                        await self.ensure_healthy()
+                        continue
+                    raise
 
     async def stop(self):
         """Stop browser and Playwright with timeout"""
@@ -780,7 +835,9 @@ class BrowserEngine:
                         except Exception:
                             pass
                         self._playwright = None
+                    self._dirty = False
         except asyncio.TimeoutError:
             # 超时则强制清理引用
             self._browser = None
             self._playwright = None
+            self._dirty = False

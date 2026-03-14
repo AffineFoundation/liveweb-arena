@@ -70,6 +70,26 @@ class TestDomainAllowed:
         assert i._is_domain_allowed("http://localhost:8080/api")
 
 
+class TestSoftFailPolicy:
+    def test_soft_fail_url_pattern(self, monkeypatch):
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_DOMAINS", "")
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_URL_PATTERNS", "news.ycombinator.com/ask")
+        i = _interceptor()
+        assert i._should_soft_fail_domain("https://news.ycombinator.com/ask")
+        assert not i._should_soft_fail_domain("https://news.ycombinator.com/newest")
+
+    def test_required_soft_regex_policy(self, monkeypatch):
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_DOMAINS", "")
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_URL_PATTERNS", "")
+        monkeypatch.setenv("LIVEWEB_REQUIRED_SOFT_URL_REGEXES", r"^news\.ycombinator\.com/?$,^news\.ycombinator\.com/(ask|show)(?:[/?].*)?$")
+        monkeypatch.setenv("LIVEWEB_PREFETCH_SOFT_URL_REGEXES", r"^channelsurfer\.tv(?:/.*)?$")
+        i = _interceptor()
+        assert i._soft_fail_policy("https://news.ycombinator.com/") == "required_soft"
+        assert i._soft_fail_policy("https://news.ycombinator.com/ask") == "required_soft"
+        assert i._soft_fail_policy("https://channelsurfer.tv/") == "prefetch_soft"
+        assert i._soft_fail_policy("https://news.ycombinator.com/newest") is None
+
+
 # ── _find_cached_page ─────────────────────────────────────────────
 
 class TestFindCachedPage:

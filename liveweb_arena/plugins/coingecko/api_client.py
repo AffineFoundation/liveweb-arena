@@ -7,7 +7,13 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from liveweb_arena.plugins.base_client import APIFetchError, BaseAPIClient, RateLimiter, validate_api_response
+from liveweb_arena.plugins.base_client import (
+    APIFetchError,
+    BaseAPIClient,
+    RateLimiter,
+    create_http_session,
+    validate_api_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +84,11 @@ class CoinGeckoClient(BaseAPIClient):
         headers = cls.get_headers()
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with create_http_session() as session:
                 async with session.get(
                     url,
                     params=params,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if response.status == 429:
                         # Rate limited - wait and retry once
@@ -92,7 +97,6 @@ class CoinGeckoClient(BaseAPIClient):
                             url,
                             params=params,
                             headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as retry_response:
                             if retry_response.status != 200:
                                 raise APIFetchError(f"CoinGecko retry failed: {retry_response.status}")
@@ -156,7 +160,7 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
     logger.info(f"Fetching CoinGecko data for {len(coins)} coins...")
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_http_session(timeout=30) as session:
             # Use CoinGeckoClient's API key if available
             headers = CoinGeckoClient.get_headers()
             base_url = CoinGeckoClient.get_base_url()
@@ -175,7 +179,6 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
                 f"{base_url}/coins/markets",
                 params=params,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
                 if response.status != 200:
                     raise Exception(f"API error: {response.status}")
@@ -237,7 +240,7 @@ async def fetch_single_coin_data(coin_id: str) -> Dict[str, Any]:
         APIFetchError: If API request fails or returns invalid data
     """
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_http_session(timeout=30) as session:
             headers = CoinGeckoClient.get_headers()
             base_url = CoinGeckoClient.get_base_url()
 
@@ -257,7 +260,6 @@ async def fetch_single_coin_data(coin_id: str) -> Dict[str, Any]:
                 f"{base_url}/coins/markets",
                 params=params,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
                 if response.status != 200:
                     raise APIFetchError(

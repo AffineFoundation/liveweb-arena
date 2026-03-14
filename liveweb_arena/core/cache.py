@@ -18,6 +18,7 @@ Directory structure:
 """
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -46,9 +47,11 @@ class CacheFatalError(Exception):
     Evaluation should be terminated immediately.
     """
 
-    def __init__(self, message: str, url: str = None):
+    def __init__(self, message: str, url: str = None, kind: str = "fatal", fatal: bool = True):
         super().__init__(message)
         self.url = url
+        self.kind = kind
+        self.fatal = fatal
 
 
 def log(tag: str, message: str):
@@ -114,6 +117,18 @@ class PageRequirement:
     def data(url: str) -> "PageRequirement":
         """Create data page requirement (HTML + API)."""
         return PageRequirement(url, need_api=True)
+
+
+@dataclass
+class CacheFetchResult:
+    """Result of ensuring one cached page."""
+
+    page: CachedPage
+    source: str  # hit|hit_after_lock|stale|fresh
+    normalized_url: str
+    domain_key: str
+    latency_s: float = 0.0
+    stale: bool = False
 
 
 async def async_file_lock_acquire(lock_path: Path, timeout: float = 60.0) -> int:
@@ -276,10 +291,19 @@ class CacheManager:
         if ttl is None:
             ttl = int(os.environ.get("LIVEWEB_CACHE_TTL", str(DEFAULT_TTL)))
         self.ttl = ttl
+        self._prefetch_interval = float(
+            os.environ.get("LIVEWEB_CACHE_PREFETCH_INTERVAL", str(self._PREFETCH_INTERVAL))
+        )
+        self.allow_stale = os.environ.get("LIVEWEB_CACHE_ALLOW_STALE", "1") == "1"
+        self.stale_max_age = int(os.environ.get("LIVEWEB_CACHE_STALE_MAX_AGE", str(24 * 3600)))
+        self.max_cache_fetches = int(os.environ.get("LIVEWEB_MAX_CACHE_FETCHES", "6"))
         self._playwright = None
         self._browser = None
         self._browser_lock = asyncio.Lock()
         self._last_fetch_time: float = 0
+        self._global_fetch_semaphore = asyncio.Semaphore(max(1, self.max_cache_fetches))
+        self._domain_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._refresh_tasks: Dict[str, asyncio.Task] = {}
 
     async def _ensure_browser(self):
         """Ensure shared Playwright browser is running (lazy singleton)."""
@@ -315,7 +339,7 @@ class CacheManager:
         self,
         pages: List[PageRequirement],
         plugin: "BasePlugin",
-    ) -> Dict[str, CachedPage]:
+    ) -> Dict[str, CacheFetchResult]:
         """
         Ensure specified pages are cached.
 
@@ -326,7 +350,7 @@ class CacheManager:
         Returns:
             {normalized_url: CachedPage} mapping
         """
-        result = {}
+        result: Dict[str, CacheFetchResult] = {}
 
         for page_req in pages:
             normalized = normalize_url(page_req.url)
@@ -340,92 +364,79 @@ class CacheManager:
         url: str,
         plugin: "BasePlugin",
         need_api: bool,
-    ) -> CachedPage:
+        allow_stale_lookup: bool = True,
+    ) -> CacheFetchResult:
         """Ensure single URL is cached."""
         normalized = normalize_url(url)
         cache_dir = url_to_cache_dir(self.cache_dir, normalized)
         cache_file = cache_dir / "page.json"
         lock_file = cache_dir / ".lock"
-
+        domain_key = self._domain_key_for_url(url)
         page_type = "data" if need_api else "nav"
 
         # 1. Quick check (no lock)
-        cached = self._load_if_valid(cache_file, need_api)
-        if cached:
+        status, cached = self._load_with_status(cache_file, need_api)
+        if status == "valid" and cached:
             log("Cache", f"HIT {page_type} - {url_display(normalized)}")
-            return cached
+            return CacheFetchResult(
+                page=cached,
+                source="hit",
+                normalized_url=normalized,
+                domain_key=domain_key,
+            )
+        if allow_stale_lookup and status == "stale" and cached:
+            log("Cache", f"STALE {page_type} - serving {url_display(normalized)}")
+            self._schedule_refresh(url, plugin, need_api)
+            return CacheFetchResult(
+                page=cached,
+                source="stale",
+                normalized_url=normalized,
+                domain_key=domain_key,
+                stale=True,
+            )
 
         # 2. Need update, acquire async lock (non-blocking to avoid deadlock)
         lock_fd = await async_file_lock_acquire(lock_file)
         try:
             # 3. Double check (another process may have updated)
-            cached = self._load_if_valid(cache_file, need_api)
-            if cached:
+            status, cached = self._load_with_status(cache_file, need_api)
+            if status == "valid" and cached:
                 log("Cache", f"HIT {page_type} (after lock) - {url_display(normalized)}")
-                return cached
+                return CacheFetchResult(
+                    page=cached,
+                    source="hit_after_lock",
+                    normalized_url=normalized,
+                    domain_key=domain_key,
+                )
+            if allow_stale_lookup and status == "stale" and cached:
+                log("Cache", f"STALE {page_type} (after lock) - serving {url_display(normalized)}")
+                self._schedule_refresh(url, plugin, need_api)
+                return CacheFetchResult(
+                    page=cached,
+                    source="stale",
+                    normalized_url=normalized,
+                    domain_key=domain_key,
+                    stale=True,
+                )
 
             # 4. Actually fetch - page and API in parallel when possible
             log("Cache", f"MISS {page_type} - fetching {url_display(normalized)}")
 
             # Rate limit consecutive fetches to avoid triggering anti-bot
             now = time.time()
-            wait = self._PREFETCH_INTERVAL - (now - self._last_fetch_time)
+            wait = self._prefetch_interval - (now - self._last_fetch_time)
             if wait > 0:
                 await asyncio.sleep(wait)
             self._last_fetch_time = time.time()
 
             start = time.time()
-
-            if need_api:
-                # Fetch HTML and API data concurrently
-                page_task = asyncio.ensure_future(self._fetch_page(url, plugin))
-                api_task = asyncio.ensure_future(plugin.fetch_api_data(url))
-
-                # Wait for both, collecting errors
-                page_result = None
-                page_error = None
-                api_data = None
-                api_error = None
-
-                try:
-                    page_result = await page_task
-                except Exception as e:
-                    page_error = e
-                    # Cancel API task if page fails — no point caching without HTML
-                    api_task.cancel()
-
-                if page_error is None:
-                    try:
-                        api_data = await api_task
-                    except Exception as e:
-                        api_error = e
-
-                if page_error is not None:
-                    raise CacheFatalError(
-                        f"Page fetch failed (browser cannot load): {page_error}",
+            async with self._global_fetch_semaphore:
+                async with self._domain_semaphore(domain_key):
+                    html, accessibility_tree, api_data = await self._fetch_and_build_cache(
                         url=url,
+                        plugin=plugin,
+                        need_api=need_api,
                     )
-                html, accessibility_tree = page_result
-
-                if api_error is not None:
-                    raise CacheFatalError(
-                        f"API data fetch failed (GT will be invalid): {api_error}",
-                        url=url,
-                    )
-                if not api_data:
-                    raise CacheFatalError(
-                        f"API data is empty (GT will be invalid)",
-                        url=url,
-                    )
-            else:
-                try:
-                    html, accessibility_tree = await self._fetch_page(url, plugin)
-                except Exception as e:
-                    raise CacheFatalError(
-                        f"Page fetch failed (browser cannot load): {e}",
-                        url=url,
-                    )
-                api_data = None
 
             cached = CachedPage(
                 url=url,
@@ -439,36 +450,148 @@ class CacheManager:
             self._save(cache_file, cached)
             elapsed = time.time() - start
             log("Cache", f"SAVED {page_type} - {url_display(normalized)} ({elapsed:.1f}s)")
-            return cached
+            return CacheFetchResult(
+                page=cached,
+                source="fresh",
+                normalized_url=normalized,
+                domain_key=domain_key,
+                latency_s=elapsed,
+            )
         finally:
             async_file_lock_release(lock_fd)
 
-    def _load_if_valid(self, cache_file: Path, need_api: bool) -> Optional[CachedPage]:
-        """Load cache if valid."""
+    def _load_with_status(self, cache_file: Path, need_api: bool) -> tuple[str, Optional[CachedPage]]:
+        """Load cache and classify it as valid, stale, invalid, or missing."""
         if not cache_file.exists():
-            return None
+            return "missing", None
 
         try:
             cached = self._load(cache_file)
         except Exception as e:
             logger.warning(f"Failed to load cache {cache_file}: {e}")
-            # Corrupted cache - delete it
             self._delete_cache(cache_file)
-            return None
+            return "invalid", None
 
-        if cached.is_expired(self.ttl):
-            # Expired cache - delete it
-            self._delete_cache(cache_file)
-            return None
-
-        # Check if cache is complete based on its own need_api flag
-        # Also handle case where current request needs API but old cache doesn't have it
         if not cached.is_complete() or (need_api and not cached.api_data):
             log("Cache", f"Incomplete (missing API) - deleting {url_display(cached.url)}")
             self._delete_cache(cache_file)
-            return None
+            return "invalid", None
 
-        return cached
+        age = time.time() - cached.fetched_at
+        if age <= self.ttl:
+            return "valid", cached
+
+        if self.allow_stale and age <= self.ttl + self.stale_max_age:
+            return "stale", cached
+
+        self._delete_cache(cache_file)
+        return "expired", None
+
+    async def _fetch_and_build_cache(
+        self,
+        url: str,
+        plugin: "BasePlugin",
+        need_api: bool,
+    ) -> tuple[str, str, Optional[Dict[str, Any]]]:
+        if need_api:
+            page_task = asyncio.create_task(self._fetch_page(url, plugin))
+            api_task = asyncio.create_task(plugin.fetch_api_data(url))
+
+            page_result = None
+            page_error = None
+            api_data = None
+            api_error = None
+
+            try:
+                page_result = await page_task
+            except Exception as e:
+                page_error = e
+                api_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await api_task
+
+            if page_error is None:
+                try:
+                    api_data = await api_task
+                except Exception as e:
+                    api_error = e
+
+            if page_error is not None:
+                if isinstance(page_error, CacheFatalError):
+                    raise page_error
+                raise CacheFatalError(
+                    f"Page fetch failed (browser cannot load): {page_error}",
+                    url=url,
+                )
+
+            html, accessibility_tree = page_result
+
+            if api_error is not None:
+                raise CacheFatalError(
+                    f"API data fetch failed (GT will be invalid): {api_error}",
+                    url=url,
+                    kind="api_error",
+                    fatal=False,
+                )
+            if not api_data:
+                raise CacheFatalError(
+                    "API data is empty (GT will be invalid)",
+                    url=url,
+                    kind="api_empty",
+                    fatal=False,
+                )
+            return html, accessibility_tree, api_data
+
+        try:
+            html, accessibility_tree = await self._fetch_page(url, plugin)
+        except Exception as e:
+            if isinstance(e, CacheFatalError):
+                raise e
+            raise CacheFatalError(
+                f"Page fetch failed (browser cannot load): {e}",
+                url=url,
+            )
+        return html, accessibility_tree, None
+
+    def _schedule_refresh(self, url: str, plugin: "BasePlugin", need_api: bool):
+        normalized = normalize_url(url)
+        existing = self._refresh_tasks.get(normalized)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._background_refresh(url, plugin, need_api, normalized))
+        self._refresh_tasks[normalized] = task
+
+    async def _background_refresh(self, url: str, plugin: "BasePlugin", need_api: bool, normalized: str):
+        try:
+            await self._ensure_single(url, plugin, need_api, allow_stale_lookup=False)
+        except Exception as e:
+            log("Cache", f"Background refresh skipped for {url_display(normalized)}: {e}")
+        finally:
+            self._refresh_tasks.pop(normalized, None)
+
+    def _domain_key_for_url(self, url: str) -> str:
+        hostname = urlparse(url).netloc.lower()
+        if "coingecko" in hostname:
+            return "coingecko"
+        if "stooq" in hostname:
+            return "stooq"
+        if "news.ycombinator" in hostname:
+            return "news_ycombinator"
+        if "taostats" in hostname:
+            return "taostats"
+        return "default"
+
+    def _domain_limit_for_key(self, domain_key: str) -> int:
+        env_name = f"LIVEWEB_CACHE_DOMAIN_LIMIT_{domain_key.upper()}"
+        default_limit = int(os.environ.get("LIVEWEB_CACHE_DOMAIN_LIMIT_DEFAULT", "2"))
+        return max(1, int(os.environ.get(env_name, str(default_limit))))
+
+    def _domain_semaphore(self, domain_key: str) -> asyncio.Semaphore:
+        sem = self._domain_semaphores.get(domain_key)
+        if sem is None:
+            sem = asyncio.Semaphore(self._domain_limit_for_key(domain_key))
+            self._domain_semaphores[domain_key] = sem
+        return sem
 
     def _delete_cache(self, cache_file: Path):
         """Delete cache file."""
@@ -549,9 +672,12 @@ class CacheManager:
 
             # Layer 1: HTTP status check
             if response and response.status >= 400:
+                fatal = response.status not in (404, 410)
                 raise CacheFatalError(
                     f"HTTP {response.status} for {url}",
                     url=url,
+                    kind=f"http_{response.status}",
+                    fatal=fatal,
                 )
 
             # Wait for network idle (short timeout: ads are blocked, so
@@ -666,4 +792,3 @@ class CacheManager:
             return self._load(cache_file)
         except Exception:
             return None
-

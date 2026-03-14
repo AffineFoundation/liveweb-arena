@@ -10,6 +10,7 @@ Usage:
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
@@ -18,13 +19,40 @@ from urllib.parse import urlparse
 from playwright.async_api import Route
 
 from liveweb_arena.core.block_patterns import TRACKING_BLOCK_PATTERNS
-from liveweb_arena.core.cache import CachedPage, CacheFatalError, CacheManager, PageRequirement, normalize_url
+from liveweb_arena.core.cache import (
+    CachedPage,
+    CacheFatalError,
+    CacheFetchResult,
+    CacheManager,
+    PageRequirement,
+    normalize_url,
+)
 
 logger = logging.getLogger(__name__)
 
-# Pre-fetch timeout must be less than the main browser's NAVIGATION_TIMEOUT_MS (30s)
-# so that route.abort() reaches the browser BEFORE page.goto() times out.
-PREFETCH_TIMEOUT = 25
+DEFAULT_PREFETCH_TIMEOUT_NAV = int(
+    os.environ.get("LIVEWEB_PREFETCH_TIMEOUT_NAV", "12")
+)
+DEFAULT_PREFETCH_TIMEOUT_DATA = int(
+    os.environ.get("LIVEWEB_PREFETCH_TIMEOUT_DATA", "25")
+)
+DEFAULT_SOFT_FAIL_DOMAINS = "news.ycombinator.com,channelsurfer.tv"
+DEFAULT_SOFT_FAIL_URL_PATTERNS = (
+    "news.ycombinator.com/ask,"
+    "news.ycombinator.com/show,"
+    "channelsurfer.tv,"
+    "runcaptain.com,"
+    "aether.saphal.me"
+)
+DEFAULT_REQUIRED_SOFT_URL_REGEXES = (
+    r"^news\.ycombinator\.com/?$,"
+    r"^news\.ycombinator\.com/(ask|show)(?:[/?].*)?$"
+)
+DEFAULT_PREFETCH_SOFT_URL_REGEXES = (
+    r"^channelsurfer\.tv(?:/.*)?$,"
+    r"^runcaptain\.com(?:/.*)?$,"
+    r"^aether\.saphal\.me(?:/.*)?$"
+)
 
 # 1x1 transparent GIF (43 bytes)
 _TRANSPARENT_GIF = (
@@ -57,9 +85,16 @@ class InterceptorStats:
     blocked: int = 0
     passed: int = 0
     errors: int = 0
+    stale_hits: int = 0
+    prefetch_timeouts: int = 0
+    soft_failures: int = 0
     miss_urls: List[str] = field(default_factory=list)
     blocked_urls: Set[str] = field(default_factory=set)
     passed_urls: Set[str] = field(default_factory=set)
+    per_domain_prefetch_timeouts: Dict[str, int] = field(default_factory=dict)
+    per_domain_soft_failures: Dict[str, int] = field(default_factory=dict)
+    per_domain_miss_count: Dict[str, int] = field(default_factory=dict)
+    per_domain_miss_latency_s: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         total = self.hits + self.misses + self.blocked + self.passed
@@ -69,11 +104,18 @@ class InterceptorStats:
             "blocked": self.blocked,
             "passed": self.passed,
             "errors": self.errors,
+            "stale_hits": self.stale_hits,
+            "prefetch_timeouts": self.prefetch_timeouts,
+            "soft_failures": self.soft_failures,
             "total": total,
             "hit_rate": self.hits / max(1, self.hits + self.misses),
             "miss_urls": self.miss_urls[:10],
             "blocked_urls": sorted(self.blocked_urls),
             "passed_urls": sorted(self.passed_urls),
+            "per_domain_prefetch_timeouts": self.per_domain_prefetch_timeouts,
+            "per_domain_soft_failures": self.per_domain_soft_failures,
+            "per_domain_miss_count": self.per_domain_miss_count,
+            "per_domain_miss_latency_s": self.per_domain_miss_latency_s,
         }
 
 
@@ -140,6 +182,26 @@ class CacheInterceptor:
         self.offline = offline
         self.stats = InterceptorStats()
         self._pending_error: Optional[Exception] = None
+        self._soft_fail_domains = {
+            item.strip().lower()
+            for item in os.environ.get("LIVEWEB_SOFT_FAIL_DOMAINS", DEFAULT_SOFT_FAIL_DOMAINS).split(",")
+            if item.strip()
+        }
+        self._soft_fail_url_patterns = [
+            item.strip().lower()
+            for item in os.environ.get("LIVEWEB_SOFT_FAIL_URL_PATTERNS", DEFAULT_SOFT_FAIL_URL_PATTERNS).split(",")
+            if item.strip()
+        ]
+        self._required_soft_url_regexes = [
+            re.compile(item.strip(), re.IGNORECASE)
+            for item in os.environ.get("LIVEWEB_REQUIRED_SOFT_URL_REGEXES", DEFAULT_REQUIRED_SOFT_URL_REGEXES).split(",")
+            if item.strip()
+        ]
+        self._prefetch_soft_url_regexes = [
+            re.compile(item.strip(), re.IGNORECASE)
+            for item in os.environ.get("LIVEWEB_PREFETCH_SOFT_URL_REGEXES", DEFAULT_PREFETCH_SOFT_URL_REGEXES).split(",")
+            if item.strip()
+        ]
         # Per-evaluation storage for cached accessibility trees
         self._accessibility_trees: Dict[str, str] = {}
 
@@ -279,35 +341,68 @@ class CacheInterceptor:
                 try:
                     need_api = plugin.needs_api_data(url)
                     page_req = PageRequirement.data(url) if need_api else PageRequirement.nav(url)
+                    timeout_s = self._prefetch_timeout_for_page(need_api)
                     pages = await asyncio.wait_for(
                         self.cache_manager.ensure_cached([page_req], plugin),
-                        timeout=PREFETCH_TIMEOUT,
+                        timeout=timeout_s,
                     )
-                    self.cached_pages.update(pages)
+                    cached_result = pages.get(normalize_url(url))
+                    if cached_result:
+                        self._register_cache_fetch(cached_result)
+                        self.cached_pages[cached_result.normalized_url] = cached_result.page
 
-                    cached = pages.get(normalize_url(url))
-                    if cached and cached.html:
-                        if cached.accessibility_tree:
-                            self._accessibility_trees[normalized] = cached.accessibility_tree
+                    if cached_result and cached_result.page.html:
+                        if cached_result.page.accessibility_tree:
+                            self._accessibility_trees[normalized] = cached_result.page.accessibility_tree
                         await route.fulfill(
                             status=200,
                             headers={"content-type": "text/html; charset=utf-8"},
-                            body=cached.html,
+                            body=cached_result.page.html,
                         )
                         return
                 except asyncio.TimeoutError:
-                    self._pending_error = CacheFatalError(
-                        f"Pre-fetch timeout ({PREFETCH_TIMEOUT}s)", url=url,
+                    self._register_prefetch_timeout(url)
+                    await route.fulfill(
+                        status=200,
+                        headers={"content-type": "text/html; charset=utf-8"},
+                        body=self._build_soft_error_page(
+                            url=url,
+                            title="Pre-fetch timeout",
+                            message=f"The page could not be prefetched within {timeout_s}s. Try another page or retry later.",
+                        ),
                     )
-                    await route.abort("failed")
                     return
                 except CacheFatalError as e:
-                    self._pending_error = e
-                    await route.abort("failed")
+                    if e.fatal and not self._should_soft_fail_domain(url):
+                        self._pending_error = e
+                        await route.abort("failed")
+                    else:
+                        self._register_soft_failure(url)
+                        await route.fulfill(
+                            status=200,
+                            headers={"content-type": "text/html; charset=utf-8"},
+                            body=self._build_soft_error_page(
+                                url=url,
+                                title="Page unavailable",
+                                message=str(e),
+                            ),
+                        )
                     return
                 except Exception as e:
-                    self._pending_error = CacheFatalError(str(e), url=url)
-                    await route.abort("failed")
+                    if self._should_soft_fail_domain(url):
+                        self._register_soft_failure(url)
+                        await route.fulfill(
+                            status=200,
+                            headers={"content-type": "text/html; charset=utf-8"},
+                            body=self._build_soft_error_page(
+                                url=url,
+                                title="Temporary page unavailable",
+                                message=str(e),
+                            ),
+                        )
+                    else:
+                        self._pending_error = CacheFatalError(str(e), url=url)
+                        await route.abort("failed")
                     return
 
         # Fallback: LIVE mode or URL without plugin → pass through to network
@@ -414,6 +509,79 @@ class CacheInterceptor:
                     return page
 
         return None
+
+    def _prefetch_timeout_for_page(self, need_api: bool) -> int:
+        return DEFAULT_PREFETCH_TIMEOUT_DATA if need_api else DEFAULT_PREFETCH_TIMEOUT_NAV
+
+    def _domain_key(self, url: str) -> str:
+        hostname = urlparse(url).netloc.lower()
+        if "coingecko" in hostname:
+            return "coingecko"
+        if "stooq" in hostname:
+            return "stooq"
+        if "news.ycombinator" in hostname:
+            return "news_ycombinator"
+        if "taostats" in hostname:
+            return "taostats"
+        return "default"
+
+    def _register_prefetch_timeout(self, url: str):
+        self.stats.prefetch_timeouts += 1
+        domain_key = self._domain_key(url)
+        self.stats.per_domain_prefetch_timeouts[domain_key] = (
+            self.stats.per_domain_prefetch_timeouts.get(domain_key, 0) + 1
+        )
+        self._register_soft_failure(url)
+
+    def _register_soft_failure(self, url: str):
+        self.stats.soft_failures += 1
+        domain_key = self._domain_key(url)
+        self.stats.per_domain_soft_failures[domain_key] = (
+            self.stats.per_domain_soft_failures.get(domain_key, 0) + 1
+        )
+
+    def _should_soft_fail_domain(self, url: str) -> bool:
+        return self._soft_fail_policy(url) is not None
+
+    def _soft_fail_policy(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        hostname = parsed.netloc.lower()
+        path = parsed.path.lower()
+        combined = f"{hostname}{path}"
+        if any(pattern.match(combined) for pattern in self._required_soft_url_regexes):
+            return "required_soft"
+        if any(pattern.match(combined) for pattern in self._prefetch_soft_url_regexes):
+            return "prefetch_soft"
+        if any(domain in hostname for domain in self._soft_fail_domains):
+            return "domain_soft"
+        combined = f"{hostname}{path}"
+        if any(pattern in combined for pattern in self._soft_fail_url_patterns):
+            return "domain_soft"
+        return None
+
+    def _register_cache_fetch(self, result: CacheFetchResult):
+        domain_key = result.domain_key
+        if result.source == "stale":
+            self.stats.stale_hits += 1
+        if result.source in ("fresh", "stale"):
+            self.stats.per_domain_miss_count[domain_key] = (
+                self.stats.per_domain_miss_count.get(domain_key, 0) + 1
+            )
+            self.stats.per_domain_miss_latency_s[domain_key] = (
+                self.stats.per_domain_miss_latency_s.get(domain_key, 0.0) + result.latency_s
+            )
+
+    def _build_soft_error_page(self, url: str, title: str, message: str) -> str:
+        safe_url = url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_message = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return (
+            "<html><body>"
+            f"<h1>{title}</h1>"
+            f"<p>{safe_message}</p>"
+            f"<p>URL: {safe_url}</p>"
+            "<p>This page could not be prefetched. You may retry or navigate elsewhere.</p>"
+            "</body></html>"
+        )
 
     @staticmethod
     def _url_variants(url: str, parsed) -> List[str]:
