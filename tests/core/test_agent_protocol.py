@@ -136,6 +136,34 @@ def test_parse_qwen_stop_after_think_fallback(protocol):
     assert action.params == {"final": {"answers": {"a1": "42"}}}
 
 
+def test_parse_qwen_function_style_fallback(protocol):
+    raw = 'click_role({"role":"link","name":"Ask HN","exact":false})'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "click_role"
+    assert action.params == {"role": "link", "name": "Ask HN", "exact": False}
+
+
+def test_parse_qwen_tool_tag_function_style_fallback(protocol):
+    raw = """
+<tool_call>
+stop({"answers":{"a1":"42"}})
+</tool_call>
+"""
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_qwen_function_style_with_wrapper_noise(protocol):
+    raw = '_goto({"url":"https://news.ycombinator.com"}_)'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "goto"
+    assert action.params == {"url": "https://news.ycombinator.com"}
+
+
 def test_parse_qwen_fallback_rejects_natural_language(protocol):
     raw = 'I should stop now. {"name":"stop","arguments":{"answers":{"a1":"42"}}}'
     assert protocol.parse_response(raw, None) is None

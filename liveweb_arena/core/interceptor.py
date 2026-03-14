@@ -36,6 +36,23 @@ DEFAULT_PREFETCH_TIMEOUT_NAV = int(
 DEFAULT_PREFETCH_TIMEOUT_DATA = int(
     os.environ.get("LIVEWEB_PREFETCH_TIMEOUT_DATA", "25")
 )
+DEFAULT_SOFT_FAIL_DOMAINS = "news.ycombinator.com,channelsurfer.tv"
+DEFAULT_SOFT_FAIL_URL_PATTERNS = (
+    "news.ycombinator.com/ask,"
+    "news.ycombinator.com/show,"
+    "channelsurfer.tv,"
+    "runcaptain.com,"
+    "aether.saphal.me"
+)
+DEFAULT_REQUIRED_SOFT_URL_REGEXES = (
+    r"^news\.ycombinator\.com/?$,"
+    r"^news\.ycombinator\.com/(ask|show)(?:[/?].*)?$"
+)
+DEFAULT_PREFETCH_SOFT_URL_REGEXES = (
+    r"^channelsurfer\.tv(?:/.*)?$,"
+    r"^runcaptain\.com(?:/.*)?$,"
+    r"^aether\.saphal\.me(?:/.*)?$"
+)
 
 # 1x1 transparent GIF (43 bytes)
 _TRANSPARENT_GIF = (
@@ -75,6 +92,7 @@ class InterceptorStats:
     blocked_urls: Set[str] = field(default_factory=set)
     passed_urls: Set[str] = field(default_factory=set)
     per_domain_prefetch_timeouts: Dict[str, int] = field(default_factory=dict)
+    per_domain_soft_failures: Dict[str, int] = field(default_factory=dict)
     per_domain_miss_count: Dict[str, int] = field(default_factory=dict)
     per_domain_miss_latency_s: Dict[str, float] = field(default_factory=dict)
 
@@ -95,6 +113,7 @@ class InterceptorStats:
             "blocked_urls": sorted(self.blocked_urls),
             "passed_urls": sorted(self.passed_urls),
             "per_domain_prefetch_timeouts": self.per_domain_prefetch_timeouts,
+            "per_domain_soft_failures": self.per_domain_soft_failures,
             "per_domain_miss_count": self.per_domain_miss_count,
             "per_domain_miss_latency_s": self.per_domain_miss_latency_s,
         }
@@ -163,6 +182,26 @@ class CacheInterceptor:
         self.offline = offline
         self.stats = InterceptorStats()
         self._pending_error: Optional[Exception] = None
+        self._soft_fail_domains = {
+            item.strip().lower()
+            for item in os.environ.get("LIVEWEB_SOFT_FAIL_DOMAINS", DEFAULT_SOFT_FAIL_DOMAINS).split(",")
+            if item.strip()
+        }
+        self._soft_fail_url_patterns = [
+            item.strip().lower()
+            for item in os.environ.get("LIVEWEB_SOFT_FAIL_URL_PATTERNS", DEFAULT_SOFT_FAIL_URL_PATTERNS).split(",")
+            if item.strip()
+        ]
+        self._required_soft_url_regexes = [
+            re.compile(item.strip(), re.IGNORECASE)
+            for item in os.environ.get("LIVEWEB_REQUIRED_SOFT_URL_REGEXES", DEFAULT_REQUIRED_SOFT_URL_REGEXES).split(",")
+            if item.strip()
+        ]
+        self._prefetch_soft_url_regexes = [
+            re.compile(item.strip(), re.IGNORECASE)
+            for item in os.environ.get("LIVEWEB_PREFETCH_SOFT_URL_REGEXES", DEFAULT_PREFETCH_SOFT_URL_REGEXES).split(",")
+            if item.strip()
+        ]
         # Per-evaluation storage for cached accessibility trees
         self._accessibility_trees: Dict[str, str] = {}
 
@@ -334,11 +373,11 @@ class CacheInterceptor:
                     )
                     return
                 except CacheFatalError as e:
-                    if e.fatal:
+                    if e.fatal and not self._should_soft_fail_domain(url):
                         self._pending_error = e
                         await route.abort("failed")
                     else:
-                        self.stats.soft_failures += 1
+                        self._register_soft_failure(url)
                         await route.fulfill(
                             status=200,
                             headers={"content-type": "text/html; charset=utf-8"},
@@ -350,8 +389,20 @@ class CacheInterceptor:
                         )
                     return
                 except Exception as e:
-                    self._pending_error = CacheFatalError(str(e), url=url)
-                    await route.abort("failed")
+                    if self._should_soft_fail_domain(url):
+                        self._register_soft_failure(url)
+                        await route.fulfill(
+                            status=200,
+                            headers={"content-type": "text/html; charset=utf-8"},
+                            body=self._build_soft_error_page(
+                                url=url,
+                                title="Temporary page unavailable",
+                                message=str(e),
+                            ),
+                        )
+                    else:
+                        self._pending_error = CacheFatalError(str(e), url=url)
+                        await route.abort("failed")
                     return
 
         # Fallback: LIVE mode or URL without plugin → pass through to network
@@ -480,7 +531,33 @@ class CacheInterceptor:
         self.stats.per_domain_prefetch_timeouts[domain_key] = (
             self.stats.per_domain_prefetch_timeouts.get(domain_key, 0) + 1
         )
+        self._register_soft_failure(url)
+
+    def _register_soft_failure(self, url: str):
         self.stats.soft_failures += 1
+        domain_key = self._domain_key(url)
+        self.stats.per_domain_soft_failures[domain_key] = (
+            self.stats.per_domain_soft_failures.get(domain_key, 0) + 1
+        )
+
+    def _should_soft_fail_domain(self, url: str) -> bool:
+        return self._soft_fail_policy(url) is not None
+
+    def _soft_fail_policy(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        hostname = parsed.netloc.lower()
+        path = parsed.path.lower()
+        combined = f"{hostname}{path}"
+        if any(pattern.match(combined) for pattern in self._required_soft_url_regexes):
+            return "required_soft"
+        if any(pattern.match(combined) for pattern in self._prefetch_soft_url_regexes):
+            return "prefetch_soft"
+        if any(domain in hostname for domain in self._soft_fail_domains):
+            return "domain_soft"
+        combined = f"{hostname}{path}"
+        if any(pattern in combined for pattern in self._soft_fail_url_patterns):
+            return "domain_soft"
+        return None
 
     def _register_cache_fetch(self, result: CacheFetchResult):
         domain_key = result.domain_key

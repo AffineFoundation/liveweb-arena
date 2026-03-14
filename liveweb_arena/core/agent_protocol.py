@@ -365,26 +365,73 @@ class FunctionCallingProtocol(AgentProtocol):
         if not stripped:
             return None
 
-        candidate = None
-        tag_match = re.search(r"<tool_call>\s*(\{.*\})\s*</tool_call>", stripped, re.DOTALL)
+        tag_match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", stripped, re.DOTALL)
         if tag_match:
-            candidate = tag_match.group(1)
-        elif stripped.startswith("{") and stripped.endswith("}"):
-            candidate = stripped
-        else:
+            stripped = tag_match.group(1).strip()
+
+        for candidate in self._qwen_payload_candidates(stripped):
+            payload = self._parse_qwen_payload(candidate)
+            if not isinstance(payload, dict):
+                continue
+            fn_name = payload.get("name")
+            fn_args = payload.get("arguments", {})
+            normalized = self._normalize_tool_call(fn_name, fn_args)
+            if normalized is not None:
+                return normalized
+        return None
+
+    def _qwen_payload_candidates(self, payload_text: str) -> List[str]:
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        def add(text: str) -> None:
+            text = text.strip()
+            if text and text not in seen:
+                seen.add(text)
+                candidates.append(text)
+
+        add(payload_text)
+        stripped = payload_text.strip()
+        add(re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.DOTALL).strip())
+        add(re.sub(r"^<[^>]+>\s*|\s*</[^>]+>$", "", stripped, flags=re.DOTALL).strip())
+
+        wrapper_match = re.fullmatch(r"([`_]+)\s*(.+?)\s*\1", stripped, flags=re.DOTALL)
+        if wrapper_match:
+            add(wrapper_match.group(2))
+        add(stripped.strip("`_ \n\t"))
+        return candidates
+
+    def _parse_qwen_payload(self, payload_text: str) -> Optional[Dict[str, Any]]:
+        stripped = payload_text.strip()
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+        sanitized = stripped.strip("` \n\t")
+        sanitized = re.sub(r"^_+", "", sanitized)
+        sanitized = re.sub(r"_+\s*\)$", ")", sanitized)
+        match = re.fullmatch(
+            r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*(\{.*\})\s*\)\s*",
+            sanitized,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return None
+
+        fn_name = match.group(1)
+        if fn_name not in VALID_ACTION_TYPES:
             return None
 
         try:
-            payload = json.loads(candidate)
+            fn_args = json.loads(match.group(2))
         except json.JSONDecodeError:
             return None
-
-        if not isinstance(payload, dict):
+        if not isinstance(fn_args, dict):
             return None
-
-        fn_name = payload.get("name")
-        fn_args = payload.get("arguments", {})
-        return self._normalize_tool_call(fn_name, fn_args)
+        return {"name": fn_name, "arguments": fn_args}
 
     def _normalize_tool_call(self, fn_name: Any, fn_args: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
         if not isinstance(fn_name, str) or fn_name not in VALID_ACTION_TYPES:
