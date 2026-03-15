@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -44,6 +45,22 @@ SEARCH_FIELDS = ",".join([
 ])
 
 
+def _candidate_search_queries(query: str) -> list[str]:
+    """Return progressively normalized search queries without changing intent."""
+    candidates: list[str] = []
+
+    def _append(value: str):
+        value = value.strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    _append(query)
+    _append(re.sub(r"\s+", " ", query))
+    _append(re.sub(r"[?!:;,.'\"()\\[\\]{}]+", " ", query))
+    _append(re.sub(r"\s+", " ", re.sub(r"[-_/]+", " ", query)))
+    return candidates
+
+
 class OpenLibraryClient(BaseAPIClient):
     """
     Open Library API client.
@@ -58,7 +75,7 @@ class OpenLibraryClient(BaseAPIClient):
     # Rate limit: 1.5s between requests (Open Library asks for politeness)
     _rate_limiter = RateLimiter(min_interval=1.5)
 
-    MAX_RETRIES = 3
+    MAX_RETRIES = 4
 
     @classmethod
     async def get(
@@ -114,19 +131,22 @@ class OpenLibraryClient(BaseAPIClient):
         Returns:
             List of work dicts with stats fields
         """
-        params: Dict[str, Any] = {
-            "q": query,
-            "limit": limit,
-            "fields": SEARCH_FIELDS,
-        }
-        if sort:
-            params["sort"] = sort
-        if mode:
-            params["mode"] = mode
+        for candidate in _candidate_search_queries(query):
+            params: Dict[str, Any] = {
+                "q": candidate,
+                "limit": limit,
+                "fields": SEARCH_FIELDS,
+            }
+            if sort:
+                params["sort"] = sort
+            if mode:
+                params["mode"] = mode
 
-        data = await cls.get("/search.json", params=params)
-        if data and isinstance(data, dict):
-            return data.get("docs", [])
+            data = await cls.get("/search.json", params=params)
+            if data and isinstance(data, dict):
+                docs = data.get("docs", [])
+                if docs:
+                    return docs
         return []
 
     @classmethod
