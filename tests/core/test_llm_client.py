@@ -72,7 +72,7 @@ class _FakeBuiltHTTPClient:
         recorder.append(kwargs)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_chat_with_tools_sends_request_id_in_extra_body(monkeypatch):
     requests = []
 
@@ -99,7 +99,7 @@ async def test_chat_with_tools_sends_request_id_in_extra_body(monkeypatch):
     assert response.request_id == request_payload["extra_body"]["request_id"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_chat_with_tools_sends_reasoning_controls_via_extra_body(monkeypatch):
     requests = []
 
@@ -125,7 +125,37 @@ async def test_chat_with_tools_sends_reasoning_controls_via_extra_body(monkeypat
     assert payload["extra_body"]["separate_reasoning"] is True
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_chat_with_tools_recovery_uses_stochastic_small_request(monkeypatch):
+    requests = []
+
+    def _factory(**kwargs):
+        return _FakeAsyncOpenAI(requests, **kwargs)
+
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.openai.AsyncOpenAI", _factory)
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_TEMPERATURE", "0.35")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_TOP_P", "0.95")
+
+    client = LLMClient(base_url="http://127.0.0.1:31050/v1", api_key="local")
+    await client.chat_with_tools_recovery(
+        system="system",
+        user="user prompt",
+        assistant_prefix="<tool_call>{\"name\":\"goto\"",
+        model="qwen",
+        tools=[{"type": "function", "function": {"name": "goto", "parameters": {"type": "object"}}}],
+        max_new_tokens=96,
+    )
+
+    payload = requests[0]
+    assert payload["temperature"] == 0.35
+    assert payload["top_p"] == 0.95
+    assert payload["max_tokens"] == 96
+    assert payload["max_completion_tokens"] == 96
+    assert payload["messages"][2] == {"role": "assistant", "content": "<tool_call>{\"name\":\"goto\""}
+    assert "Continue from the assistant's last output" in payload["messages"][3]["content"]
+
+
+@pytest.mark.anyio
 async def test_chat_with_tools_timeout_triggers_abort(monkeypatch):
     requests = []
     aborts = []

@@ -289,6 +289,8 @@ class LLMClient:
         self._max_completion_tokens = self._read_max_completion_tokens()
         self._enable_thinking = self._read_optional_bool_env("LIVEWEB_ENABLE_THINKING")
         self._separate_reasoning = self._read_optional_bool_env("LIVEWEB_SEPARATE_REASONING")
+        self._format_recovery_temperature = self._read_float_env("LIVEWEB_FORMAT_RECOVERY_TEMPERATURE", 0.35)
+        self._format_recovery_top_p = self._read_float_env("LIVEWEB_FORMAT_RECOVERY_TOP_P", 0.95)
         if self._strict_serial:
             self._max_retries = 1
 
@@ -328,6 +330,17 @@ class LLMClient:
             return False
         log("LLM", f"Invalid {name}={raw!r}; ignoring")
         return None
+
+    @staticmethod
+    def _read_float_env(name: str, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            log("LLM", f"Invalid {name}={raw!r}; using default {default}")
+            return default
 
     def _apply_reasoning_controls(self, params: Dict[str, object]) -> None:
         extra_body = dict(params.get("extra_body") or {})
@@ -609,6 +622,7 @@ class LLMClient:
                         model=model,
                         tools=tools,
                         temperature=temperature,
+                        top_p=None,
                         seed=seed,
                         timeout_s=actual_timeout,
                         request_id=request_id,
@@ -740,6 +754,82 @@ class LLMClient:
 
         raise last_error or Exception("LLM request failed after all retries")
 
+    async def chat_with_tools_recovery(
+        self,
+        model: str,
+        messages: Optional[list] = None,
+        system: str = "",
+        user: str = "",
+        assistant_prefix: str = "",
+        tools: Optional[List[dict]] = None,
+        seed: Optional[int] = None,
+        timeout_s: int = None,
+        max_new_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        actual_timeout = timeout_s if timeout_s is not None else self._default_timeout
+
+        if messages is None:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": user})
+            if assistant_prefix.strip():
+                messages.append({"role": "assistant", "content": assistant_prefix})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue from the assistant's last output and emit exactly one valid tool call "
+                        "in strict function-calling format. No explanation, no markdown, no XML, no raw prose."
+                    ),
+                }
+            )
+
+        last_error = None
+        for attempt in range(self._max_retries):
+            lease = None
+            request_id = None
+            request_start = time.time()
+            try:
+                lease = await self._acquire_lease()
+                request_id = self._generate_request_id("format-recovery")
+                response = await asyncio.wait_for(
+                    self._make_request_with_tools(
+                        base_url=lease.base_url,
+                        api_key=lease.api_key,
+                        messages=messages,
+                        model=model,
+                        tools=tools,
+                        temperature=self._format_recovery_temperature,
+                        top_p=self._format_recovery_top_p,
+                        seed=seed,
+                        timeout_s=actual_timeout,
+                        request_id=request_id,
+                        max_completion_tokens_override=max_new_tokens,
+                    ),
+                    timeout=actual_timeout,
+                )
+                await self._release_lease(lease, success=True, latency_s=time.time() - request_start)
+                return response
+            except Exception as e:
+                await self._abort_request(
+                    lease,
+                    request_id,
+                    f"format recovery error: {type(e).__name__} (attempt {attempt + 1})",
+                )
+                if lease is not None:
+                    await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
+                last_error = e
+                if self._strict_serial:
+                    self._raise_strict_serial_error(
+                        f"Strict-serial format recovery error: {e}",
+                        e,
+                        attempt + 1,
+                    )
+                await self._backoff(attempt)
+
+        raise last_error or Exception("LLM format recovery failed after all retries")
+
     async def _acquire_lease(self) -> _ServerLease:
         if self._router is not None:
             return await self._router.acquire(route_key=self._route_key)
@@ -762,9 +852,11 @@ class LLMClient:
         model: str,
         tools: Optional[List[dict]],
         temperature: float,
+        top_p: Optional[float],
         seed: Optional[int],
         timeout_s: int,
         request_id: str,
+        max_completion_tokens_override: Optional[int] = None,
     ) -> LLMResponse:
         timeout_config = httpx.Timeout(
             connect=30.0,
@@ -788,14 +880,21 @@ class LLMClient:
                 "messages": messages,
                 "temperature": temperature,
             }
+            if top_p is not None:
+                params["top_p"] = top_p
             if tools:
                 params["tools"] = tools
             if seed is not None:
                 params["seed"] = seed
-            if self._max_completion_tokens is not None:
+            effective_max_completion_tokens = (
+                max_completion_tokens_override
+                if max_completion_tokens_override is not None
+                else self._max_completion_tokens
+            )
+            if effective_max_completion_tokens is not None:
                 # Pass both names for compatibility across OpenAI-compatible servers.
-                params["max_tokens"] = self._max_completion_tokens
-                params["max_completion_tokens"] = self._max_completion_tokens
+                params["max_tokens"] = effective_max_completion_tokens
+                params["max_completion_tokens"] = effective_max_completion_tokens
             params["extra_body"] = {"request_id": request_id}
             self._apply_reasoning_controls(params)
 
