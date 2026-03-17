@@ -715,6 +715,7 @@ class Actor:
                     "conversation": conversation,
                     "failure_reason": failure_reason,
                     "cache_stats": interceptor_stats,
+                    **agent_loop.get_format_recovery_stats(),
                 },
                 "rewards": {
                     "step_rewards": step_rewards,
@@ -804,7 +805,7 @@ class Actor:
                     interceptor, cached_pages, plugins_used, url, self.use_cache,
                 )
 
-            trajectory, final_answer, usage, failure_reason, error_message, _ = await self._run_agent_loop(
+            trajectory, final_answer, usage, failure_reason, error_message, agent_loop = await self._run_agent_loop(
                 task=task,
                 session=session,
                 llm_client=llm_client,
@@ -840,6 +841,7 @@ class Actor:
                     "failure_reason": failure_reason,
                     "cache_stats": interceptor_stats,
                     "trajectory_steps": len(trajectory),
+                    **agent_loop.get_format_recovery_stats(),
                 },
             }
             if error_message:

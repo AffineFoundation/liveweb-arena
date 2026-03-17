@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from collections import Counter
 from typing import Any, Callable, List, Optional, Tuple
 
 from .browser import BrowserSession
@@ -80,11 +81,18 @@ class AgentLoop:
         self._failfast_action_failures = int(os.getenv("LIVEWEB_FAILFAST_ACTION_FAILURES", "5"))
         self._failfast_error_pages = int(os.getenv("LIVEWEB_FAILFAST_ERROR_PAGES", "10"))
         self._failfast_blank_observations = int(os.getenv("LIVEWEB_FAILFAST_BLANK_OBSERVATIONS", "4"))
+        self._enable_format_recovery = os.getenv("LIVEWEB_ENABLE_FORMAT_RECOVERY", "1") == "1"
+        self._format_recovery_max_retries = int(os.getenv("LIVEWEB_FORMAT_RECOVERY_MAX_RETRIES", "4"))
+        self._format_recovery_max_new_tokens = int(os.getenv("LIVEWEB_FORMAT_RECOVERY_MAX_NEW_TOKENS", "96"))
 
         # Internal state for partial recovery
         self._trajectory: List[TrajectoryStep] = []
         self._total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._final_answer = None
+        self._format_recovery_attempts = 0
+        self._format_recovery_successes = 0
+        self._format_recovery_exhausted = 0
+        self._format_failure_class_counts: Counter[str] = Counter()
 
     def get_trajectory(self) -> List[TrajectoryStep]:
         """Get current trajectory (for partial recovery on timeout)"""
@@ -98,10 +106,32 @@ class AgentLoop:
         """Get final answer if available"""
         return self._final_answer
 
+    def get_format_recovery_stats(self) -> dict:
+        attempts = self._format_recovery_attempts
+        successes = self._format_recovery_successes
+        exhausted = self._format_recovery_exhausted
+        return {
+            "format_recovery_attempts": attempts,
+            "format_recovery_successes": successes,
+            "format_recovery_exhausted": exhausted,
+            "format_recovery_success_rate": (successes / attempts) if attempts else 0.0,
+            "format_failure_class_counts": dict(self._format_failure_class_counts),
+            "format_failure_recoverable_rate": (
+                sum(count for name, count in self._format_failure_class_counts.items() if name.startswith("recoverable_")) / total
+                if (total := sum(self._format_failure_class_counts.values()))
+                else 0.0
+            ),
+            "format_failure_terminal_rate": (
+                sum(count for name, count in self._format_failure_class_counts.items() if name.startswith("terminal_")) / total
+                if (total := sum(self._format_failure_class_counts.values()))
+                else 0.0
+            ),
+        }
+
     async def _call_llm(
         self, system_prompt: str, user_prompt: str, model: str,
         temperature: float, seed: Optional[int],
-    ) -> Tuple[str, Optional[BrowserAction], Optional[dict]]:
+    ) -> Tuple[str, Optional[BrowserAction], Any]:
         """
         Call LLM with function calling protocol.
 
@@ -122,7 +152,91 @@ class AgentLoop:
             tc = response.tool_calls[0]
             raw_response = raw_response or f"[tool_call: {tc.function['name']}({tc.function['arguments']})]"
         action = self._protocol.parse_response(raw_response, response.tool_calls)
-        return raw_response, action, response.usage
+        return raw_response, action, response
+
+    def _build_recovery_messages(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        assistant_prefix: str,
+    ) -> list[dict]:
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        for step in self._trajectory:
+            messages.extend(self._protocol.serialize_step(step))
+        messages.append({"role": "user", "content": user_prompt})
+        if assistant_prefix.strip():
+            messages.append({"role": "assistant", "content": assistant_prefix})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Continue from the assistant's last output and emit exactly one valid tool call "
+                    "in strict function-calling format. No explanation, no markdown, no XML, no raw prose."
+                ),
+            }
+        )
+        return messages
+
+    async def _attempt_format_recovery(
+        self,
+        *,
+        model: str,
+        seed: Optional[int],
+        raw_response: str,
+        messages: list[dict],
+    ) -> Tuple[str, Optional[BrowserAction], Optional[dict]]:
+        if not self._enable_format_recovery:
+            return raw_response, None, None
+
+        tools = self._protocol.get_tools()
+        prefix = raw_response or ""
+        recovery_instruction = {
+            "role": "user",
+            "content": (
+                "Continue from the assistant's last output and emit exactly one valid tool call "
+                "in strict function-calling format. No explanation, no markdown, no XML, no raw prose."
+            ),
+        }
+        base_messages = list(messages)
+        if base_messages and base_messages[-1] == recovery_instruction:
+            base_messages = base_messages[:-1]
+        self._format_recovery_attempts += 1
+        recovery_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        for retry_idx in range(self._format_recovery_max_retries):
+            attempt_messages = list(base_messages)
+            if prefix.strip():
+                attempt_messages.append({"role": "assistant", "content": prefix})
+            attempt_messages.append(recovery_instruction)
+            response = await self._llm_client.chat_with_tools_recovery(
+                messages=attempt_messages,
+                model=model,
+                tools=tools,
+                seed=seed,
+                max_new_tokens=self._format_recovery_max_new_tokens,
+            )
+            if response.usage:
+                for key in recovery_usage:
+                    recovery_usage[key] += int(response.usage.get(key, 0) or 0)
+            recovered_raw = response.content
+            if response.has_tool_calls:
+                tc = response.tool_calls[0]
+                recovered_raw = recovered_raw or f"[tool_call: {tc.function['name']}({tc.function['arguments']})]"
+            action = self._protocol.parse_response(recovered_raw, response.tool_calls)
+            if action is not None:
+                self._format_recovery_successes += 1
+                log(
+                    "Agent",
+                    f"Format recovery succeeded on retry {retry_idx + 1} with action={action.action_type}",
+                    force=True,
+                )
+                return recovered_raw, action, recovery_usage
+            prefix = recovered_raw or prefix
+
+        self._format_recovery_exhausted += 1
+        return raw_response, None, recovery_usage
 
     async def run(
         self,
@@ -152,6 +266,10 @@ class AgentLoop:
         self._final_answer = None
         self._max_steps_reached = False
         self._parse_failed = False
+        self._format_recovery_attempts = 0
+        self._format_recovery_successes = 0
+        self._format_recovery_exhausted = 0
+        self._format_failure_class_counts = Counter()
 
         system_prompt = self._protocol.build_system_prompt(task)
         log("Agent", f"Starting loop, max_steps={self._max_steps}, protocol=function_calling")
@@ -234,9 +352,9 @@ class AgentLoop:
                 raw_response, action, usage = await self._call_llm(
                     system_prompt, user_prompt, model, temperature, seed,
                 )
-                if usage:
+                if usage and usage.usage:
                     for key in self._total_usage:
-                        self._total_usage[key] += usage.get(key, 0)
+                        self._total_usage[key] += usage.usage.get(key, 0)
                 consecutive_errors = 0
 
             except Exception as e:
@@ -257,19 +375,38 @@ class AgentLoop:
 
             # Parse failed - terminate immediately
             if action is None:
-                log("Agent", f"PARSE FAILED: {raw_response[:200]!r}", force=True)
+                failure_class = self._protocol.classify_format_failure(raw_response, usage.tool_calls if usage else None)
+                self._format_failure_class_counts[failure_class] += 1
+                if failure_class.startswith("recoverable_"):
+                    log("Agent", f"Parse failed, attempting format recovery: {failure_class}", force=True)
+                    raw_response, action, usage = await self._attempt_format_recovery(
+                        model=model,
+                        seed=seed,
+                        raw_response=raw_response,
+                        messages=self._build_recovery_messages(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            assistant_prefix=raw_response,
+                        ),
+                    )
+                    if usage:
+                        for key in self._total_usage:
+                            self._total_usage[key] += usage.get(key, 0)
 
-                step = TrajectoryStep(
-                    step_num=step_num,
-                    observation=current_obs,
-                    action=None,
-                    action_result="Parse failed - model output not valid JSON",
-                    prompt=user_prompt,
-                    raw_response=raw_response,
-                )
-                self._trajectory.append(step)
-                self._parse_failed = True
-                break
+                if action is None:
+                    log("Agent", f"PARSE FAILED: {raw_response[:200]!r}", force=True)
+
+                    step = TrajectoryStep(
+                        step_num=step_num,
+                        observation=current_obs,
+                        action=None,
+                        action_result="Parse failed - model output not valid JSON",
+                        prompt=user_prompt,
+                        raw_response=raw_response,
+                    )
+                    self._trajectory.append(step)
+                    self._parse_failed = True
+                    break
 
             if action.action_type == "stop":
                 final_params = action.params.get("final", {})

@@ -169,6 +169,20 @@ def test_parse_qwen_fallback_rejects_natural_language(protocol):
     assert protocol.parse_response(raw, None) is None
 
 
+def test_classify_format_failure_empty_response_is_recoverable(protocol):
+    assert protocol.classify_format_failure("", None) == "recoverable_empty"
+
+
+def test_classify_format_failure_truncated_tool_call_is_recoverable(protocol):
+    raw = "<tool_call>{\"name\":\"goto\",\"arguments\":{\"url\":\"https://example.com\"}"
+    assert protocol.classify_format_failure(raw, None) == "recoverable_truncated_tool_json"
+
+
+def test_classify_format_failure_natural_language_is_terminal(protocol):
+    raw = "I will now browse the page and report back with the answer."
+    assert protocol.classify_format_failure(raw, None) == "terminal_natural_language"
+
+
 # ── serialize_step ─────────────────────────────────────────────────
 
 def _make_step(step_num, action_type, params, action_result="Success", prompt="obs"):

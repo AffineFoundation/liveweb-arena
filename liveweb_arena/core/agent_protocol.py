@@ -171,6 +171,10 @@ class AgentProtocol(ABC):
     def serialize_step(self, step: TrajectoryStep) -> List[dict]:
         """Serialize a trajectory step as conversation messages for training export."""
 
+    def classify_format_failure(self, raw: str, tool_calls: Optional[List[Any]] = None) -> str:
+        """Classify whether a parse failure is worth a local recovery attempt."""
+        return "terminal"
+
 
 # Shared step prompt (observation format is protocol-independent)
 _STEP_PROMPT_TEMPLATE = """## Current Page State
@@ -338,6 +342,32 @@ class FunctionCallingProtocol(AgentProtocol):
             params = {"final": {"answers": answers}}
 
         return BrowserAction(action_type=fn_name, params=params)
+
+    def classify_format_failure(self, raw: str, tool_calls: Optional[List[Any]] = None) -> str:
+        if self._parse_primary_tool_call(tool_calls) is not None:
+            return "none"
+        if raw and self._parse_qwen_fallback(raw) is not None:
+            return "none"
+
+        stripped = (raw or "").strip()
+        if tool_calls:
+            return "recoverable_truncated_tool_json"
+        if not stripped:
+            return "recoverable_empty"
+
+        stripped = re.sub(r"^\s*<think>.*?</think>\s*", "", stripped, flags=re.DOTALL).strip()
+        if not stripped:
+            return "recoverable_empty"
+
+        if "<tool_call>" in stripped or "</tool_call>" in stripped:
+            return "recoverable_truncated_tool_json"
+        if re.match(r"^\s*\{", stripped):
+            return "recoverable_truncated_tool_json"
+        if re.match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", stripped):
+            return "recoverable_qwen_tool_text"
+        if stripped.startswith("[tool_call:"):
+            return "recoverable_truncated_tool_json"
+        return "terminal_natural_language"
 
     def _parse_primary_tool_call(self, tool_calls: Optional[List[Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
         if not tool_calls:
