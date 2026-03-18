@@ -503,6 +503,16 @@ class CacheManager:
         self._delete_cache(cache_file)
         return "expired", None
 
+    def _load_if_valid(self, cache_file: Path, need_api: bool) -> Optional[CachedPage]:
+        """Backward-compatible wrapper for tests and older callers.
+
+        Returns the cached page only when it is currently valid under the
+        configured TTL and completeness rules. Stale, invalid, expired, and
+        missing entries all map to ``None``.
+        """
+        status, cached = self._load_with_status(cache_file, need_api)
+        return cached if status == "valid" else None
+
     async def _fetch_and_build_cache(
         self,
         url: str,
