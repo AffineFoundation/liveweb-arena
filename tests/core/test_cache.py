@@ -194,6 +194,22 @@ class TestCacheFatalError:
         err = CacheFatalError("generic failure")
         assert err.url is None
 
+    def test_structured_fields(self):
+        err = CacheFatalError(
+            "timeout",
+            url="https://x.com",
+            status_code=504,
+            evidence={"k": "v"},
+            soft_fail_applied=True,
+            stale_fallback_used=False,
+            plugin_name="coingecko",
+        )
+        assert err.status_code == 504
+        assert err.evidence == {"k": "v"}
+        assert err.soft_fail_applied is True
+        assert err.stale_fallback_used is False
+        assert err.plugin_name == "coingecko"
+
 
 # ── CacheManager._load_if_valid (via file I/O) ──────────────────────
 

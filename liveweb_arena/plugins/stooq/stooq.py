@@ -44,6 +44,30 @@ class StooqPlugin(BasePlugin):
             "*stooq.com/ads/*",  # Ad frames
         ]
 
+    def get_stable_url_patterns(self) -> List[str]:
+        return [
+            "/",
+            "/q/",
+            "/q/?s=",
+            "/q/i/?s=",
+            "/q/d/?s=",
+        ]
+
+    def classify_url(self, url: str) -> Optional[str]:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        query = parsed.query.lower()
+        if "stooq.com" not in host:
+            return None
+        if host.startswith("www."):
+            return "env_tls_error"
+        if "/q/conv/" in path or "/s/mst/" in path or "quote.php" in path or "/q/plus/" in path:
+            return "model_invalid_url_shape"
+        if "q=" in query and "s=" not in query:
+            return "model_invalid_url_shape"
+        return None
+
     def get_synthetic_page(self, url: str) -> Optional[str]:
         """Return synthetic error page for unknown symbols (zero network requests)."""
         symbol = self._extract_symbol(url)
@@ -162,3 +186,9 @@ class StooqPlugin(BasePlugin):
             return query["e"][0].lower()
 
         return ""
+
+    def is_plausible_asset_id(self, url: str) -> bool:
+        symbol = self._extract_symbol(url)
+        if not symbol:
+            return True
+        return symbol in self._get_known_symbols()

@@ -1,6 +1,7 @@
 """LiveWeb Arena - Main evaluation entry point"""
 
 import asyncio
+import json
 import os
 import random
 import time
@@ -19,6 +20,7 @@ from liveweb_arena.core.cache import CacheManager, CachedPage, CacheFatalError, 
 from liveweb_arena.core.interceptor import CacheInterceptor
 from liveweb_arena.core.models import BrowserObservation, CompositeTask, TrajectoryStep
 from liveweb_arena.core.reward import StepwiseRewardCalculator, RewardConfig, RewardBreakdown
+from liveweb_arena.core.reachability_audit import audit_reachability_failure
 from liveweb_arena.plugins.base import BasePlugin
 from liveweb_arena.plugins import get_all_plugins
 from liveweb_arena.core.validators.llm_validator import validate_answers_with_llm
@@ -395,9 +397,11 @@ class Actor:
         temperature: float,
         seed: int,
         allowed_domains: Set[str],
+        plugins_used: Optional[Dict[str, BasePlugin]] = None,
         on_navigation=None,
         on_observation=None,
     ):
+        plugins_used = plugins_used or {}
         agent_loop = AgentLoop(
             session=session,
             llm_client=llm_client,
@@ -431,23 +435,69 @@ class Actor:
             log("Actor", error_message, force=True)
         except BrowserFatalError as e:
             is_required_domain = False
+            plugin_name = None
+            plugin = None
             if e.url:
                 for domain in allowed_domains:
                     if _url_matches_domain(e.url, domain):
                         is_required_domain = True
                         break
+                plugin = _find_plugin_for_url(plugins_used, e.url)
+                plugin_name = getattr(plugin, "name", None) if plugin is not None else None
 
             if is_required_domain:
                 failure_reason = "site_unreachable"
                 error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
                 log("Actor", f"Infrastructure error: {error_message}", force=True)
+                navigation_metadata = session.get_last_navigation_metadata() if hasattr(session, "get_last_navigation_metadata") else None
+                reachability_audit = audit_reachability_failure(
+                    url=e.url or "",
+                    plugin_name=plugin_name,
+                    plugin=plugin,
+                    exception=e,
+                    reason=error_message,
+                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
+                )
             else:
                 failure_reason = "browser_error"
                 log("Actor", f"Browser error (agent issue): {e}", force=True)
+                navigation_metadata = session.get_last_navigation_metadata() if hasattr(session, "get_last_navigation_metadata") else None
+                reachability_audit = audit_reachability_failure(
+                    url=e.url or "",
+                    plugin_name=plugin_name,
+                    plugin=plugin,
+                    exception=e,
+                    reason=str(e),
+                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
+                )
         except (LLMFatalError, CacheFatalError) as e:
             failure_reason = fatal_error_map[type(e)]
             error_message = f"{failure_reason}: {e}"
             log("Actor", f"Fatal error - {error_message}", force=True)
+            reachability_audit = None
+            if isinstance(e, CacheFatalError) and getattr(e, "url", None):
+                plugin = _find_plugin_for_url(plugins_used, e.url)
+                interceptor_metadata = {}
+                if "interceptor" in (getattr(e, "evidence", {}) or {}):
+                    interceptor_metadata = (e.evidence or {}).get("interceptor") or {}
+                reachability_audit = audit_reachability_failure(
+                    url=e.url,
+                    plugin_name=getattr(plugin, "name", None) if plugin is not None else None,
+                    plugin=plugin,
+                    exception=e,
+                    reason=error_message,
+                    http_status=getattr(e, "status_code", None),
+                    evidence={
+                        **(getattr(e, "evidence", {}) or {}),
+                        "interceptor": interceptor_metadata,
+                    },
+                )
+        else:
+            reachability_audit = None
+
+        setattr(agent_loop, "_reachability_audit", reachability_audit)
+        if reachability_audit:
+            log("ReachabilityAudit", json.dumps(reachability_audit.to_dict(), ensure_ascii=False), force=True)
 
         if failure_reason and failure_reason not in ("max_steps_reached", "parse_failed"):
             trajectory = agent_loop.get_trajectory()
@@ -546,9 +596,10 @@ class Actor:
                 )
 
             active_protocol = FunctionCallingProtocol()
-            trajectory, final_answer, usage, failure_reason, error_message, _ = await self._run_agent_loop(
+            trajectory, final_answer, usage, failure_reason, error_message, agent_loop = await self._run_agent_loop(
                 task=task,
                 session=session,
+                plugins_used=plugins_used,
                 llm_client=agent_llm_client,
                 protocol=active_protocol,
                 model=model,
@@ -560,6 +611,7 @@ class Actor:
                 on_navigation=on_navigation,
                 on_observation=on_observation,
             )
+            reachability_audit = getattr(agent_loop, "_reachability_audit", None)
 
             # GT is collected in real-time via on_observation callback
             # For API_ONLY and HYBRID templates, fetch remaining API GT
@@ -715,6 +767,11 @@ class Actor:
                     "conversation": conversation,
                     "failure_reason": failure_reason,
                     "cache_stats": interceptor_stats,
+                    "reachability_audit": reachability_audit.to_dict() if reachability_audit else None,
+                    "reachability_classification": reachability_audit.classification if reachability_audit else None,
+                    "reachability_layer": reachability_audit.layer if reachability_audit else None,
+                    "is_environment_failure": reachability_audit.is_environment_failure if reachability_audit else False,
+                    "is_model_hallucination": reachability_audit.is_model_hallucination if reachability_audit else False,
                     **agent_loop.get_format_recovery_stats(),
                 },
                 "rewards": {
@@ -808,6 +865,7 @@ class Actor:
             trajectory, final_answer, usage, failure_reason, error_message, agent_loop = await self._run_agent_loop(
                 task=task,
                 session=session,
+                plugins_used=plugins_used,
                 llm_client=llm_client,
                 protocol=active_protocol,
                 model=model,
@@ -819,6 +877,7 @@ class Actor:
                 on_navigation=on_navigation,
                 on_observation=None,
             )
+            reachability_audit = getattr(agent_loop, "_reachability_audit", None)
 
             interceptor_stats = interceptor.get_stats()
             final_url = trajectory[-1].observation.url if trajectory else None
@@ -841,6 +900,11 @@ class Actor:
                     "failure_reason": failure_reason,
                     "cache_stats": interceptor_stats,
                     "trajectory_steps": len(trajectory),
+                    "reachability_audit": reachability_audit.to_dict() if reachability_audit else None,
+                    "reachability_classification": reachability_audit.classification if reachability_audit else None,
+                    "reachability_layer": reachability_audit.layer if reachability_audit else None,
+                    "is_environment_failure": reachability_audit.is_environment_failure if reachability_audit else False,
+                    "is_model_hallucination": reachability_audit.is_model_hallucination if reachability_audit else False,
                     **agent_loop.get_format_recovery_stats(),
                 },
             }

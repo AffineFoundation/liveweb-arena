@@ -36,6 +36,27 @@ class TaostatsPlugin(BasePlugin):
         """Initialize plugin - fetch API data for question generation."""
         initialize_cache()
 
+    def get_stable_url_patterns(self) -> List[str]:
+        return [
+            "/",
+            "/subnets",
+            "/subnets/<id>",
+            "/subnets/<id>/chart",
+            "/validators",
+        ]
+
+    def classify_url(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        if "taostats.io" not in host:
+            return None
+        if path in {"", "/", "/subnets", "/validators"}:
+            return None
+        if path.startswith("/subnets/"):
+            return None
+        return "model_invalid_url_shape"
+
     def get_blocked_patterns(self) -> List[str]:
         """Block direct API access to force agents to use the website."""
         return [

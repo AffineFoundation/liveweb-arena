@@ -25,12 +25,14 @@ class _FakeLLMClient:
         self.initial_response = initial_response
         self.recovery_responses = list(recovery_responses or [])
         self.recovery_calls = 0
+        self.recovery_messages = []
 
     async def chat_with_tools(self, **kwargs):
         return self.initial_response
 
     async def chat_with_tools_recovery(self, **kwargs):
         self.recovery_calls += 1
+        self.recovery_messages.append(kwargs.get("messages"))
         return self.recovery_responses.pop(0)
 
 
@@ -71,6 +73,11 @@ async def test_agent_loop_recovers_from_truncated_tool_json(monkeypatch):
     assert stats["format_recovery_successes"] == 1
     assert llm_client.recovery_calls == 1
     assert trajectory[-1].action.action_type == "stop"
+    messages = llm_client.recovery_messages[0]
+    assistant_messages = [item for item in messages if item["role"] == "assistant"]
+    assert assistant_messages == []
+    assert messages[-1]["role"] == "user"
+    assert "invalid tool-call formatting" in messages[-1]["content"].lower()
 
 
 @pytest.mark.anyio
@@ -127,3 +134,33 @@ async def test_agent_loop_marks_parse_failed_after_recovery_exhausted(monkeypatc
     assert stats["format_recovery_exhausted"] == 1
     assert llm_client.recovery_calls == 2
     assert trajectory[-1].action is None
+
+
+@pytest.mark.anyio
+async def test_agent_loop_limits_empty_recovery_retries(monkeypatch):
+    monkeypatch.setenv("LIVEWEB_ENABLE_FORMAT_RECOVERY", "1")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_MAX_RETRIES", "4")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_EMPTY_MAX_RETRIES", "2")
+
+    llm_client = _FakeLLMClient(
+        initial_response=LLMResponse(content=""),
+        recovery_responses=[
+            LLMResponse(content=""),
+            LLMResponse(content=""),
+        ],
+    )
+    loop = AgentLoop(
+        session=_FakeSession(),
+        llm_client=llm_client,
+        protocol=FunctionCallingProtocol(),
+        max_steps=2,
+    )
+
+    trajectory, final_answer, usage = await loop.run(task=_task(), model="qwen", temperature=0.0, seed=1)
+
+    assert final_answer is None
+    assert loop.is_parse_failed() is True
+    stats = loop.get_format_recovery_stats()
+    assert stats["format_recovery_attempts"] == 1
+    assert stats["format_recovery_exhausted"] == 1
+    assert llm_client.recovery_calls == 2

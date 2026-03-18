@@ -150,6 +150,22 @@ class BasePlugin(ABC):
         """
         return None
 
+    def get_stable_url_patterns(self) -> List[str]:
+        """Return stable URL shapes that this plugin intentionally supports."""
+        return []
+
+    def classify_url(self, url: str) -> Optional[str]:
+        """Return a model-side classification for clearly invalid URL shapes."""
+        return None
+
+    def is_plausible_asset_id(self, url: str) -> bool:
+        """Return True when URL-derived asset identifiers look valid for this plugin."""
+        return True
+
+    def audit_url(self, url: str) -> Optional[Dict[str, Any]]:
+        """Return optional extra audit details for the URL."""
+        return None
+
     def needs_api_data(self, url: str) -> bool:
         """
         Check if this URL needs API data for ground truth.

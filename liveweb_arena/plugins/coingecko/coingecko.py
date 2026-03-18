@@ -61,6 +61,29 @@ class CoinGeckoPlugin(BasePlugin):
             "*-emoji-*",
         ]
 
+    def get_stable_url_patterns(self) -> List[str]:
+        return [
+            "/en",
+            "/en/coins/",
+            "/en/coins/*/historical_data",
+            "/en/highlights/",
+        ]
+
+    def classify_url(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        if "coingecko.com" not in host:
+            return None
+        coin_id = self._extract_coin_id(url)
+        if coin_id and not self.is_plausible_asset_id(url):
+            return "model_invalid_asset_id"
+        if "/coins/" in path and coin_id:
+            return None
+        if self._is_homepage(url) or "/en/highlights/" in path:
+            return None
+        return None
+
     async def fetch_api_data(self, url: str) -> Dict[str, Any]:
         """
         Fetch API data for a CoinGecko page.
@@ -138,3 +161,20 @@ class CoinGeckoPlugin(BasePlugin):
             return URL_SLUG_TO_COIN_ID.get(url_slug, url_slug)
 
         return ""
+
+    def is_plausible_asset_id(self, url: str) -> bool:
+        coin_id = self._extract_coin_id(url)
+        if not coin_id:
+            return True
+        # Known false positives from hybrid/company-name hallucinations.
+        invalid = {
+            "microsoft",
+            "google",
+            "exxon-mobil",
+            "jpmorgan-chase",
+            "tesla",
+            "walmart",
+            "apple",
+            "amazon",
+        }
+        return coin_id not in invalid

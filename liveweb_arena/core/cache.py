@@ -47,11 +47,27 @@ class CacheFatalError(Exception):
     Evaluation should be terminated immediately.
     """
 
-    def __init__(self, message: str, url: str = None, kind: str = "fatal", fatal: bool = True):
+    def __init__(
+        self,
+        message: str,
+        url: str = None,
+        kind: str = "fatal",
+        fatal: bool = True,
+        status_code: int | None = None,
+        evidence: dict | None = None,
+        soft_fail_applied: bool = False,
+        stale_fallback_used: bool = False,
+        plugin_name: str | None = None,
+    ):
         super().__init__(message)
         self.url = url
         self.kind = kind
         self.fatal = fatal
+        self.status_code = status_code
+        self.evidence = evidence or {}
+        self.soft_fail_applied = soft_fail_applied
+        self.stale_fallback_used = stale_fallback_used
+        self.plugin_name = plugin_name
 
 
 def log(tag: str, message: str):
@@ -678,6 +694,8 @@ class CacheManager:
                     url=url,
                     kind=f"http_{response.status}",
                     fatal=fatal,
+                    status_code=response.status,
+                    evidence={"page_url": url},
                 )
 
             # Wait for network idle (short timeout: ads are blocked, so
@@ -711,6 +729,7 @@ class CacheManager:
                 raise CacheFatalError(
                     f"CAPTCHA/challenge page detected (title: {page_title!r})",
                     url=url,
+                    evidence={"page_title": page_title},
                 )
 
             # Layer 3: Minimum content length (real pages are >5KB)
@@ -718,6 +737,7 @@ class CacheManager:
                 raise CacheFatalError(
                     f"Page too short ({len(html)} bytes, title: {page_title!r})",
                     url=url,
+                    evidence={"page_title": page_title, "html_length": len(html)},
                 )
 
             # Extract accessibility tree for deterministic caching

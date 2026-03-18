@@ -13,10 +13,13 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 from urllib.parse import urlparse
 
-from playwright.async_api import Route
+if TYPE_CHECKING:
+    from playwright.async_api import Route
+else:
+    Route = Any
 
 from liveweb_arena.core.block_patterns import TRACKING_BLOCK_PATTERNS
 from liveweb_arena.core.cache import (
@@ -36,13 +39,17 @@ DEFAULT_PREFETCH_TIMEOUT_NAV = int(
 DEFAULT_PREFETCH_TIMEOUT_DATA = int(
     os.environ.get("LIVEWEB_PREFETCH_TIMEOUT_DATA", "25")
 )
-DEFAULT_SOFT_FAIL_DOMAINS = "news.ycombinator.com,channelsurfer.tv"
+DEFAULT_SOFT_FAIL_DOMAINS = "news.ycombinator.com,channelsurfer.tv,taostats.io,coingecko.com"
 DEFAULT_SOFT_FAIL_URL_PATTERNS = (
     "news.ycombinator.com/ask,"
     "news.ycombinator.com/show,"
     "channelsurfer.tv,"
     "runcaptain.com,"
-    "aether.saphal.me"
+    "aether.saphal.me,"
+    "stooq.com/q/currency/,"
+    "stooq.com/q/c/,"
+    "coingecko.app.link,"
+    "coingecko.com/en/highlights/"
 )
 DEFAULT_REQUIRED_SOFT_URL_REGEXES = (
     r"^news\.ycombinator\.com/?$,"
@@ -51,7 +58,10 @@ DEFAULT_REQUIRED_SOFT_URL_REGEXES = (
 DEFAULT_PREFETCH_SOFT_URL_REGEXES = (
     r"^channelsurfer\.tv(?:/.*)?$,"
     r"^runcaptain\.com(?:/.*)?$,"
-    r"^aether\.saphal\.me(?:/.*)?$"
+    r"^aether\.saphal\.me(?:/.*)?$,"
+    r"^(?:www\.)?taostats\.io(?:/subnets(?:/\d+(?:/chart)?)?)?(?:[/?].*)?$,"
+    r"^(?:www\.)?coingecko\.com/en/(?:coins/[^/?#]+(?:/historical_data)?|highlights/.*)(?:[/?].*)?$,"
+    r"^(?:www\.)?stooq\.com/q/(?:currency|c)/.*$"
 )
 
 # 1x1 transparent GIF (43 bytes)
@@ -182,6 +192,7 @@ class CacheInterceptor:
         self.offline = offline
         self.stats = InterceptorStats()
         self._pending_error: Optional[Exception] = None
+        self._last_error_metadata: Dict[str, Any] = {}
         self._soft_fail_domains = {
             item.strip().lower()
             for item in os.environ.get("LIVEWEB_SOFT_FAIL_DOMAINS", DEFAULT_SOFT_FAIL_DOMAINS).split(",")
@@ -341,7 +352,7 @@ class CacheInterceptor:
                 try:
                     need_api = plugin.needs_api_data(url)
                     page_req = PageRequirement.data(url) if need_api else PageRequirement.nav(url)
-                    timeout_s = self._prefetch_timeout_for_page(need_api)
+                    timeout_s = self._prefetch_timeout_for_url(url, need_api)
                     pages = await asyncio.wait_for(
                         self.cache_manager.ensure_cached([page_req], plugin),
                         timeout=timeout_s,
@@ -362,6 +373,27 @@ class CacheInterceptor:
                         return
                 except asyncio.TimeoutError:
                     self._register_prefetch_timeout(url)
+                    cached_fallback = self._find_any_cached_page(url)
+                    if cached_fallback and cached_fallback.html:
+                        if cached_fallback.accessibility_tree:
+                            self._accessibility_trees[normalized] = cached_fallback.accessibility_tree
+                        self.cached_pages[normalized] = cached_fallback
+                        await route.fulfill(
+                            status=200,
+                            headers={"content-type": "text/html; charset=utf-8"},
+                            body=cached_fallback.html,
+                        )
+                        return
+                    self._last_error_metadata = {
+                        "classification": "env_prefetch_timeout",
+                        "layer": "cache",
+                        "prefetch_attempted": True,
+                        "prefetch_timeout_kind": "asyncio_timeout",
+                        "prefetch_elapsed_s": timeout_s,
+                        "soft_fail_triggered": True,
+                        "soft_fail_reason": "prefetch_timeout",
+                        "stale_fallback_used": False,
+                    }
                     await route.fulfill(
                         status=200,
                         headers={"content-type": "text/html; charset=utf-8"},
@@ -374,10 +406,46 @@ class CacheInterceptor:
                     return
                 except CacheFatalError as e:
                     if e.fatal and not self._should_soft_fail_domain(url):
+                        e.evidence.setdefault("interceptor", {})
+                        e.evidence["interceptor"].update(
+                            {
+                                "prefetch_attempted": True,
+                                "soft_fail_triggered": False,
+                                "stale_fallback_used": False,
+                            }
+                        )
+                        e.plugin_name = getattr(plugin, "name", None) if plugin is not None else e.plugin_name
                         self._pending_error = e
                         await route.abort("failed")
                     else:
                         self._register_soft_failure(url)
+                        cached_fallback = self._find_any_cached_page(url)
+                        if cached_fallback and cached_fallback.html:
+                            self._last_error_metadata = {
+                                "classification": "env_cache_fetch_failed",
+                                "layer": "cache",
+                                "prefetch_attempted": True,
+                                "soft_fail_triggered": True,
+                                "soft_fail_reason": str(e),
+                                "stale_fallback_used": True,
+                            }
+                            if cached_fallback.accessibility_tree:
+                                self._accessibility_trees[normalized] = cached_fallback.accessibility_tree
+                            self.cached_pages[normalized] = cached_fallback
+                            await route.fulfill(
+                                status=200,
+                                headers={"content-type": "text/html; charset=utf-8"},
+                                body=cached_fallback.html,
+                            )
+                            return
+                        self._last_error_metadata = {
+                            "classification": "env_cache_fetch_failed",
+                            "layer": "cache",
+                            "prefetch_attempted": True,
+                            "soft_fail_triggered": True,
+                            "soft_fail_reason": str(e),
+                            "stale_fallback_used": False,
+                        }
                         await route.fulfill(
                             status=200,
                             headers={"content-type": "text/html; charset=utf-8"},
@@ -391,6 +459,33 @@ class CacheInterceptor:
                 except Exception as e:
                     if self._should_soft_fail_domain(url):
                         self._register_soft_failure(url)
+                        cached_fallback = self._find_any_cached_page(url)
+                        if cached_fallback and cached_fallback.html:
+                            self._last_error_metadata = {
+                                "classification": "env_cache_fetch_failed",
+                                "layer": "cache",
+                                "prefetch_attempted": True,
+                                "soft_fail_triggered": True,
+                                "soft_fail_reason": str(e),
+                                "stale_fallback_used": True,
+                            }
+                            if cached_fallback.accessibility_tree:
+                                self._accessibility_trees[normalized] = cached_fallback.accessibility_tree
+                            self.cached_pages[normalized] = cached_fallback
+                            await route.fulfill(
+                                status=200,
+                                headers={"content-type": "text/html; charset=utf-8"},
+                                body=cached_fallback.html,
+                            )
+                            return
+                        self._last_error_metadata = {
+                            "classification": "env_cache_fetch_failed",
+                            "layer": "cache",
+                            "prefetch_attempted": True,
+                            "soft_fail_triggered": True,
+                            "soft_fail_reason": str(e),
+                            "stale_fallback_used": False,
+                        }
                         await route.fulfill(
                             status=200,
                             headers={"content-type": "text/html; charset=utf-8"},
@@ -401,7 +496,19 @@ class CacheInterceptor:
                             ),
                         )
                     else:
-                        self._pending_error = CacheFatalError(str(e), url=url)
+                        self._pending_error = CacheFatalError(
+                            str(e),
+                            url=url,
+                            kind="prefetch_failed",
+                            evidence={
+                                "interceptor": {
+                                    "prefetch_attempted": True,
+                                    "soft_fail_triggered": False,
+                                    "stale_fallback_used": False,
+                                }
+                            },
+                            plugin_name=getattr(plugin, "name", None) if plugin is not None else None,
+                        )
                         await route.abort("failed")
                     return
 
@@ -510,6 +617,28 @@ class CacheInterceptor:
 
         return None
 
+    def _find_any_cached_page(self, url: str) -> Optional[CachedPage]:
+        normalized = normalize_url(url)
+        parsed = urlparse(normalized)
+
+        candidates = [normalized]
+        if parsed.netloc.startswith("www."):
+            candidates.append(normalized.replace("www.", "", 1))
+        else:
+            candidates.append(normalized.replace("://", "://www.", 1))
+
+        for candidate in candidates:
+            page = self.cached_pages.get(candidate) or self._url_map.get(candidate)
+            if page and page.html:
+                return page
+
+        if self.cache_manager:
+            for candidate in self._url_variants(url, parsed):
+                page = self.cache_manager.get_cached(candidate)
+                if page and page.html:
+                    return page
+        return None
+
     def _prefetch_timeout_for_page(self, need_api: bool) -> int:
         return DEFAULT_PREFETCH_TIMEOUT_DATA if need_api else DEFAULT_PREFETCH_TIMEOUT_NAV
 
@@ -524,6 +653,17 @@ class CacheInterceptor:
         if "taostats" in hostname:
             return "taostats"
         return "default"
+
+    def _prefetch_timeout_for_url(self, url: str, need_api: bool) -> int:
+        timeout = self._prefetch_timeout_for_page(need_api)
+        domain_key = self._domain_key(url)
+        if domain_key == "coingecko":
+            return max(timeout, 35 if need_api else 18)
+        if domain_key == "stooq":
+            return max(timeout, 30 if need_api else 16)
+        if domain_key == "taostats":
+            return max(timeout, 35 if need_api else 18)
+        return timeout
 
     def _register_prefetch_timeout(self, url: str):
         self.stats.prefetch_timeouts += 1
@@ -652,6 +792,11 @@ class CacheInterceptor:
         self._pending_error = None
         return err
 
+    def get_and_clear_error_metadata(self) -> Dict[str, Any]:
+        metadata = dict(self._last_error_metadata)
+        self._last_error_metadata = {}
+        return metadata
+
     def raise_if_error(self, url: str = None) -> None:
         """Check for pending error and raise as CacheFatalError if present."""
         err = self._pending_error
@@ -659,7 +804,11 @@ class CacheInterceptor:
         if err is not None:
             if isinstance(err, CacheFatalError):
                 raise err
-            raise CacheFatalError(str(err), url=url)
+            raise CacheFatalError(
+                str(err),
+                url=url,
+                evidence={"interceptor": self.get_and_clear_error_metadata()},
+            )
 
     def get_stats(self) -> dict:
         """Get interception statistics."""
@@ -677,3 +826,4 @@ class CacheInterceptor:
         self.cached_pages.clear()
         self.stats = InterceptorStats()
         self._pending_error = None
+        self._last_error_metadata = {}

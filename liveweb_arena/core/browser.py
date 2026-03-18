@@ -1,7 +1,9 @@
 """Browser engine with session isolation for concurrent evaluations"""
 
 import asyncio
-from typing import Optional, TYPE_CHECKING
+from dataclasses import asdict, dataclass, field
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from typing import Any, Optional, TYPE_CHECKING
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 
 from .block_patterns import STEALTH_BROWSER_ARGS, STEALTH_USER_AGENT
@@ -27,10 +29,63 @@ _BROWSER_TRANSPORT_ERROR_PATTERNS = (
 )
 
 
+@dataclass
+class BrowserNavigationMetadata:
+    url: str
+    normalized_url: str
+    navigation_stage: str
+    wait_until: str | None = None
+    timeout_ms: int | None = None
+    raw_exception_type: str | None = None
+    raw_exception_message: str | None = None
+    attempt_index: int = 1
+    max_attempts: int = 1
+    browser_reused: bool = True
+    context_reused: bool = True
+    page_recreated_before_retry: bool = False
+    used_url_normalization: bool = False
+    resource_type: str = "document"
+    classification_hint: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class BrowserNavigationError(Exception):
+    def __init__(self, message: str, metadata: BrowserNavigationMetadata):
+        super().__init__(message)
+        self.metadata = metadata
+
+
 def is_browser_transport_error(exc: BaseException) -> bool:
     """Return True when an exception indicates a dead Playwright/browser transport."""
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(pattern in text for pattern in _BROWSER_TRANSPORT_ERROR_PATTERNS)
+
+
+def _is_stooq_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return "stooq.com" in hostname
+
+
+def _normalize_stooq_url(url: str) -> str:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if "stooq.com" not in hostname:
+        return url
+
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if "q/currency" in parsed.path.lower():
+        return urlunparse(parsed._replace(scheme="https", netloc="stooq.com"))
+
+    if "q" in query:
+        query["q"] = [query["q"][0].lower()]
+    if "s" in query:
+        query["s"] = [query["s"][0].lower()]
+
+    normalized_query = urlencode([(key, value) for key, values in query.items() for value in values], doseq=True)
+    return urlunparse(parsed._replace(scheme="https", netloc="stooq.com", query=normalized_query))
 
 
 class BrowserSession:
@@ -60,6 +115,13 @@ class BrowserSession:
         self._blocked_patterns = []
         self._allowed_domains = None  # None means allow all
         self._cache_interceptor: Optional["CacheInterceptor"] = None
+        self._last_navigation_metadata: BrowserNavigationMetadata | None = None
+
+    def get_last_navigation_metadata(self) -> dict[str, Any] | None:
+        return self._last_navigation_metadata.to_dict() if self._last_navigation_metadata else None
+
+    def clear_last_navigation_metadata(self) -> None:
+        self._last_navigation_metadata = None
 
     async def block_urls(self, patterns: list):
         """
@@ -120,19 +182,14 @@ class BrowserSession:
         # Reset view offset when navigating to a new page
         self._view_offset = 0
         self._last_full_content = ""
+        self.clear_last_navigation_metadata()
 
         # Ensure URL has protocol prefix
         if url and not url.startswith(("http://", "https://", "about:")):
             url = "https://" + url
 
         try:
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-            # Wait a bit for dynamic content
-            try:
-                await self._page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                # Network idle timeout is acceptable, page may still be usable
-                pass
+            await self._goto_with_recovery(url)
         except Exception as e:
             # Navigation failed — browser may show error page (chrome-error://).
             # Log but don't raise: _get_observation() detects error pages and
@@ -160,11 +217,7 @@ class BrowserSession:
                     url = "https://" + url
                 # Navigate and return observation (including error pages)
                 try:
-                    await self._page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-                    try:
-                        await self._page.wait_for_load_state("networkidle", timeout=10000)
-                    except Exception:
-                        pass
+                    await self._goto_with_recovery(url)
                 except Exception as e:
                     log("Browser", f"Navigation failed for {url[:80]}: {type(e).__name__}: {e}")
 
@@ -473,6 +526,59 @@ class BrowserSession:
 
         return await self._get_observation()
 
+    async def _goto_with_recovery(self, url: str) -> None:
+        normalized_url = _normalize_stooq_url(url)
+        max_attempts = 2 if _is_stooq_url(normalized_url) else 1
+        for attempt_index in range(1, max_attempts + 1):
+            wait_until = "domcontentloaded" if attempt_index == 1 else "commit"
+            page_recreated = False
+            if attempt_index > 1:
+                log("Browser", f"Retrying unstable navigation for {normalized_url[:80]}")
+                try:
+                    await self._page.close()
+                except Exception:
+                    pass
+                self._page = await self._context.new_page()
+                page_recreated = True
+                await asyncio.sleep(0.2)
+            try:
+                await self._page.goto(normalized_url, wait_until=wait_until, timeout=NAVIGATION_TIMEOUT_MS)
+                try:
+                    await self._page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                self.clear_last_navigation_metadata()
+                return
+            except Exception as exc:
+                text = f"{type(exc).__name__}: {exc}".lower()
+                classification_hint = None
+                if "err_aborted" in text or "frame was detached" in text:
+                    classification_hint = "env_nav_aborted"
+                elif "target page, context or browser has been closed" in text or "targetclosederror" in text:
+                    classification_hint = "env_target_closed"
+                elif "timeout" in text:
+                    classification_hint = "env_nav_timeout"
+                elif is_browser_transport_error(exc):
+                    classification_hint = "env_browser_context_invalidated"
+                self._last_navigation_metadata = BrowserNavigationMetadata(
+                    url=url,
+                    normalized_url=normalized_url,
+                    navigation_stage=f"goto_{wait_until}",
+                    wait_until=wait_until,
+                    timeout_ms=NAVIGATION_TIMEOUT_MS,
+                    raw_exception_type=type(exc).__name__,
+                    raw_exception_message=str(exc),
+                    attempt_index=attempt_index,
+                    max_attempts=max_attempts,
+                    browser_reused=self._browser is None,
+                    context_reused=True,
+                    page_recreated_before_retry=page_recreated,
+                    used_url_normalization=(normalized_url != url),
+                    classification_hint=classification_hint,
+                )
+                if attempt_index == max_attempts or not _is_stooq_url(normalized_url) or classification_hint not in {"env_nav_aborted", "env_target_closed"}:
+                    raise BrowserNavigationError(str(exc), self._last_navigation_metadata) from exc
+
     async def get_observation(self, max_retries: int = 3) -> BrowserObservation:
         """Get current browser observation with retry logic for navigation timing"""
         return await self._get_observation(max_retries)
@@ -644,7 +750,22 @@ class BrowserSession:
                 else:
                     # Final attempt failed - raise error instead of returning empty observation
                     # Empty observation would affect agent decisions and GT collection
-                    raise RuntimeError(f"Failed to get browser observation after {max_retries} retries: {e}") from e
+                    metadata = BrowserNavigationMetadata(
+                        url=self._page.url,
+                        normalized_url=_normalize_stooq_url(self._page.url),
+                        navigation_stage="observation_fetch",
+                        timeout_ms=15000,
+                        raw_exception_type=type(e).__name__,
+                        raw_exception_message=str(e),
+                        attempt_index=attempt + 1,
+                        max_attempts=max_retries,
+                        browser_reused=self._browser is None,
+                        context_reused=True,
+                        page_recreated_before_retry=False,
+                        classification_hint="env_nav_timeout" if "timeout" in f"{type(e).__name__}: {e}".lower() else "ambiguous_navigation_failure",
+                    )
+                    self._last_navigation_metadata = metadata
+                    raise BrowserNavigationError(f"Failed to get browser observation after {max_retries} retries: {e}", metadata) from e
 
     def _format_accessibility_tree(self, node: dict, indent: int = 0) -> str:
         """Format accessibility tree node recursively"""

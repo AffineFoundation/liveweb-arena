@@ -84,6 +84,9 @@ class AgentLoop:
         self._enable_format_recovery = os.getenv("LIVEWEB_ENABLE_FORMAT_RECOVERY", "1") == "1"
         self._format_recovery_max_retries = int(os.getenv("LIVEWEB_FORMAT_RECOVERY_MAX_RETRIES", "4"))
         self._format_recovery_max_new_tokens = int(os.getenv("LIVEWEB_FORMAT_RECOVERY_MAX_NEW_TOKENS", "96"))
+        self._format_recovery_empty_max_retries = int(
+            os.getenv("LIVEWEB_FORMAT_RECOVERY_EMPTY_MAX_RETRIES", "2")
+        )
 
         # Internal state for partial recovery
         self._trajectory: List[TrajectoryStep] = []
@@ -159,7 +162,7 @@ class AgentLoop:
         *,
         system_prompt: str,
         user_prompt: str,
-        assistant_prefix: str,
+        failure_class: str,
     ) -> list[dict]:
         messages: list[dict] = []
         if system_prompt:
@@ -167,15 +170,19 @@ class AgentLoop:
         for step in self._trajectory:
             messages.extend(self._protocol.serialize_step(step))
         messages.append({"role": "user", "content": user_prompt})
-        if assistant_prefix.strip():
-            messages.append({"role": "assistant", "content": assistant_prefix})
+        remediation = (
+            "The previous assistant output had invalid tool-call formatting. "
+            "Emit exactly one valid tool call now. No explanation, no prose, no markdown, no XML."
+        )
+        if failure_class == "recoverable_empty":
+            remediation = (
+                "Your previous assistant message was empty. Emit exactly one valid tool call now. "
+                "No explanation, no prose, no markdown, no XML."
+            )
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "Continue from the assistant's last output and emit exactly one valid tool call "
-                    "in strict function-calling format. No explanation, no markdown, no XML, no raw prose."
-                ),
+                "content": remediation,
             }
         )
         return messages
@@ -187,31 +194,22 @@ class AgentLoop:
         seed: Optional[int],
         raw_response: str,
         messages: list[dict],
+        failure_class: str,
     ) -> Tuple[str, Optional[BrowserAction], Optional[dict]]:
         if not self._enable_format_recovery:
             return raw_response, None, None
 
         tools = self._protocol.get_tools()
-        prefix = raw_response or ""
-        recovery_instruction = {
-            "role": "user",
-            "content": (
-                "Continue from the assistant's last output and emit exactly one valid tool call "
-                "in strict function-calling format. No explanation, no markdown, no XML, no raw prose."
-            ),
-        }
         base_messages = list(messages)
-        if base_messages and base_messages[-1] == recovery_instruction:
-            base_messages = base_messages[:-1]
         self._format_recovery_attempts += 1
         recovery_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        for retry_idx in range(self._format_recovery_max_retries):
-            attempt_messages = list(base_messages)
-            if prefix.strip():
-                attempt_messages.append({"role": "assistant", "content": prefix})
-            attempt_messages.append(recovery_instruction)
+        max_retries = self._format_recovery_max_retries
+        if failure_class == "recoverable_empty":
+            max_retries = min(max_retries, self._format_recovery_empty_max_retries)
+
+        for retry_idx in range(max_retries):
             response = await self._llm_client.chat_with_tools_recovery(
-                messages=attempt_messages,
+                messages=base_messages,
                 model=model,
                 tools=tools,
                 seed=seed,
@@ -233,7 +231,6 @@ class AgentLoop:
                     force=True,
                 )
                 return recovered_raw, action, recovery_usage
-            prefix = recovered_raw or prefix
 
         self._format_recovery_exhausted += 1
         return raw_response, None, recovery_usage
@@ -386,8 +383,9 @@ class AgentLoop:
                         messages=self._build_recovery_messages(
                             system_prompt=system_prompt,
                             user_prompt=user_prompt,
-                            assistant_prefix=raw_response,
+                            failure_class=failure_class,
                         ),
+                        failure_class=failure_class,
                     )
                     if usage:
                         for key in self._total_usage:

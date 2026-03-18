@@ -773,14 +773,12 @@ class LLMClient:
             if system:
                 messages.append({"role": "system", "content": system})
             messages.append({"role": "user", "content": user})
-            if assistant_prefix.strip():
-                messages.append({"role": "assistant", "content": assistant_prefix})
             messages.append(
                 {
                     "role": "user",
                     "content": (
-                        "Continue from the assistant's last output and emit exactly one valid tool call "
-                        "in strict function-calling format. No explanation, no markdown, no XML, no raw prose."
+                        "The previous assistant output had invalid tool-call formatting. "
+                        "Emit exactly one valid tool call now. No explanation, no prose, no markdown, no XML."
                     ),
                 }
             )

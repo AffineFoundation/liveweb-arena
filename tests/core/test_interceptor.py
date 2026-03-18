@@ -89,6 +89,14 @@ class TestSoftFailPolicy:
         assert i._soft_fail_policy("https://channelsurfer.tv/") == "prefetch_soft"
         assert i._soft_fail_policy("https://news.ycombinator.com/newest") is None
 
+    def test_default_soft_fail_domains_cover_high_noise_sites(self, monkeypatch):
+        monkeypatch.delenv("LIVEWEB_SOFT_FAIL_DOMAINS", raising=False)
+        monkeypatch.delenv("LIVEWEB_PREFETCH_SOFT_URL_REGEXES", raising=False)
+        i = _interceptor()
+        assert i._should_soft_fail_domain("https://www.taostats.io/subnets")
+        assert i._should_soft_fail_domain("https://www.coingecko.com/en/coins/bitcoin")
+        assert i._should_soft_fail_domain("https://www.stooq.com/q/currency/usd-eur")
+
 
 # ── _find_cached_page ─────────────────────────────────────────────
 
@@ -117,6 +125,18 @@ class TestFindCachedPage:
         page = CachedPage(url=url, html="<h1>BTC</h1>", api_data=None, fetched_at=1.0, need_api=True)
         i = _interceptor(cached={normalize_url(url): page})
         assert i._find_cached_page(url) is None
+
+    def test_find_any_cached_page_allows_stale_html_fallback(self):
+        url = "https://www.taostats.io/subnets"
+        page = CachedPage(url=url, html="<h1>Subnets</h1>", api_data=None, fetched_at=1.0, need_api=True)
+        i = _interceptor(cached={normalize_url(url): page})
+        assert i._find_any_cached_page(url) is page
+
+    def test_prefetch_timeout_for_high_noise_domains(self):
+        i = _interceptor()
+        assert i._prefetch_timeout_for_url("https://www.coingecko.com/en/coins/bitcoin", need_api=True) >= 35
+        assert i._prefetch_timeout_for_url("https://www.taostats.io/subnets", need_api=True) >= 35
+        assert i._prefetch_timeout_for_url("https://www.stooq.com/q/currency/usd-eur", need_api=False) >= 16
 
 
 # ── InterceptorStats ───────────────────────────────────────────────
@@ -158,6 +178,15 @@ class TestErrorManagement:
         i._pending_error = ValueError("bad")
         with pytest.raises(CacheFatalError):
             i.raise_if_error("https://x.com")
+
+    def test_error_metadata_roundtrip(self):
+        i = _interceptor()
+        i._last_error_metadata = {"classification": "env_prefetch_timeout", "soft_fail_triggered": True}
+        assert i.get_and_clear_error_metadata() == {
+            "classification": "env_prefetch_timeout",
+            "soft_fail_triggered": True,
+        }
+        assert i.get_and_clear_error_metadata() == {}
 
 
 # ── Accessibility tree cache ───────────────────────────────────────
