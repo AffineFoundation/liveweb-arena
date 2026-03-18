@@ -164,3 +164,42 @@ async def test_agent_loop_limits_empty_recovery_retries(monkeypatch):
     assert stats["format_recovery_attempts"] == 1
     assert stats["format_recovery_exhausted"] == 1
     assert llm_client.recovery_calls == 2
+
+
+@pytest.mark.anyio
+async def test_agent_loop_skips_recovery_when_context_budget_exceeded(monkeypatch):
+    monkeypatch.setenv("LIVEWEB_ENABLE_FORMAT_RECOVERY", "1")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_CONTEXT_LENGTH", "64")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_MAX_NEW_TOKENS", "32")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_TOKEN_MARGIN", "16")
+
+    llm_client = _FakeLLMClient(
+        initial_response=LLMResponse(content="<tool_call>{\"name\":\"goto\""),
+        recovery_responses=[],
+    )
+    loop = AgentLoop(
+        session=_FakeSession(),
+        llm_client=llm_client,
+        protocol=FunctionCallingProtocol(),
+        max_steps=2,
+    )
+    long_obs = BrowserObservation(url="https://example.com", title="Long", accessibility_tree="x" * 2000)
+    loop._trajectory = []
+    messages = loop._build_recovery_messages(
+        system_prompt="sys",
+        user_prompt=f"obs {long_obs.accessibility_tree}",
+        failure_class="recoverable_truncated_tool_json",
+    )
+
+    raw, action, usage, override = await loop._attempt_format_recovery(
+        model="qwen",
+        seed=1,
+        raw_response="<tool_call>{\"name\":\"goto\"",
+        messages=messages,
+        failure_class="recoverable_truncated_tool_json",
+    )
+
+    assert action is None
+    assert usage is None
+    assert override == "recoverable_context_overflow"
+    assert llm_client.recovery_calls == 0

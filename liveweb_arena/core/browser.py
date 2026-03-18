@@ -88,6 +88,19 @@ def _normalize_stooq_url(url: str) -> str:
     return urlunparse(parsed._replace(scheme="https", netloc="stooq.com", query=normalized_query))
 
 
+def _classify_browser_exception(exc: BaseException) -> str | None:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "err_aborted" in text or "frame was detached" in text:
+        return "env_nav_aborted"
+    if "target page, context or browser has been closed" in text or "targetclosederror" in text:
+        return "env_target_closed"
+    if "timeout" in text:
+        return "env_nav_timeout"
+    if is_browser_transport_error(exc):
+        return "env_browser_context_invalidated"
+    return None
+
+
 class BrowserSession:
     """
     Isolated browser session (context + page).
@@ -122,6 +135,25 @@ class BrowserSession:
 
     def clear_last_navigation_metadata(self) -> None:
         self._last_navigation_metadata = None
+
+    def _record_action_failure_metadata(self, *, url: str, action_stage: str, exc: BaseException) -> None:
+        if isinstance(exc, BrowserNavigationError):
+            self._last_navigation_metadata = exc.metadata
+            return
+        self._last_navigation_metadata = BrowserNavigationMetadata(
+            url=url,
+            normalized_url=_normalize_stooq_url(url),
+            navigation_stage=action_stage,
+            timeout_ms=NAVIGATION_TIMEOUT_MS,
+            raw_exception_type=type(exc).__name__,
+            raw_exception_message=str(exc),
+            attempt_index=1,
+            max_attempts=1,
+            browser_reused=self._browser is None,
+            context_reused=True,
+            page_recreated_before_retry=False,
+            classification_hint=_classify_browser_exception(exc) or "ambiguous_navigation_failure",
+        )
 
     async def block_urls(self, patterns: list):
         """
@@ -522,6 +554,11 @@ class BrowserSession:
 
         except Exception as e:
             # Re-raise action execution errors so agent_loop can report failure
+            self._record_action_failure_metadata(
+                url=self._page.url or params.get("url", "") or self._last_url or "about:blank",
+                action_stage=f"action_{action_type}",
+                exc=e,
+            )
             raise
 
         return await self._get_observation()

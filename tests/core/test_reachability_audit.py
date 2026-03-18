@@ -44,6 +44,24 @@ def test_reachability_audit_classifies_target_closed():
     assert audit.is_environment_failure is True
 
 
+def test_reachability_audit_classifies_from_raw_navigation_message_when_outer_error_is_generic():
+    audit = audit_reachability_failure(
+        url="https://taostats.io/subnets/73",
+        plugin_name="taostats",
+        plugin=TaostatsPlugin(),
+        exception=RuntimeError("Too many consecutive action failures (5)"),
+        evidence={
+            "navigation_metadata": {
+                "raw_exception_type": "Error",
+                "raw_exception_message": "net::ERR_ABORTED; maybe frame was detached",
+                "navigation_stage": "action_click",
+            }
+        },
+    )
+    assert audit.classification == "env_nav_aborted"
+    assert audit.navigation_stage == "action_click"
+
+
 def test_reachability_audit_classifies_cdn_blocked():
     audit = audit_reachability_failure(
         url="https://www.coingecko.com/en/coins/bitcoin",

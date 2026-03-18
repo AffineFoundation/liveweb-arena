@@ -123,6 +123,7 @@ def audit_reachability_failure(
     navigation_metadata = evidence.get("navigation_metadata") or {}
     raw_exception_type = navigation_metadata.get("raw_exception_type") or (type(exception).__name__ if exception is not None else None)
     raw_exception_message = navigation_metadata.get("raw_exception_message") or (str(exception) if exception is not None else None)
+    raw_exception_lower = (raw_exception_message or "").lower()
     navigation_stage = navigation_metadata.get("navigation_stage")
     resource_type = navigation_metadata.get("resource_type")
     attempt_index = navigation_metadata.get("attempt_index")
@@ -221,22 +222,30 @@ def audit_reachability_failure(
             evidence=evidence,
         )
 
+    combined_lower = " ".join(part for part in [exception_lower, raw_exception_lower] if part)
+
     if probe and probe.exception_type == "SSLError":
         classification = "env_tls_error"
         layer = "tls"
-    elif "certificate_verify_failed" in exception_lower or "sslerror" in exception_lower:
+    elif "certificate_verify_failed" in combined_lower or "sslerror" in combined_lower:
         classification = "env_tls_error"
         layer = "tls"
-    elif "err_aborted" in exception_lower or "frame was detached" in exception_lower:
+    elif "err_aborted" in combined_lower or "frame was detached" in combined_lower:
         classification = "env_nav_aborted"
         layer = "browser"
-    elif "target page, context or browser has been closed" in exception_lower or "targetclosederror" in exception_lower:
+    elif "target page, context or browser has been closed" in combined_lower or "targetclosederror" in combined_lower:
         classification = "env_target_closed"
         layer = "browser"
-    elif "status=429" in exception_lower:
+    elif "timeout" in combined_lower:
+        classification = "env_nav_timeout"
+        layer = "browser"
+    elif "handler is closed" in combined_lower or "transport closed" in combined_lower or "connection closed" in combined_lower:
+        classification = "env_browser_context_invalidated"
+        layer = "browser"
+    elif "status=429" in combined_lower:
         classification = "env_api_rate_limited"
         layer = "api"
-    elif "empty response for coin_id" in exception_lower:
+    elif "empty response for coin_id" in combined_lower:
         classification = "env_api_empty"
         layer = "api"
     elif http_status is not None and 400 <= http_status < 500:

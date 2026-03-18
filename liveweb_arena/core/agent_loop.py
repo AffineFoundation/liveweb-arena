@@ -87,6 +87,10 @@ class AgentLoop:
         self._format_recovery_empty_max_retries = int(
             os.getenv("LIVEWEB_FORMAT_RECOVERY_EMPTY_MAX_RETRIES", "2")
         )
+        self._format_recovery_context_length = int(
+            os.getenv("LIVEWEB_FORMAT_RECOVERY_CONTEXT_LENGTH", os.getenv("LIVEWEB_LLM_CONTEXT_LENGTH", "32768"))
+        )
+        self._format_recovery_token_margin = int(os.getenv("LIVEWEB_FORMAT_RECOVERY_TOKEN_MARGIN", "256"))
 
         # Internal state for partial recovery
         self._trajectory: List[TrajectoryStep] = []
@@ -187,6 +191,60 @@ class AgentLoop:
         )
         return messages
 
+    @staticmethod
+    def _estimate_message_tokens(messages: list[dict]) -> int:
+        total = 0
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                total += max(1, len(content) // 4) + 8
+            else:
+                total += 16
+        return total
+
+    def _trim_recovery_messages(
+        self,
+        *,
+        messages: list[dict],
+        max_new_tokens: int,
+    ) -> tuple[list[dict] | None, bool]:
+        budget = self._format_recovery_context_length - max_new_tokens - self._format_recovery_token_margin
+        if budget <= 0:
+            return None, True
+
+        protected_indices = []
+        if messages and messages[0].get("role") == "system":
+            protected_indices.append(0)
+        if len(messages) >= 2:
+            protected_indices.extend([len(messages) - 2, len(messages) - 1])
+        protected_indices = sorted(set(i for i in protected_indices if 0 <= i < len(messages)))
+
+        protected_messages = [messages[i] for i in protected_indices]
+        if self._estimate_message_tokens(protected_messages) > budget:
+            return None, True
+
+        middle_indices = [i for i in range(len(messages)) if i not in protected_indices]
+        kept_middle: list[dict] = []
+        current_messages = list(protected_messages)
+        current_tokens = self._estimate_message_tokens(current_messages)
+        for idx in reversed(middle_indices):
+            candidate = messages[idx]
+            candidate_tokens = self._estimate_message_tokens([candidate])
+            if current_tokens + candidate_tokens > budget:
+                continue
+            kept_middle.append(candidate)
+            current_tokens += candidate_tokens
+
+        rebuilt: list[dict] = []
+        protected_set = set(protected_indices)
+        kept_middle_ids = {id(msg) for msg in kept_middle}
+        for i, message in enumerate(messages):
+            if i in protected_set or id(message) in kept_middle_ids:
+                rebuilt.append(message)
+
+        overflowed = self._estimate_message_tokens(messages) > budget
+        return rebuilt, overflowed
+
     async def _attempt_format_recovery(
         self,
         *,
@@ -195,12 +253,19 @@ class AgentLoop:
         raw_response: str,
         messages: list[dict],
         failure_class: str,
-    ) -> Tuple[str, Optional[BrowserAction], Optional[dict]]:
+    ) -> Tuple[str, Optional[BrowserAction], Optional[dict], Optional[str]]:
         if not self._enable_format_recovery:
-            return raw_response, None, None
+            return raw_response, None, None, None
 
         tools = self._protocol.get_tools()
-        base_messages = list(messages)
+        base_messages, overflowed = self._trim_recovery_messages(
+            messages=list(messages),
+            max_new_tokens=self._format_recovery_max_new_tokens,
+        )
+        if base_messages is None:
+            log("Agent", "Skipping format recovery because trimmed recovery context still exceeds context budget", force=True)
+            return raw_response, None, None, "recoverable_context_overflow"
+
         self._format_recovery_attempts += 1
         recovery_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         max_retries = self._format_recovery_max_retries
@@ -230,10 +295,10 @@ class AgentLoop:
                     f"Format recovery succeeded on retry {retry_idx + 1} with action={action.action_type}",
                     force=True,
                 )
-                return recovered_raw, action, recovery_usage
+                return recovered_raw, action, recovery_usage, None
 
         self._format_recovery_exhausted += 1
-        return raw_response, None, recovery_usage
+        return raw_response, None, recovery_usage, None
 
     async def run(
         self,
@@ -376,7 +441,7 @@ class AgentLoop:
                 self._format_failure_class_counts[failure_class] += 1
                 if failure_class.startswith("recoverable_"):
                     log("Agent", f"Parse failed, attempting format recovery: {failure_class}", force=True)
-                    raw_response, action, usage = await self._attempt_format_recovery(
+                    raw_response, action, usage, failure_override = await self._attempt_format_recovery(
                         model=model,
                         seed=seed,
                         raw_response=raw_response,
@@ -387,6 +452,10 @@ class AgentLoop:
                         ),
                         failure_class=failure_class,
                     )
+                    if failure_override is not None:
+                        if self._format_failure_class_counts[failure_class] > 0:
+                            self._format_failure_class_counts[failure_class] -= 1
+                        self._format_failure_class_counts[failure_override] += 1
                     if usage:
                         for key in self._total_usage:
                             self._total_usage[key] += usage.get(key, 0)
