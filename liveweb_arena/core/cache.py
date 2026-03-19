@@ -18,7 +18,6 @@ Directory structure:
 """
 
 import asyncio
-import fcntl
 import json
 import logging
 import os
@@ -127,12 +126,36 @@ async def async_file_lock_acquire(lock_path: Path, timeout: float = 60.0) -> int
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
 
+    # Cross-platform file locking.
+    # - POSIX: use fcntl.flock
+    # - Windows: use msvcrt.locking (non-blocking)
+    try:
+        import fcntl  # type: ignore
+        _lock_impl = "posix"
+    except ModuleNotFoundError:
+        import msvcrt  # type: ignore
+        _lock_impl = "windows"
+
     while True:
-        fd = open(lock_path, 'w')
+        # Open in binary mode so Windows locking works reliably.
+        fd = open(lock_path, 'w+b')
         try:
-            # Try non-blocking lock
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd  # Lock acquired, return file object
+            if _lock_impl == "posix":
+                # Try non-blocking lock
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd  # Lock acquired, return file object
+
+            # Windows: ensure at least 1 byte to lock.
+            fd.write(b"\0")
+            fd.flush()
+            fd.seek(0)
+            try:
+                # Non-blocking lock for 1 byte
+                msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+                return fd
+            except OSError:
+                raise BlockingIOError()
+
         except BlockingIOError:
             fd.close()
             # Lock held by another process, wait and retry
@@ -147,7 +170,13 @@ async def async_file_lock_acquire(lock_path: Path, timeout: float = 60.0) -> int
 def async_file_lock_release(fd):
     """Release file lock acquired by async_file_lock_acquire()."""
     try:
-        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        # Best-effort cross-platform unlock.
+        try:
+            import fcntl  # type: ignore
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        except ModuleNotFoundError:
+            import msvcrt  # type: ignore
+            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
     finally:
         fd.close()
 
