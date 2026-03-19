@@ -12,10 +12,15 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 from urllib.parse import urlparse
 
-from playwright.async_api import Route
+if TYPE_CHECKING:
+    from playwright.async_api import Route
+else:
+    # Allow importing this module in environments without Playwright installed.
+    # At runtime, Playwright will provide the actual Route type.
+    Route = Any  # type: ignore
 
 from liveweb_arena.core.block_patterns import TRACKING_BLOCK_PATTERNS
 from liveweb_arena.core.cache import CachedPage, CacheFatalError, CacheManager, PageRequirement, normalize_url
@@ -188,7 +193,28 @@ class CacheInterceptor:
                         body="<html><body><h1>Blocked</h1><p>URL blocked by policy.</p></body></html>",
                     )
                 else:
-                    await route.abort("blockedbyclient")
+                    # Offline mode tries to keep JS happy by fulfilling
+                    # lightweight stubs rather than aborting.
+                    if self.offline:
+                        offline_stub = _OFFLINE_STUBS.get(resource_type)
+                        if offline_stub:
+                            content_type, body = offline_stub
+                            await route.fulfill(
+                                status=200,
+                                headers={"content-type": content_type},
+                                body=body,
+                            )
+                        elif resource_type in ("xhr", "fetch"):
+                            content_type, body = self._offline_xhr_stub(route)
+                            await route.fulfill(
+                                status=200,
+                                headers={"content-type": content_type},
+                                body=body,
+                            )
+                        else:
+                            await route.abort("blockedbyclient")
+                    else:
+                        await route.abort("blockedbyclient")
                 return
 
             # Handle by resource type
@@ -335,7 +361,18 @@ class CacheInterceptor:
 
     async def _handle_xhr(self, route: Route, url: str):
         """Handle XHR/fetch requests."""
-        if self.offline or not self._is_domain_allowed(url):
+        if self.offline:
+            content_type, body = self._offline_xhr_stub(route)
+            self.stats.blocked += 1
+            self.stats.blocked_urls.add(url)
+            await route.fulfill(
+                status=200,
+                headers={"content-type": content_type},
+                body=body,
+            )
+            return
+
+        if not self._is_domain_allowed(url):
             self.stats.blocked += 1
             self.stats.blocked_urls.add(url)
             await route.abort("blockedbyclient")
@@ -414,6 +451,29 @@ class CacheInterceptor:
                     return page
 
         return None
+
+    @staticmethod
+    def _offline_xhr_stub(route: Route) -> tuple[str, Any]:
+        """
+        Return (content_type, body) for offline XHR/fetch fulfillment.
+
+        Goal: avoid JS retries/errors during cache-mode evaluation by giving
+        the app a plausible empty response.
+        """
+        headers: Dict[str, str] = getattr(route.request, "headers", {}) or {}
+        accept = headers.get("accept") or headers.get("Accept") or ""
+        accept_l = accept.lower() if accept else ""
+
+        # Common: fetch(...).then(r => r.json())
+        if "application/json" in accept_l or "json" in accept_l:
+            return "application/json; charset=utf-8", "{}"
+
+        # Common: r.text() / r.text().then(...)
+        if "text/" in accept_l or accept_l == "":
+            return "text/plain; charset=utf-8", ""
+
+        # Fallback for other Accepts: return empty bytes.
+        return "application/octet-stream", b""
 
     @staticmethod
     def _url_variants(url: str, parsed) -> List[str]:

@@ -1,5 +1,6 @@
 """Tests for CacheInterceptor — URL blocking, domain allowlisting, cache lookup, error management."""
 
+import asyncio
 import pytest
 
 from liveweb_arena.core.cache import CachedPage, CacheFatalError, normalize_url
@@ -159,3 +160,71 @@ class TestAccessibilityTreeCache:
         i.cleanup()
         assert len(i._accessibility_trees) == 0
         assert len(i.cached_pages) == 0
+
+
+class FakeRequest:
+    def __init__(self, url: str, resource_type: str, headers=None):
+        self.url = url
+        self.resource_type = resource_type
+        self.headers = headers or {}
+
+
+class FakeRoute:
+    def __init__(self, request: FakeRequest):
+        self.request = request
+        self.fulfilled = None
+        self.aborted = None
+        self.continued = False
+
+    async def fulfill(self, status=None, headers=None, body=None):
+        self.fulfilled = {
+            "status": status,
+            "headers": headers or {},
+            "body": body,
+        }
+
+    async def abort(self, reason=None):
+        self.aborted = reason
+
+    async def continue_(self):
+        self.continued = True
+
+
+def test_offline_xhr_fulfilled_with_json_stub():
+    i = _interceptor(offline=True)
+    route = FakeRoute(
+        FakeRequest(
+            url="https://example.com/api",
+            resource_type="xhr",
+            headers={"accept": "application/json"},
+        )
+    )
+
+    asyncio.run(i.handle_route(route))
+
+    assert route.aborted is None
+    assert route.continued is False
+    assert route.fulfilled is not None
+    assert route.fulfilled["status"] == 200
+    assert route.fulfilled["headers"]["content-type"].startswith("application/json")
+    assert route.fulfilled["body"] == "{}"
+
+
+def test_offline_blocked_xhr_fulfilled_instead_of_abort():
+    i = _interceptor(offline=True)
+    # This URL is blocked by the built-in tracking block patterns.
+    route = FakeRoute(
+        FakeRequest(
+            url="https://www.google-analytics.com/collect?v=1",
+            resource_type="xhr",
+            headers={"accept": "application/json"},
+        )
+    )
+
+    asyncio.run(i.handle_route(route))
+
+    assert route.aborted is None
+    assert route.continued is False
+    assert route.fulfilled is not None
+    assert route.fulfilled["status"] == 200
+    assert route.fulfilled["body"] == "{}"
