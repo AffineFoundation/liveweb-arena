@@ -357,17 +357,25 @@ class LLMClient:
         hostname = (urlparse(base_url).hostname or "").lower()
         return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
 
-    def _apply_reasoning_controls(self, params: Dict[str, object], *, base_url: str) -> None:
+    @staticmethod
+    def _is_openrouter_kimi_model(model: str) -> bool:
+        normalized = (model or "").strip().lower()
+        return normalized.startswith("moonshotai/kimi-k2.5")
+
+    def _apply_reasoning_controls(self, params: Dict[str, object], *, base_url: str, model: str) -> None:
         extra_body = dict(params.get("extra_body") or {})
         if self._enable_thinking is not None:
             extra_body["chat_template_kwargs"] = {"enable_thinking": self._enable_thinking}
         if self._separate_reasoning is not None:
             extra_body["separate_reasoning"] = self._separate_reasoning
         if self._is_openrouter_base_url(base_url) and self._enable_thinking is False:
-            extra_body["reasoning"] = {
-                "effort": "none",
-                "exclude": True,
-            }
+            if self._is_openrouter_kimi_model(model):
+                extra_body["reasoning"] = {"enabled": False}
+            else:
+                extra_body["reasoning"] = {
+                    "effort": "none",
+                    "exclude": True,
+                }
         if extra_body:
             params["extra_body"] = extra_body
 
@@ -1033,7 +1041,7 @@ class LLMClient:
                 params["max_tokens"] = effective_max_completion_tokens
                 params["max_completion_tokens"] = effective_max_completion_tokens
             params["extra_body"] = {"request_id": request_id}
-            self._apply_reasoning_controls(params, base_url=base_url)
+            self._apply_reasoning_controls(params, base_url=base_url, model=model)
 
             start_time = time.time()
             response = await client.chat.completions.create(**params)
@@ -1139,7 +1147,7 @@ class LLMClient:
                 params["max_tokens"] = self._max_completion_tokens
                 params["max_completion_tokens"] = self._max_completion_tokens
             params["extra_body"] = {"request_id": request_id}
-            self._apply_reasoning_controls(params, base_url=base_url)
+            self._apply_reasoning_controls(params, base_url=base_url, model=model)
 
             start_time = time.time()
             stream = await client.chat.completions.create(**params)

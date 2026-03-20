@@ -189,6 +189,30 @@ async def test_chat_with_tools_uses_openrouter_reasoning_none_when_thinking_disa
 
 
 @pytest.mark.anyio
+async def test_chat_with_tools_uses_kimi_reasoning_enabled_false_when_thinking_disabled(monkeypatch):
+    requests = []
+
+    def _factory(**kwargs):
+        return _FakeAsyncOpenAI(requests, **kwargs)
+
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.openai.AsyncOpenAI", _factory)
+    monkeypatch.setenv("LIVEWEB_ENABLE_THINKING", "0")
+
+    client = LLMClient(base_url="https://openrouter.ai/api/v1", api_key="or")
+    await client.chat_with_tools(
+        system="system",
+        user="user",
+        model="moonshotai/kimi-k2.5",
+        tools=[{"type": "function", "function": {"name": "goto", "parameters": {"type": "object"}}}],
+        temperature=0.0,
+        timeout_s=5,
+    )
+
+    payload = requests[0]
+    assert payload["extra_body"]["reasoning"] == {"enabled": False}
+
+
+@pytest.mark.anyio
 async def test_chat_with_tools_recovery_uses_stochastic_small_request(monkeypatch):
     requests = []
 

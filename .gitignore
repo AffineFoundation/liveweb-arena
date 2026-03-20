@@ -63,3 +63,4 @@ logs/
 # uv
 .python-version
 .cache/
+tmp/
