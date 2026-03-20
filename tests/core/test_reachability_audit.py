@@ -128,6 +128,29 @@ def test_reachability_audit_classifies_taostats_list_action_timeout():
     assert audit.evidence["target_locator"] == ".rt-th:nth-child(6)"
 
 
+def test_reachability_audit_classifies_taostats_invalid_selector_as_model_error():
+    audit = audit_reachability_failure(
+        url="https://taostats.io/subnets",
+        plugin_name="taostats",
+        plugin=TaostatsPlugin(),
+        exception=RuntimeError("Locator failed"),
+        evidence={
+            "navigation_metadata": {
+                "navigation_stage": "action_click",
+                "raw_exception_type": "Error",
+                "raw_exception_message": "button:contains('30D') is not a valid selector",
+                "evidence": {"selector": "button:contains('30D')"},
+            }
+        },
+    )
+    assert audit.classification == "model_invalid_selector"
+    assert audit.layer == "model"
+    assert audit.is_environment_failure is False
+    assert audit.is_model_hallucination is True
+    assert audit.evidence["page_kind"] == "taostats_list"
+    assert audit.evidence["selector_syntax_invalid"] is True
+
+
 def test_reachability_audit_classifies_taostats_detail_prefetch_invalidated():
     audit = audit_reachability_failure(
         url="https://taostats.io/subnets/73",
@@ -152,3 +175,26 @@ def test_reachability_audit_classifies_taostats_detail_prefetch_invalidated():
     assert audit.evidence["page_kind"] == "taostats_detail"
     assert audit.evidence["prefetch_phase"] == "setup_page_for_cache"
     assert audit.evidence["wait_target"] == "text=Statistics"
+
+
+def test_reachability_audit_keeps_taostats_detail_soft_setup_out_of_invalidated():
+    audit = audit_reachability_failure(
+        url="https://taostats.io/subnets/73",
+        plugin_name="taostats",
+        plugin=TaostatsPlugin(),
+        exception=RuntimeError("Page.click: Timeout 5000ms exceeded"),
+        evidence={
+            "taostats_prefetch": {
+                "page_kind": "taostats_detail",
+                "prefetch_phase": "setup_page_for_cache",
+                "wait_target": "text=Price Impact",
+                "page_body_ready": True,
+                "detail_setup_soft_failed": True,
+            },
+            "navigation_metadata": {
+                "raw_exception_type": "TimeoutError",
+                "raw_exception_message": "Page.click: Timeout 5000ms exceeded",
+            },
+        },
+    )
+    assert audit.classification == "env_nav_timeout"

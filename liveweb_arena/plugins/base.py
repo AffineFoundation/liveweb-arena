@@ -183,7 +183,7 @@ class BasePlugin(ABC):
         """
         return True
 
-    async def setup_page_for_cache(self, page, url: str) -> None:
+    async def setup_page_for_cache(self, page, url: str) -> Optional[Dict[str, Any]]:
         """
         Perform page interactions before caching (e.g., click 'Show All').
 
@@ -194,8 +194,13 @@ class BasePlugin(ABC):
             page: Playwright Page object
             url: The page URL being cached
 
+        Returns:
+            Optional metadata describing soft setup issues or extra evidence
+            gathered during cache preparation. Returning ``None`` keeps the
+            previous behavior.
+
         Example:
-            async def setup_page_for_cache(self, page, url: str) -> None:
+            async def setup_page_for_cache(self, page, url: str) -> Optional[Dict[str, Any]]:
                 if '/subnets' in url:
                     # Click "ALL" to show all rows
                     await page.click('text=ALL')

@@ -73,6 +73,21 @@ def _infer_taostats_interaction_kind(target_locator: str | None, raw_exception_m
     return "unknown"
 
 
+def _is_invalid_selector_message(raw_exception_type: str | None, raw_exception_message: str | None) -> bool:
+    text = " ".join(part for part in [raw_exception_type or "", raw_exception_message or ""] if part).lower()
+    return any(
+        marker in text
+        for marker in (
+            "not a valid selector",
+            "unexpected token",
+            "queryselectorall",
+            "selector engine",
+            "selector is malformed",
+            "unknown engine",
+        )
+    )
+
+
 def _build_disallowed_domain_audit(
     *,
     url: str,
@@ -276,6 +291,40 @@ def audit_reachability_failure(
             )
         )
         interaction_kind = _infer_taostats_interaction_kind(target_locator, raw_exception_message)
+        selector_syntax_invalid = _is_invalid_selector_message(raw_exception_type, raw_exception_message)
+        if selector_syntax_invalid:
+            evidence.update(
+                {
+                    "page_kind": "taostats_list",
+                    "interaction_kind": interaction_kind,
+                    "target_locator": target_locator,
+                    "selector_syntax_invalid": True,
+                }
+            )
+            return ReachabilityAuditResult(
+                status="unreachable",
+                classification="model_invalid_selector",
+                layer="model",
+                url=url,
+                normalized_url=normalized,
+                domain=domain,
+                plugin_name=plugin_name,
+                reason=reason or exception_text,
+                http_status=http_status,
+                exception_type=type(exception).__name__ if exception is not None else None,
+                raw_exception_type=raw_exception_type,
+                raw_exception_message=raw_exception_message,
+                navigation_stage=navigation_stage,
+                resource_type=resource_type,
+                attempt_index=attempt_index,
+                max_attempts=max_attempts,
+                browser_reused=browser_reused,
+                context_reused=context_reused,
+                page_recreated_before_retry=page_recreated_before_retry,
+                is_environment_failure=False,
+                is_model_hallucination=True,
+                evidence=evidence,
+            )
         if (
             (navigation_stage or "").startswith("action_")
             and (
@@ -289,6 +338,7 @@ def audit_reachability_failure(
                     "page_kind": "taostats_list",
                     "interaction_kind": interaction_kind,
                     "target_locator": target_locator,
+                    "selector_syntax_invalid": False,
                 }
             )
             return ReachabilityAuditResult(
@@ -328,39 +378,53 @@ def audit_reachability_failure(
         wait_target = taostats_prefetch.get("wait_target")
         background_refresh = bool(taostats_prefetch.get("background_refresh", False))
         page_kind = taostats_prefetch.get("page_kind")
+        detail_setup_soft_failed = bool(taostats_prefetch.get("detail_setup_soft_failed", False))
+        page_body_ready = taostats_prefetch.get("page_body_ready")
         if prefetch_phase or page_kind == "taostats_detail":
-            evidence.update(
-                {
-                    "page_kind": "taostats_detail",
-                    "prefetch_phase": prefetch_phase or "goto",
-                    "wait_target": wait_target,
-                    "background_refresh": background_refresh,
-                }
-            )
-            return ReachabilityAuditResult(
-                status="unreachable",
-                classification="env_taostats_detail_prefetch_invalidated",
-                layer="browser",
-                url=url,
-                normalized_url=normalized,
-                domain=domain,
-                plugin_name=plugin_name,
-                reason=reason or exception_text,
-                http_status=http_status,
-                exception_type=type(exception).__name__ if exception is not None else None,
-                raw_exception_type=raw_exception_type,
-                raw_exception_message=raw_exception_message,
-                navigation_stage=navigation_stage,
-                resource_type=resource_type,
-                attempt_index=attempt_index,
-                max_attempts=max_attempts,
-                browser_reused=browser_reused,
-                context_reused=context_reused,
-                page_recreated_before_retry=page_recreated_before_retry,
-                is_environment_failure=True,
-                is_model_hallucination=False,
-                evidence=evidence,
-            )
+            if detail_setup_soft_failed and page_body_ready is True:
+                evidence.update(
+                    {
+                        "page_kind": "taostats_detail",
+                        "prefetch_phase": prefetch_phase or "setup_page_for_cache",
+                        "wait_target": wait_target,
+                        "background_refresh": background_refresh,
+                        "page_body_ready": True,
+                        "detail_setup_soft_failed": True,
+                    }
+                )
+            else:
+                evidence.update(
+                    {
+                        "page_kind": "taostats_detail",
+                        "prefetch_phase": prefetch_phase or "goto",
+                        "wait_target": wait_target,
+                        "background_refresh": background_refresh,
+                    }
+                )
+                return ReachabilityAuditResult(
+                    status="unreachable",
+                    classification="env_taostats_detail_prefetch_invalidated",
+                    layer="browser",
+                    url=url,
+                    normalized_url=normalized,
+                    domain=domain,
+                    plugin_name=plugin_name,
+                    reason=reason or exception_text,
+                    http_status=http_status,
+                    exception_type=type(exception).__name__ if exception is not None else None,
+                    raw_exception_type=raw_exception_type,
+                    raw_exception_message=raw_exception_message,
+                    navigation_stage=navigation_stage,
+                    resource_type=resource_type,
+                    attempt_index=attempt_index,
+                    max_attempts=max_attempts,
+                    browser_reused=browser_reused,
+                    context_reused=context_reused,
+                    page_recreated_before_retry=page_recreated_before_retry,
+                    is_environment_failure=True,
+                    is_model_hallucination=False,
+                    evidence=evidence,
+                )
 
     if navigation_metadata.get("classification_hint") in {
         "env_nav_aborted",

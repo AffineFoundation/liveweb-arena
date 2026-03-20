@@ -547,6 +547,8 @@ class Actor:
                     allowed_domains=allowed_domains,
                     evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
                 )
+                if reachability_audit and reachability_audit.classification == "model_invalid_selector":
+                    failure_reason = "invalid_selector"
         except (LLMFatalError, CacheFatalError) as e:
             failure_reason = fatal_error_map[type(e)]
             error_message = f"{failure_reason}: {e}"
@@ -572,6 +574,9 @@ class Actor:
                 )
                 if reachability_audit and reachability_audit.classification == "model_disallowed_domain":
                     failure_reason = "disallowed_domain"
+                    error_message = None
+                elif reachability_audit and reachability_audit.classification == "model_invalid_selector":
+                    failure_reason = "invalid_selector"
                     error_message = None
         else:
             reachability_audit = None

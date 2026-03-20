@@ -15,6 +15,7 @@ from liveweb_arena.core.cache import (
     safe_path_component,
     url_to_cache_dir,
 )
+from liveweb_arena.plugins.taostats.taostats import TaostatsPlugin
 
 
 # ── CachedPage ──────────────────────────────────────────────────────
@@ -303,3 +304,44 @@ class TestCacheManagerLoadIfValid:
         assert cached is not None
         assert cached.api_data == {"symbol": "jnj.us"}
         assert local_file.exists()
+
+
+def test_cache_manager_records_taostats_prefetch_cooldown(tmp_path):
+    mgr = CacheManager(cache_dir=tmp_path, ttl=3600)
+    url = "https://taostats.io/subnets/73"
+    err = CacheFatalError(
+        "Taostats detail prefetch invalidated",
+        url=url,
+        kind="taostats_prefetch_invalidated",
+        fatal=False,
+        evidence={
+            "classification": "env_taostats_detail_prefetch_invalidated",
+            "page_kind": "taostats_detail",
+            "prefetch_phase": "setup_page_for_cache",
+        },
+        plugin_name="taostats",
+    )
+
+    mgr._maybe_activate_taostats_prefetch_cooldown(url, err)
+    cooldown = mgr._get_taostats_prefetch_cooldown(url)
+    assert cooldown is not None
+    assert cooldown["classification"] == "env_taostats_detail_prefetch_invalidated"
+    assert cooldown["cooldown_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_cache_manager_short_circuits_taostats_detail_during_cooldown(tmp_path):
+    mgr = CacheManager(cache_dir=tmp_path, ttl=3600)
+    url = "https://taostats.io/subnets/73"
+    mgr._taostats_prefetch_cooldowns[normalize_url(url)] = (
+        time.monotonic() + 60,
+        {
+            "classification": "env_taostats_detail_prefetch_invalidated",
+            "page_kind": "taostats_detail",
+        },
+    )
+
+    with pytest.raises(CacheFatalError, match="cooldown active") as excinfo:
+        await mgr._ensure_single(url, TaostatsPlugin(), need_api=False)
+
+    assert excinfo.value.kind == "taostats_prefetch_cooldown"

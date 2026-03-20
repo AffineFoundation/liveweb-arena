@@ -103,7 +103,7 @@ def _build_taostats_prefetch_evidence(
 ) -> dict[str, Any] | None:
     if not _is_taostats_detail_url(url) or not _is_retryable_taostats_detail_prefetch_error(exc):
         return None
-    return {
+    evidence = {
         "classification": "env_taostats_detail_prefetch_invalidated",
         "page_kind": "taostats_detail",
         "prefetch_phase": prefetch_phase,
@@ -112,6 +112,10 @@ def _build_taostats_prefetch_evidence(
         "raw_exception_type": type(exc).__name__,
         "raw_exception_message": str(exc),
     }
+    extra_evidence = dict(getattr(exc, "evidence", {}) or {})
+    if extra_evidence:
+        evidence.update(extra_evidence)
+    return evidence
 
 
 class _VisibleTextExtractor(HTMLParser):
@@ -451,6 +455,7 @@ class CacheManager:
 
     # Minimum interval between consecutive cache-miss fetches (seconds)
     _PREFETCH_INTERVAL = 1.0
+    _TAOSTATS_DETAIL_COOLDOWN_S = 600
 
     def __init__(self, cache_dir: Path, ttl: int = None):
         self.cache_dir = Path(cache_dir)
@@ -479,6 +484,7 @@ class CacheManager:
         self._global_fetch_semaphore = asyncio.Semaphore(max(1, self.max_cache_fetches))
         self._domain_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._refresh_tasks: Dict[str, asyncio.Task] = {}
+        self._taostats_prefetch_cooldowns: Dict[str, tuple[float, dict[str, Any]]] = {}
 
     def _browser_launch_options(self, *, direct: bool = False) -> dict[str, Any]:
         from liveweb_arena.core.block_patterns import STEALTH_BROWSER_ARGS
@@ -593,6 +599,17 @@ class CacheManager:
                 stale=True,
             )
 
+        cooldown_evidence = self._get_taostats_prefetch_cooldown(url)
+        if cooldown_evidence is not None:
+            raise CacheFatalError(
+                "Taostats prefetch cooldown active",
+                url=url,
+                kind="taostats_prefetch_cooldown",
+                fatal=False,
+                evidence=dict(cooldown_evidence),
+                plugin_name=getattr(plugin, "name", None),
+            )
+
         # 2. Need update, acquire async lock (non-blocking to avoid deadlock)
         lock_fd = await async_file_lock_acquire(lock_file)
         try:
@@ -617,6 +634,17 @@ class CacheManager:
                     stale=True,
                 )
 
+            cooldown_evidence = self._get_taostats_prefetch_cooldown(url)
+            if cooldown_evidence is not None:
+                raise CacheFatalError(
+                    "Taostats prefetch cooldown active",
+                    url=url,
+                    kind="taostats_prefetch_cooldown",
+                    fatal=False,
+                    evidence=dict(cooldown_evidence),
+                    plugin_name=getattr(plugin, "name", None),
+                )
+
             # 4. Actually fetch - page and API in parallel when possible
             log("Cache", f"MISS {page_type} - fetching {url_display(normalized)}")
 
@@ -628,13 +656,17 @@ class CacheManager:
             self._last_fetch_time = time.time()
 
             start = time.time()
-            async with self._global_fetch_semaphore:
-                async with self._domain_semaphore(domain_key):
-                    html, accessibility_tree, api_data = await self._fetch_and_build_cache(
-                        url=url,
-                        plugin=plugin,
-                        need_api=need_api,
-                    )
+            try:
+                async with self._global_fetch_semaphore:
+                    async with self._domain_semaphore(domain_key):
+                        html, accessibility_tree, api_data = await self._fetch_and_build_cache(
+                            url=url,
+                            plugin=plugin,
+                            need_api=need_api,
+                        )
+            except Exception as exc:
+                self._maybe_activate_taostats_prefetch_cooldown(url, exc)
+                raise
 
             cached = CachedPage(
                 url=url,
@@ -852,6 +884,45 @@ class CacheManager:
             default_limit = int(os.environ.get("LIVEWEB_CACHE_DOMAIN_LIMIT_STOOQ", "1"))
         return max(1, int(os.environ.get(env_name, str(default_limit))))
 
+    def _get_taostats_prefetch_cooldown(self, url: str) -> Optional[dict[str, Any]]:
+        if not _is_taostats_detail_url(url):
+            return None
+        key = normalize_url(url)
+        entry = self._taostats_prefetch_cooldowns.get(key)
+        if entry is None:
+            return None
+        expires_at, evidence = entry
+        if expires_at > time.monotonic():
+            return evidence
+        self._taostats_prefetch_cooldowns.pop(key, None)
+        return None
+
+    def _maybe_activate_taostats_prefetch_cooldown(self, url: str, exc: BaseException) -> None:
+        if not _is_taostats_detail_url(url):
+            return
+        evidence: dict[str, Any] | None = None
+        if isinstance(exc, CacheFatalError):
+            evidence = dict(exc.evidence or {})
+            classification = evidence.get("classification")
+            if classification != "env_taostats_detail_prefetch_invalidated":
+                return
+        else:
+            evidence = _build_taostats_prefetch_evidence(
+                url=url,
+                exc=exc,
+                prefetch_phase=getattr(exc, "prefetch_phase", "setup_page_for_cache"),
+                wait_target=getattr(exc, "wait_target", None),
+            )
+            if not evidence:
+                return
+        evidence = dict(evidence or {})
+        evidence.setdefault("cooldown_seconds", self._TAOSTATS_DETAIL_COOLDOWN_S)
+        evidence.setdefault("cooldown_applied", True)
+        self._taostats_prefetch_cooldowns[normalize_url(url)] = (
+            time.monotonic() + self._TAOSTATS_DETAIL_COOLDOWN_S,
+            evidence,
+        )
+
     def _domain_semaphore(self, domain_key: str) -> asyncio.Semaphore:
         sem = self._domain_semaphores.get(domain_key)
         if sem is None:
@@ -983,10 +1054,11 @@ class CacheManager:
             except Exception:
                 pass
 
+            setup_metadata: dict[str, Any] = {}
             if plugin and hasattr(plugin, 'setup_page_for_cache'):
                 try:
                     prefetch_phase = "setup_page_for_cache"
-                    await plugin.setup_page_for_cache(page, url)
+                    setup_metadata = dict(await plugin.setup_page_for_cache(page, url) or {})
                 except Exception as e:
                     taostats_evidence = _build_taostats_prefetch_evidence(
                         url=url,
@@ -1004,6 +1076,18 @@ class CacheManager:
                             plugin_name=getattr(plugin, "name", None),
                         ) from e
                     log("Cache", f"Page setup failed (continuing): {e}")
+            if setup_metadata.get("page_kind") == "taostats_detail":
+                log(
+                    "Cache",
+                    "Taostats detail setup metadata: "
+                    + json.dumps(setup_metadata, ensure_ascii=False, sort_keys=True),
+                )
+            elif setup_metadata.get("page_kind") == "taostats_list" and setup_metadata.get("list_setup_soft_failed"):
+                log(
+                    "Cache",
+                    "Taostats list setup soft failure: "
+                    + json.dumps(setup_metadata, ensure_ascii=False, sort_keys=True),
+                )
 
             for pos in [0, 500, 1000, 2000]:
                 prefetch_phase = "post_wait"
