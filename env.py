@@ -70,6 +70,49 @@ def _find_plugin_for_url(plugins_used: Dict[str, "BasePlugin"], url: str) -> Opt
     return None
 
 
+def _maybe_promote_disallowed_domain_failure(
+    *,
+    interceptor,
+    trajectory: list,
+    allowed_domains: Set[str],
+    failure_reason: str | None,
+    reachability_audit,
+) -> tuple[str | None, Any]:
+    if interceptor is None:
+        return failure_reason, reachability_audit
+    blocked = {}
+    if hasattr(interceptor, "get_last_blocked_document_metadata"):
+        blocked = interceptor.get_last_blocked_document_metadata()
+    blocked_url = blocked.get("blocked_url")
+    if not blocked_url:
+        return failure_reason, reachability_audit
+    if failure_reason in {"agent_timeout", "llm_error", "cache_error", "site_unreachable"}:
+        return failure_reason, reachability_audit
+
+    last_url = None
+    last_observation = None
+    if trajectory:
+        observation = getattr(trajectory[-1], "observation", None)
+        last_url = getattr(observation, "url", None)
+        last_observation = getattr(observation, "accessibility_tree", None)
+
+    blocked_marker = "Domain not allowed"
+    same_last_url = bool(last_url and normalize_url(last_url) == normalize_url(blocked_url))
+    blocked_page_visible = blocked_marker in str(last_observation or "")
+    if not same_last_url and not blocked_page_visible:
+        return failure_reason, reachability_audit
+
+    audit = audit_reachability_failure(
+        url=blocked_url,
+        plugin_name=None,
+        plugin=None,
+        reason="Domain not allowed",
+        allowed_domains=allowed_domains,
+        evidence={"interceptor": blocked},
+    )
+    return "disallowed_domain", audit
+
+
 async def _handle_navigation_event(interceptor, cached_pages, plugins_used, url, use_cache):
     """Navigation handler: error propagation + external URL extraction."""
     if not use_cache:
@@ -200,7 +243,7 @@ class Actor:
             if env_cache_dir:
                 cache_dir = Path(env_cache_dir)
             else:
-                cache_dir = Path("/var/lib/liveweb-arena/cache")
+                cache_dir = Path(__file__).resolve().parent / ".cache" / "liveweb"
         self.cache_manager = CacheManager(cache_dir)
 
     def _collect_plugin_info(self, task: CompositeTask):
@@ -220,7 +263,10 @@ class Actor:
         return plugins_used, allowed_domains, list(set(blocked_patterns))
 
     async def _setup_interceptor(self, session, cached_pages, allowed_domains, blocked_patterns, plugins_used):
-        """Create and install CacheInterceptor. Returns interceptor."""
+        """Create and install CacheInterceptor. Returns (session, interceptor)."""
+        if hasattr(session, "set_allowed_domains"):
+            session.set_allowed_domains(allowed_domains)
+
         def url_validator(url):
             for p in plugins_used.values():
                 if hasattr(p, 'is_url_allowed') and p.is_url_allowed(url):
@@ -237,11 +283,24 @@ class Actor:
             plugin_resolver=plugin_resolver,
             offline=self.use_cache,
         )
-        if self.use_cache:
-            await session.set_cache_interceptor(interceptor)
-        if not self.use_cache and blocked_patterns:
-            await session.block_urls(blocked_patterns)
-        return interceptor
+        for attempt in range(2):
+            try:
+                if self.use_cache:
+                    await session.set_cache_interceptor(interceptor)
+                if not self.use_cache and blocked_patterns:
+                    await session.block_urls(blocked_patterns)
+                return session, interceptor
+            except Exception as exc:
+                if attempt == 0 and is_browser_transport_error(exc):
+                    log("Actor", f"Session setup hit browser transport error, rebuilding session: {exc}", force=True)
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
+                    await self._ensure_browser()
+                    session = await self.browser.new_session()
+                    continue
+                raise
 
     async def evaluate(
         self,
@@ -398,6 +457,7 @@ class Actor:
         seed: int,
         allowed_domains: Set[str],
         plugins_used: Optional[Dict[str, BasePlugin]] = None,
+        enable_format_recovery: Optional[bool] = None,
         on_navigation=None,
         on_observation=None,
     ):
@@ -407,6 +467,7 @@ class Actor:
             llm_client=llm_client,
             protocol=protocol,
             max_steps=max_steps,
+            enable_format_recovery=enable_format_recovery,
             on_navigation=on_navigation,
             on_observation=on_observation,
         )
@@ -435,39 +496,55 @@ class Actor:
             log("Actor", error_message, force=True)
         except BrowserFatalError as e:
             is_required_domain = False
+            is_disallowed_domain = False
             plugin_name = None
             plugin = None
+            navigation_metadata = session.get_last_navigation_metadata() if hasattr(session, "get_last_navigation_metadata") else None
+            action_stage = str((navigation_metadata or {}).get("navigation_stage") or "")
             if e.url:
                 for domain in allowed_domains:
                     if _url_matches_domain(e.url, domain):
                         is_required_domain = True
                         break
+                is_disallowed_domain = bool(allowed_domains) and not is_required_domain
                 plugin = _find_plugin_for_url(plugins_used, e.url)
                 plugin_name = getattr(plugin, "name", None) if plugin is not None else None
 
-            if is_required_domain:
-                failure_reason = "site_unreachable"
-                error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
-                log("Actor", f"Infrastructure error: {error_message}", force=True)
-                navigation_metadata = session.get_last_navigation_metadata() if hasattr(session, "get_last_navigation_metadata") else None
-                reachability_audit = audit_reachability_failure(
-                    url=e.url or "",
-                    plugin_name=plugin_name,
-                    plugin=plugin,
-                    exception=e,
-                    reason=error_message,
-                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
-                )
-            else:
-                failure_reason = "browser_error"
-                log("Actor", f"Browser error (agent issue): {e}", force=True)
-                navigation_metadata = session.get_last_navigation_metadata() if hasattr(session, "get_last_navigation_metadata") else None
+            if is_disallowed_domain:
+                failure_reason = "disallowed_domain"
+                log("Actor", f"Disallowed domain navigation: {e.url}", force=True)
                 reachability_audit = audit_reachability_failure(
                     url=e.url or "",
                     plugin_name=plugin_name,
                     plugin=plugin,
                     exception=e,
                     reason=str(e),
+                    allowed_domains=allowed_domains,
+                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
+                )
+            elif is_required_domain and not action_stage.startswith("action_"):
+                failure_reason = "site_unreachable"
+                error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
+                log("Actor", f"Infrastructure error: {error_message}", force=True)
+                reachability_audit = audit_reachability_failure(
+                    url=e.url or "",
+                    plugin_name=plugin_name,
+                    plugin=plugin,
+                    exception=e,
+                    reason=error_message,
+                    allowed_domains=allowed_domains,
+                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
+                )
+            else:
+                failure_reason = "browser_error"
+                log("Actor", f"Browser error (agent issue): {e}", force=True)
+                reachability_audit = audit_reachability_failure(
+                    url=e.url or "",
+                    plugin_name=plugin_name,
+                    plugin=plugin,
+                    exception=e,
+                    reason=str(e),
+                    allowed_domains=allowed_domains,
                     evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
                 )
         except (LLMFatalError, CacheFatalError) as e:
@@ -486,12 +563,16 @@ class Actor:
                     plugin=plugin,
                     exception=e,
                     reason=error_message,
+                    allowed_domains=allowed_domains,
                     http_status=getattr(e, "status_code", None),
                     evidence={
                         **(getattr(e, "evidence", {}) or {}),
                         "interceptor": interceptor_metadata,
                     },
                 )
+                if reachability_audit and reachability_audit.classification == "model_disallowed_domain":
+                    failure_reason = "disallowed_domain"
+                    error_message = None
         else:
             reachability_audit = None
 
@@ -563,7 +644,7 @@ class Actor:
             session = await self.browser.new_session()
 
             # Set up interceptor
-            interceptor = await self._setup_interceptor(
+            session, interceptor = await self._setup_interceptor(
                 session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
             )
 
@@ -612,6 +693,13 @@ class Actor:
                 on_observation=on_observation,
             )
             reachability_audit = getattr(agent_loop, "_reachability_audit", None)
+            failure_reason, reachability_audit = _maybe_promote_disallowed_domain_failure(
+                interceptor=interceptor,
+                trajectory=trajectory,
+                allowed_domains=allowed_domains,
+                failure_reason=failure_reason,
+                reachability_audit=reachability_audit,
+            )
 
             # GT is collected in real-time via on_observation callback
             # For API_ONLY and HYBRID templates, fetch remaining API GT
@@ -708,6 +796,15 @@ class Actor:
             else:
                 total_score = 0.0
                 success = False
+
+            if not success and failure_reason in {None, "browser_error", "max_steps_reached", "parse_failed"}:
+                failure_reason, reachability_audit = _maybe_promote_disallowed_domain_failure(
+                    interceptor=interceptor,
+                    trajectory=trajectory,
+                    allowed_domains=allowed_domains,
+                    failure_reason=failure_reason,
+                    reachability_audit=reachability_audit,
+                )
 
             # Compute step-wise rewards from trajectory (post-hoc)
             reward_calc = StepwiseRewardCalculator(
@@ -844,7 +941,7 @@ class Actor:
         interceptor = None
         try:
             session = await self.browser.new_session()
-            interceptor = await self._setup_interceptor(
+            session, interceptor = await self._setup_interceptor(
                 session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
             )
             active_protocol = FunctionCallingProtocol()
@@ -878,6 +975,13 @@ class Actor:
                 on_observation=None,
             )
             reachability_audit = getattr(agent_loop, "_reachability_audit", None)
+            failure_reason, reachability_audit = _maybe_promote_disallowed_domain_failure(
+                interceptor=interceptor,
+                trajectory=trajectory,
+                allowed_domains=allowed_domains,
+                failure_reason=failure_reason,
+                reachability_audit=reachability_audit,
+            )
 
             interceptor_stats = interceptor.get_stats()
             final_url = trajectory[-1].observation.url if trajectory else None
@@ -1025,7 +1129,7 @@ class Actor:
             session = await self.browser.new_session()
 
             # Set up interceptor
-            interceptor = await self._setup_interceptor(
+            session, interceptor = await self._setup_interceptor(
                 session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
             )
 

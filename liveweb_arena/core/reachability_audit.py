@@ -44,6 +44,81 @@ def _domain(url: str) -> str:
         return ""
 
 
+def _matches_allowed_domain(domain: str, allowed_domain: str) -> bool:
+    return domain == allowed_domain or domain.endswith("." + allowed_domain)
+
+
+def _is_taostats_list_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower().rstrip("/")
+    return "taostats.io" in host and path in {"", "/subnets"}
+
+
+def _is_taostats_detail_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    return "taostats.io" in host and (path.startswith("/subnet/") or path.startswith("/subnets/"))
+
+
+def _infer_taostats_interaction_kind(target_locator: str | None, raw_exception_message: str | None) -> str:
+    text = " ".join(part for part in [target_locator or "", raw_exception_message or ""] if part).lower()
+    if any(marker in text for marker in ("page-item", "next", "prev", "next page")):
+        return "paginate"
+    if any(marker in text for marker in ("rt-th", "dt-orderable", "1h", "24h", "1w", "1m", "sort")):
+        return "sort"
+    if any(marker in text for marker in ("all", "rows:", "dataTables_length", ".dataTables_length")):
+        return "show_all"
+    return "unknown"
+
+
+def _build_disallowed_domain_audit(
+    *,
+    url: str,
+    normalized: str,
+    domain: str,
+    plugin_name: str | None,
+    reason: str | None,
+    http_status: int | None,
+    exception: BaseException | None,
+    raw_exception_type: str | None,
+    raw_exception_message: str | None,
+    navigation_stage: str | None,
+    resource_type: str | None,
+    attempt_index: int | None,
+    max_attempts: int | None,
+    browser_reused: bool | None,
+    context_reused: bool | None,
+    page_recreated_before_retry: bool | None,
+    evidence: dict[str, Any],
+) -> "ReachabilityAuditResult":
+    return ReachabilityAuditResult(
+        status="unreachable",
+        classification="model_disallowed_domain",
+        layer="model",
+        url=url,
+        normalized_url=normalized,
+        domain=domain,
+        plugin_name=plugin_name,
+        reason=reason or "Domain not allowed",
+        http_status=http_status,
+        exception_type=type(exception).__name__ if exception is not None else None,
+        raw_exception_type=raw_exception_type,
+        raw_exception_message=raw_exception_message,
+        navigation_stage=navigation_stage,
+        resource_type=resource_type,
+        attempt_index=attempt_index,
+        max_attempts=max_attempts,
+        browser_reused=browser_reused,
+        context_reused=context_reused,
+        page_recreated_before_retry=page_recreated_before_retry,
+        is_environment_failure=False,
+        is_model_hallucination=True,
+        evidence=evidence,
+    )
+
+
 def classify_stooq_url(url: str) -> str | None:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -131,6 +206,35 @@ def audit_reachability_failure(
     browser_reused = navigation_metadata.get("browser_reused")
     context_reused = navigation_metadata.get("context_reused")
     page_recreated_before_retry = navigation_metadata.get("page_recreated_before_retry")
+    navigation_evidence = dict(navigation_metadata.get("evidence") or {})
+    interceptor_metadata = dict(evidence.get("interceptor") or {})
+    if not resource_type:
+        resource_type = interceptor_metadata.get("blocked_resource_type") or resource_type
+
+    if allowed_domains and domain:
+        normalized_allowed = {(item or "").lower() for item in allowed_domains if item}
+        if normalized_allowed and not any(_matches_allowed_domain(domain, allowed) for allowed in normalized_allowed):
+            evidence.setdefault("interceptor", interceptor_metadata)
+            evidence.setdefault("allowed_domains", sorted(normalized_allowed))
+            return _build_disallowed_domain_audit(
+                url=url,
+                normalized=normalized,
+                domain=domain,
+                plugin_name=plugin_name,
+                reason=reason,
+                http_status=http_status,
+                exception=exception,
+                raw_exception_type=raw_exception_type,
+                raw_exception_message=raw_exception_message,
+                navigation_stage=navigation_stage,
+                resource_type=resource_type,
+                attempt_index=attempt_index,
+                max_attempts=max_attempts,
+                browser_reused=browser_reused,
+                context_reused=context_reused,
+                page_recreated_before_retry=page_recreated_before_retry,
+                evidence=evidence,
+            )
 
     if hallucination_class is not None:
         is_env = hallucination_class.startswith("env_") or hallucination_class.startswith("ambiguous_")
@@ -159,11 +263,104 @@ def audit_reachability_failure(
             evidence=evidence,
         )
 
-    probe = probe_site(url) if url else None
-    if probe is not None:
-        evidence.setdefault("site_probe", probe.to_dict())
-        if http_status is None:
-            http_status = probe.http_status
+    combined_lower = " ".join(part for part in [exception_lower, raw_exception_lower] if part)
+
+    if "taostats.io" in domain and _is_taostats_list_url(url):
+        target_locator = (
+            navigation_evidence.get("selector")
+            or navigation_evidence.get("target_locator")
+            or (
+                f"role={navigation_evidence.get('role')} name={navigation_evidence.get('name')}"
+                if navigation_evidence.get("role")
+                else None
+            )
+        )
+        interaction_kind = _infer_taostats_interaction_kind(target_locator, raw_exception_message)
+        if (
+            (navigation_stage or "").startswith("action_")
+            and (
+                "timeout" in combined_lower
+                or "too many consecutive action failures" in combined_lower
+                or "no element found with role" in combined_lower
+            )
+        ):
+            evidence.update(
+                {
+                    "page_kind": "taostats_list",
+                    "interaction_kind": interaction_kind,
+                    "target_locator": target_locator,
+                }
+            )
+            return ReachabilityAuditResult(
+                status="unreachable",
+                classification="env_taostats_list_action_timeout",
+                layer="browser",
+                url=url,
+                normalized_url=normalized,
+                domain=domain,
+                plugin_name=plugin_name,
+                reason=reason or exception_text,
+                http_status=http_status,
+                exception_type=type(exception).__name__ if exception is not None else None,
+                raw_exception_type=raw_exception_type,
+                raw_exception_message=raw_exception_message,
+                navigation_stage=navigation_stage,
+                resource_type=resource_type,
+                attempt_index=attempt_index,
+                max_attempts=max_attempts,
+                browser_reused=browser_reused,
+                context_reused=context_reused,
+                page_recreated_before_retry=page_recreated_before_retry,
+                is_environment_failure=True,
+                is_model_hallucination=False,
+                evidence=evidence,
+            )
+
+    taostats_prefetch = dict(evidence.get("taostats_prefetch") or {})
+    if not taostats_prefetch:
+        taostats_prefetch = {
+            key: evidence.get(key)
+            for key in ("page_kind", "prefetch_phase", "wait_target", "background_refresh")
+            if evidence.get(key) is not None
+        }
+    if "taostats.io" in domain and _is_taostats_detail_url(url):
+        prefetch_phase = taostats_prefetch.get("prefetch_phase")
+        wait_target = taostats_prefetch.get("wait_target")
+        background_refresh = bool(taostats_prefetch.get("background_refresh", False))
+        page_kind = taostats_prefetch.get("page_kind")
+        if prefetch_phase or page_kind == "taostats_detail":
+            evidence.update(
+                {
+                    "page_kind": "taostats_detail",
+                    "prefetch_phase": prefetch_phase or "goto",
+                    "wait_target": wait_target,
+                    "background_refresh": background_refresh,
+                }
+            )
+            return ReachabilityAuditResult(
+                status="unreachable",
+                classification="env_taostats_detail_prefetch_invalidated",
+                layer="browser",
+                url=url,
+                normalized_url=normalized,
+                domain=domain,
+                plugin_name=plugin_name,
+                reason=reason or exception_text,
+                http_status=http_status,
+                exception_type=type(exception).__name__ if exception is not None else None,
+                raw_exception_type=raw_exception_type,
+                raw_exception_message=raw_exception_message,
+                navigation_stage=navigation_stage,
+                resource_type=resource_type,
+                attempt_index=attempt_index,
+                max_attempts=max_attempts,
+                browser_reused=browser_reused,
+                context_reused=context_reused,
+                page_recreated_before_retry=page_recreated_before_retry,
+                is_environment_failure=True,
+                is_model_hallucination=False,
+                evidence=evidence,
+            )
 
     if navigation_metadata.get("classification_hint") in {
         "env_nav_aborted",
@@ -196,6 +393,12 @@ def audit_reachability_failure(
             evidence=evidence,
         )
 
+    probe = probe_site(url) if url else None
+    if probe is not None:
+        evidence.setdefault("site_probe", probe.to_dict())
+        if http_status is None:
+            http_status = probe.http_status
+
     if http_status == 403 and "coingecko" in domain:
         return ReachabilityAuditResult(
             status="unreachable",
@@ -221,8 +424,6 @@ def audit_reachability_failure(
             is_model_hallucination=False,
             evidence=evidence,
         )
-
-    combined_lower = " ".join(part for part in [exception_lower, raw_exception_lower] if part)
 
     if probe and probe.exception_type == "SSLError":
         classification = "env_tls_error"

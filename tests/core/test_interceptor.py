@@ -20,6 +20,29 @@ def _interceptor(cached=None, domains=None, blocked=None, url_validator=None, of
     )
 
 
+class _FakeRequest:
+    def __init__(self, url: str, resource_type: str = "document"):
+        self.url = url
+        self.resource_type = resource_type
+
+
+class _FakeRoute:
+    def __init__(self, url: str, resource_type: str = "document"):
+        self.request = _FakeRequest(url, resource_type)
+        self.fulfilled = None
+        self.aborted = None
+        self.continued = False
+
+    async def fulfill(self, **kwargs):
+        self.fulfilled = kwargs
+
+    async def abort(self, error_code):
+        self.aborted = error_code
+
+    async def continue_(self):
+        self.continued = True
+
+
 # ── _should_block ──────────────────────────────────────────────────
 
 class TestShouldBlock:
@@ -187,6 +210,23 @@ class TestErrorManagement:
             "soft_fail_triggered": True,
         }
         assert i.get_and_clear_error_metadata() == {}
+
+
+@pytest.mark.anyio
+async def test_disallowed_document_navigation_stores_structured_metadata():
+    interceptor = _interceptor(domains={"coingecko.com"})
+    route = _FakeRoute("https://finance.yahoo.com/quote/AAPL/")
+
+    await interceptor.handle_route(route)
+
+    assert route.fulfilled is not None
+    assert route.fulfilled["status"] == 403
+    metadata = interceptor.get_last_blocked_document_metadata()
+    assert metadata["classification"] == "model_disallowed_domain"
+    assert metadata["blocked_domain"] == "finance.yahoo.com"
+    assert metadata["allowed_domains"] == ["coingecko.com"]
+    assert metadata["blocked_resource_type"] == "document"
+    assert metadata["blocked_by"] == "interceptor"
 
 
 # ── Accessibility tree cache ───────────────────────────────────────

@@ -22,6 +22,7 @@ from liveweb_arena.plugins import get_all_plugins
 
 SITE_UNREACHABLE_RE = re.compile(r"Required site unreachable:\s+(https?://\S+)")
 DOMAIN_UNREACHABLE_RE = re.compile(r"Required domain unreachable:\s+(https?://\S+)")
+REACHABILITY_AUDIT_RE = re.compile(r"\[ReachabilityAudit\]\s+(\{.*\})")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -62,6 +63,20 @@ def _extract_unreachable_urls(log_path: Path) -> Counter[str]:
             if match:
                 counts[match.group(1)] += 1
     return counts
+
+
+def _extract_reachability_audits(log_path: Path) -> list[dict[str, Any]]:
+    audits: list[dict[str, Any]] = []
+    with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            match = REACHABILITY_AUDIT_RE.search(line)
+            if not match:
+                continue
+            try:
+                audits.append(json.loads(match.group(1)))
+            except Exception:
+                continue
+    return audits
 
 
 def _infer_plugin(url: str) -> tuple[str | None, Any | None]:
@@ -196,6 +211,26 @@ def _print_summary(report: dict[str, Any], show_top_urls: int) -> None:
         count = report["environment_detail_counts"][classification]
         print(f"  {classification}: {count} ({ratio:.4f})")
 
+    if report.get("page_kind_counts"):
+        print("\nPage kind breakdown:")
+        for key, count in report["page_kind_counts"].items():
+            print(f"  {key}: {count}")
+
+    if report.get("prefetch_phase_counts"):
+        print("\nPrefetch phase breakdown:")
+        for key, count in report["prefetch_phase_counts"].items():
+            print(f"  {key}: {count}")
+
+    if report.get("audit_classification_counts"):
+        print("\nStructured audit classifications:")
+        for key, count in report["audit_classification_counts"].items():
+            print(f"  {key}: {count}")
+
+    if report.get("audit_domain_counts"):
+        print("\nStructured audit domains:")
+        for key, count in report["audit_domain_counts"].items():
+            print(f"  {key}: {count}")
+
     print("\nTop unreachable URLs:")
     for item in report["top_urls"][:show_top_urls]:
         print(
@@ -209,6 +244,7 @@ def main() -> int:
     args = _build_parser().parse_args()
     log_path = Path(args.log_file)
     url_counts = _extract_unreachable_urls(log_path)
+    audit_rows = _extract_reachability_audits(log_path)
 
     most_common_urls = url_counts.most_common(args.max_unique_urls)
     total_events = sum(url_counts.values())
@@ -216,9 +252,28 @@ def main() -> int:
     classification_counts: Counter[str] = Counter()
     env_detail_counts: Counter[str] = Counter()
     plugin_counts: Counter[str] = Counter()
+    page_kind_counts: Counter[str] = Counter()
+    prefetch_phase_counts: Counter[str] = Counter()
+    audit_classification_counts: Counter[str] = Counter()
+    audit_domain_counts: Counter[str] = Counter()
     env_failures = 0
     model_hallucinations = 0
     rows: list[dict[str, Any]] = []
+
+    for audit in audit_rows:
+        classification = str(audit.get("classification") or "")
+        domain = str(audit.get("domain") or "")
+        evidence = dict(audit.get("evidence") or {})
+        page_kind = evidence.get("page_kind")
+        prefetch_phase = evidence.get("prefetch_phase")
+        if classification:
+            audit_classification_counts[classification] += 1
+        if domain:
+            audit_domain_counts[domain] += 1
+        if page_kind:
+            page_kind_counts[str(page_kind)] += 1
+        if prefetch_phase:
+            prefetch_phase_counts[str(prefetch_phase)] += 1
 
     for url, count in most_common_urls:
         plugin_name, plugin = _infer_plugin(url)
@@ -246,6 +301,10 @@ def main() -> int:
         "classification_ratios": _weighted_ratio(classification_counts, total_events),
         "environment_detail_counts": dict(env_detail_counts),
         "environment_detail_ratios": _weighted_ratio(env_detail_counts, total_events),
+        "audit_classification_counts": dict(audit_classification_counts),
+        "audit_domain_counts": dict(audit_domain_counts),
+        "page_kind_counts": dict(page_kind_counts),
+        "prefetch_phase_counts": dict(prefetch_phase_counts),
         "plugin_counts": dict(plugin_counts),
         "top_urls": sorted(rows, key=lambda item: item["count"], reverse=True),
     }

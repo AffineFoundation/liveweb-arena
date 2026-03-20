@@ -193,6 +193,7 @@ class CacheInterceptor:
         self.stats = InterceptorStats()
         self._pending_error: Optional[Exception] = None
         self._last_error_metadata: Dict[str, Any] = {}
+        self._last_blocked_document_metadata: Dict[str, Any] = {}
         self._soft_fail_domains = {
             item.strip().lower()
             for item in os.environ.get("LIVEWEB_SOFT_FAIL_DOMAINS", DEFAULT_SOFT_FAIL_DOMAINS).split(",")
@@ -320,6 +321,15 @@ class CacheInterceptor:
         log("Intercept", f"MISS document - {self._url_display(url)}")
 
         if not self._is_domain_allowed(url):
+            blocked_domain = (urlparse(url).hostname or "").lower()
+            self._last_blocked_document_metadata = {
+                "classification": "model_disallowed_domain",
+                "blocked_url": url,
+                "blocked_domain": blocked_domain,
+                "allowed_domains": sorted(self.allowed_domains),
+                "blocked_resource_type": "document",
+                "blocked_by": "interceptor",
+            }
             await route.fulfill(
                 status=403,
                 headers={"content-type": "text/html"},
@@ -660,7 +670,7 @@ class CacheInterceptor:
         if domain_key == "coingecko":
             return max(timeout, 35 if need_api else 18)
         if domain_key == "stooq":
-            return max(timeout, 30 if need_api else 16)
+            return max(timeout, 45 if need_api else 20)
         if domain_key == "taostats":
             return max(timeout, 35 if need_api else 18)
         return timeout
@@ -797,6 +807,9 @@ class CacheInterceptor:
         self._last_error_metadata = {}
         return metadata
 
+    def get_last_blocked_document_metadata(self) -> Dict[str, Any]:
+        return dict(self._last_blocked_document_metadata)
+
     def raise_if_error(self, url: str = None) -> None:
         """Check for pending error and raise as CacheFatalError if present."""
         err = self._pending_error
@@ -827,3 +840,4 @@ class CacheInterceptor:
         self.stats = InterceptorStats()
         self._pending_error = None
         self._last_error_metadata = {}
+        self._last_blocked_document_metadata = {}

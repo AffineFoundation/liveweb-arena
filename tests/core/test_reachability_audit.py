@@ -81,3 +81,74 @@ def test_reachability_audit_classifies_stooq_invalid_shape():
     )
     assert audit.classification == "model_invalid_url_shape"
     assert audit.is_model_hallucination is True
+
+
+def test_reachability_audit_classifies_disallowed_domain_as_model_error():
+    audit = audit_reachability_failure(
+        url="https://finance.yahoo.com/quote/AAPL/",
+        plugin_name=None,
+        plugin=None,
+        reason="Domain not allowed",
+        allowed_domains={"stooq.com"},
+        evidence={
+            "interceptor": {
+                "blocked_url": "https://finance.yahoo.com/quote/AAPL/",
+                "blocked_domain": "finance.yahoo.com",
+                "allowed_domains": ["stooq.com"],
+                "blocked_resource_type": "document",
+                "blocked_by": "interceptor",
+            }
+        },
+    )
+    assert audit.classification == "model_disallowed_domain"
+    assert audit.layer == "model"
+    assert audit.is_environment_failure is False
+    assert audit.is_model_hallucination is True
+
+
+def test_reachability_audit_classifies_taostats_list_action_timeout():
+    audit = audit_reachability_failure(
+        url="https://taostats.io/subnets",
+        plugin_name="taostats",
+        plugin=TaostatsPlugin(),
+        exception=RuntimeError("Page.click: Timeout 5000ms exceeded"),
+        evidence={
+            "navigation_metadata": {
+                "navigation_stage": "action_click",
+                "raw_exception_type": "TimeoutError",
+                "raw_exception_message": "Page.click: Timeout 5000ms exceeded",
+                "evidence": {"selector": ".rt-th:nth-child(6)"},
+            }
+        },
+    )
+    assert audit.classification == "env_taostats_list_action_timeout"
+    assert audit.is_environment_failure is True
+    assert audit.evidence["page_kind"] == "taostats_list"
+    assert audit.evidence["interaction_kind"] == "sort"
+    assert audit.evidence["target_locator"] == ".rt-th:nth-child(6)"
+
+
+def test_reachability_audit_classifies_taostats_detail_prefetch_invalidated():
+    audit = audit_reachability_failure(
+        url="https://taostats.io/subnets/73",
+        plugin_name="taostats",
+        plugin=TaostatsPlugin(),
+        exception=RuntimeError("Target page, context or browser has been closed"),
+        evidence={
+            "taostats_prefetch": {
+                "page_kind": "taostats_detail",
+                "prefetch_phase": "setup_page_for_cache",
+                "wait_target": "text=Statistics",
+                "background_refresh": False,
+            },
+            "navigation_metadata": {
+                "raw_exception_type": "TargetClosedError",
+                "raw_exception_message": "Target page, context or browser has been closed",
+            },
+        },
+    )
+    assert audit.classification == "env_taostats_detail_prefetch_invalidated"
+    assert audit.is_environment_failure is True
+    assert audit.evidence["page_kind"] == "taostats_detail"
+    assert audit.evidence["prefetch_phase"] == "setup_page_for_cache"
+    assert audit.evidence["wait_target"] == "text=Statistics"
