@@ -88,6 +88,11 @@ def _is_invalid_selector_message(raw_exception_type: str | None, raw_exception_m
     )
 
 
+def _is_missing_ui_target_message(raw_exception_type: str | None, raw_exception_message: str | None) -> bool:
+    text = " ".join(part for part in [raw_exception_type or "", raw_exception_message or ""] if part).lower()
+    return "no element found with role" in text or "no element found for selector" in text
+
+
 def _build_disallowed_domain_audit(
     *,
     url: str,
@@ -292,6 +297,7 @@ def audit_reachability_failure(
         )
         interaction_kind = _infer_taostats_interaction_kind(target_locator, raw_exception_message)
         selector_syntax_invalid = _is_invalid_selector_message(raw_exception_type, raw_exception_message)
+        missing_ui_target = _is_missing_ui_target_message(raw_exception_type, raw_exception_message)
         if selector_syntax_invalid:
             evidence.update(
                 {
@@ -304,6 +310,40 @@ def audit_reachability_failure(
             return ReachabilityAuditResult(
                 status="unreachable",
                 classification="model_invalid_selector",
+                layer="model",
+                url=url,
+                normalized_url=normalized,
+                domain=domain,
+                plugin_name=plugin_name,
+                reason=reason or exception_text,
+                http_status=http_status,
+                exception_type=type(exception).__name__ if exception is not None else None,
+                raw_exception_type=raw_exception_type,
+                raw_exception_message=raw_exception_message,
+                navigation_stage=navigation_stage,
+                resource_type=resource_type,
+                attempt_index=attempt_index,
+                max_attempts=max_attempts,
+                browser_reused=browser_reused,
+                context_reused=context_reused,
+                page_recreated_before_retry=page_recreated_before_retry,
+                is_environment_failure=False,
+                is_model_hallucination=True,
+                evidence=evidence,
+            )
+        if missing_ui_target:
+            evidence.update(
+                {
+                    "page_kind": "taostats_list",
+                    "interaction_kind": interaction_kind,
+                    "target_locator": target_locator,
+                    "selector_syntax_invalid": False,
+                    "ui_target_missing": True,
+                }
+            )
+            return ReachabilityAuditResult(
+                status="unreachable",
+                classification="model_invalid_ui_target",
                 layer="model",
                 url=url,
                 normalized_url=normalized,

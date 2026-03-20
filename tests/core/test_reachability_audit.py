@@ -151,6 +151,29 @@ def test_reachability_audit_classifies_taostats_invalid_selector_as_model_error(
     assert audit.evidence["selector_syntax_invalid"] is True
 
 
+def test_reachability_audit_classifies_taostats_missing_ui_target_as_model_error():
+    audit = audit_reachability_failure(
+        url="https://taostats.io/subnets",
+        plugin_name="taostats",
+        plugin=TaostatsPlugin(),
+        exception=RuntimeError("Locator failed"),
+        evidence={
+            "navigation_metadata": {
+                "navigation_stage": "action_click_role",
+                "raw_exception_type": "Exception",
+                "raw_exception_message": "No element found with role='button' name='Rows: 25'",
+                "evidence": {"role": "button", "name": "Rows: 25"},
+            }
+        },
+    )
+    assert audit.classification == "model_invalid_ui_target"
+    assert audit.layer == "model"
+    assert audit.is_environment_failure is False
+    assert audit.is_model_hallucination is True
+    assert audit.evidence["page_kind"] == "taostats_list"
+    assert audit.evidence["ui_target_missing"] is True
+
+
 def test_reachability_audit_classifies_taostats_detail_prefetch_invalidated():
     audit = audit_reachability_failure(
         url="https://taostats.io/subnets/73",

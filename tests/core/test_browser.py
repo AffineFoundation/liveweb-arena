@@ -63,6 +63,23 @@ class _FakePage:
         return self._element
 
 
+class _FallbackClickPage:
+    def __init__(self, *, url: str, click_results: dict[str, Exception | None]):
+        self.url = url
+        self._click_results = click_results
+        self.clicked: list[str] = []
+
+    async def click(self, selector: str, timeout: int | None = None):
+        self.clicked.append(selector)
+        outcome = self._click_results.get(selector, RuntimeError("not found"))
+        if outcome is not None:
+            raise outcome
+        return None
+
+    async def query_selector(self, selector: str):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_browser_session_direct_nav_fallback_from_selector():
     session = BrowserSession.__new__(BrowserSession)
@@ -116,6 +133,39 @@ async def test_browser_session_force_click_locator_fallback_uses_js_click():
     ok = await session._force_click_locator_fallback(locator)
     assert ok is True
     assert locator.evaluated is True
+
+
+@pytest.mark.asyncio
+async def test_browser_session_taostats_role_fallback_can_navigate_home_to_subnets():
+    session = BrowserSession.__new__(BrowserSession)
+    session._page = SimpleNamespace(url="https://taostats.io")
+
+    visited = {}
+
+    async def _goto(url: str):
+        visited["url"] = url
+
+    session._goto_with_recovery = _goto
+
+    ok = await session._taostats_list_role_fallback("link", "View All", 5000)
+    assert ok is True
+    assert visited["url"] == "https://taostats.io/subnets"
+
+
+@pytest.mark.asyncio
+async def test_browser_session_taostats_selector_fallback_tries_semantic_candidates():
+    session = BrowserSession.__new__(BrowserSession)
+    session._page = _FallbackClickPage(
+        url="https://taostats.io/subnets",
+        click_results={
+            '[data-testid="rows-select"]': RuntimeError("timeout"),
+            ".ant-select-selector": None,
+        },
+    )
+
+    ok = await session._taostats_list_selector_fallback('[data-testid="rows-select"]', 5000)
+    assert ok is True
+    assert session._page.clicked[:2] == ['[data-testid="rows-select"]', '.ant-select-selector']
 
 
 def test_should_fallback_to_direct_navigation_for_intercepted_click_timeout():

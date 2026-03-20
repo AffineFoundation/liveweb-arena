@@ -549,6 +549,8 @@ class Actor:
                 )
                 if reachability_audit and reachability_audit.classification == "model_invalid_selector":
                     failure_reason = "invalid_selector"
+                elif reachability_audit and reachability_audit.classification == "model_invalid_ui_target":
+                    failure_reason = "invalid_ui_target"
         except (LLMFatalError, CacheFatalError) as e:
             failure_reason = fatal_error_map[type(e)]
             error_message = f"{failure_reason}: {e}"
@@ -577,6 +579,9 @@ class Actor:
                     error_message = None
                 elif reachability_audit and reachability_audit.classification == "model_invalid_selector":
                     failure_reason = "invalid_selector"
+                    error_message = None
+                elif reachability_audit and reachability_audit.classification == "model_invalid_ui_target":
+                    failure_reason = "invalid_ui_target"
                     error_message = None
         else:
             reachability_audit = None

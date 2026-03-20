@@ -75,6 +75,27 @@ _BROWSER_TRANSPORT_ERROR_PATTERNS = (
     "browser.new_context",
 )
 
+_TAOSTATS_LIST_PAGINATE_SELECTORS = (
+    ".ant-pagination-next",
+    ".paginate_button.next",
+    ".next.paginate_button",
+    "#subnets-table_paginate .paginate_button.next",
+    ".pagination-wrap .next-page",
+    "li.page-item:nth-child(5) a.page-link",
+)
+
+_TAOSTATS_LIST_SHOW_ALL_SELECTORS = (
+    '[data-testid="rows-select"]',
+    ".ant-select-selector",
+    "select",
+)
+
+_TAOSTATS_LIST_SORT_SELECTORS = (
+    '.rt-th:nth-child(6)',
+    'div.rt-th:has-text("1M")',
+    'th:nth-child(7)',
+)
+
 
 @dataclass
 class BrowserNavigationMetadata:
@@ -175,6 +196,26 @@ def _classify_browser_exception(exc: BaseException) -> str | None:
         return "env_nav_timeout"
     if is_browser_transport_error(exc):
         return "env_browser_context_invalidated"
+    return None
+
+
+def _is_taostats_list_page_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower().rstrip("/")
+    return "taostats.io" in host and path in {"", "/subnets"}
+
+
+def _infer_taostats_list_target_kind(*, selector: str | None = None, role: str | None = None, name: str | None = None) -> str | None:
+    text = " ".join(part for part in [selector or "", role or "", name or ""] if part).lower()
+    if not text:
+        return None
+    if any(marker in text for marker in ("view all", "rows:", "rows-select", "ant-select-selector", "all", "customise table")):
+        return "show_all"
+    if any(marker in text for marker in ("pagination", "paginate", "page-link", "next-page", "next")) or (name or "").strip().isdigit():
+        return "paginate"
+    if any(marker in text for marker in ("1m", "1h", "24h", "1w", "sort", "rt-th", "th:nth-child")):
+        return "sort"
     return None
 
 
@@ -314,6 +355,49 @@ class BrowserSession:
                 return True
         except Exception:
             return False
+
+    async def _click_any_selector(self, selectors: list[str], timeout_ms: int = 2500) -> bool:
+        seen: set[str] = set()
+        for selector in selectors:
+            if not selector or selector in seen:
+                continue
+            seen.add(selector)
+            try:
+                await self._page.click(selector, timeout=timeout_ms)
+                return True
+            except Exception:
+                if await self._force_click_selector_fallback(selector, timeout_ms=min(timeout_ms, 1500)):
+                    return True
+        return False
+
+    async def _taostats_list_selector_fallback(self, selector: str, timeout_ms: int) -> bool:
+        if not _is_taostats_list_page_url(self._page.url):
+            return False
+        kind = _infer_taostats_list_target_kind(selector=selector)
+        if kind == "show_all":
+            return await self._click_any_selector(list(_TAOSTATS_LIST_SHOW_ALL_SELECTORS), timeout_ms=min(timeout_ms, 3000))
+        if kind == "paginate":
+            return await self._click_any_selector(list(_TAOSTATS_LIST_PAGINATE_SELECTORS), timeout_ms=min(timeout_ms, 3000))
+        if kind == "sort":
+            candidates = [selector, *_TAOSTATS_LIST_SORT_SELECTORS]
+            return await self._click_any_selector(candidates, timeout_ms=min(timeout_ms, 3000))
+        return False
+
+    async def _taostats_list_role_fallback(self, role: str, name: str, timeout_ms: int) -> bool:
+        if not _is_taostats_list_page_url(self._page.url):
+            return False
+        kind = _infer_taostats_list_target_kind(role=role, name=name)
+        page_url = self._page.url
+        if kind == "show_all":
+            if "view all" in (name or "").lower() and page_url.rstrip("/") == "https://taostats.io":
+                await self._goto_with_recovery("https://taostats.io/subnets")
+                return True
+            return await self._click_any_selector(list(_TAOSTATS_LIST_SHOW_ALL_SELECTORS), timeout_ms=min(timeout_ms, 3000))
+        if kind == "paginate":
+            return await self._click_any_selector(list(_TAOSTATS_LIST_PAGINATE_SELECTORS), timeout_ms=min(timeout_ms, 3000))
+        if kind == "sort":
+            return await self._click_any_selector(list(_TAOSTATS_LIST_SORT_SELECTORS), timeout_ms=min(timeout_ms, 3000))
+        return False
 
     async def block_urls(self, patterns: list):
         """
@@ -610,6 +694,8 @@ class BrowserSession:
                 except Exception as click_err:
                     if await self._force_click_selector_fallback(selector, timeout_ms=min(timeout_ms, 2000)):
                         clicked = True
+                    elif await self._taostats_list_selector_fallback(selector, timeout_ms):
+                        clicked = True
                     elif _should_fallback_to_direct_navigation(click_err):
                         clicked = await self._direct_nav_fallback_from_selector(selector)
 
@@ -747,6 +833,7 @@ class BrowserSession:
                 role = params.get("role", "button")
                 name = params.get("name", "")
                 exact = params.get("exact", False)
+                timeout_ms = params.get("timeout_ms", 5000)
                 locator = self._page.get_by_role(role, name=name, exact=exact)
                 count = await locator.count()
 
@@ -768,9 +855,11 @@ class BrowserSession:
 
                 if count > 0:
                     try:
-                        await locator.click(timeout=5000)
+                        await locator.click(timeout=timeout_ms)
                     except Exception as click_err:
                         if await self._force_click_locator_fallback(locator):
+                            pass
+                        elif await self._taostats_list_role_fallback(role, name, timeout_ms):
                             pass
                         elif _should_fallback_to_direct_navigation(click_err) and await self._direct_nav_fallback_from_locator(locator):
                             pass
@@ -779,7 +868,10 @@ class BrowserSession:
                     # Wait briefly for potential navigation
                     await asyncio.sleep(0.3)
                 else:
-                    raise Exception(f"No element found with role='{role}' name='{name}'")
+                    if await self._taostats_list_role_fallback(role, name, timeout_ms):
+                        await asyncio.sleep(0.3)
+                    else:
+                        raise Exception(f"No element found with role='{role}' name='{name}'")
 
             elif action_type == "type_role":
                 role = params.get("role", "textbox")
