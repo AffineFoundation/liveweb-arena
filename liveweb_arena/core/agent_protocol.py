@@ -195,7 +195,7 @@ Title: {title}
 
 _LAST_STEP_WARNING = """
 
-**THIS IS YOUR LAST STEP!** You MUST use the "stop" action now and provide your best answers based on the information you have gathered. Do not attempt any other action."""
+**THIS IS YOUR LAST STEP!** You MUST use the "stop" action now and provide your best answers based on the information you have gathered. Do not attempt any other action. Do not explore. Each answer must be a short final string only."""
 
 
 def _build_step_prompt_common(
@@ -265,12 +265,6 @@ class FunctionCallingProtocol(AgentProtocol):
         return tools
 
     def build_system_prompt(self, task: CompositeTask) -> str:
-        hints = ""
-        if task.plugin_hints:
-            hints = "## Available Information Sources\n\n"
-            for _, usage_hint in task.plugin_hints.items():
-                hints += usage_hint + "\n\n"
-
         return (
             "You are a web automation agent that interacts with real websites to complete tasks.\n\n"
             "You have access to a browser and can navigate to any website to gather information.\n"
@@ -283,13 +277,12 @@ class FunctionCallingProtocol(AgentProtocol):
             "- Your assistant message should contain only the tool call selected by the model.\n"
             "- If you have enough information, call the stop tool immediately with the final answers.\n"
             "- Never describe what you are about to do in text; just call the correct tool.\n\n"
-            f"{hints}"
             f"{task.combined_intent}\n\n"
             "## Tips\n\n"
             "- First analyze the task and decide which website to visit\n"
             "- Use the goto tool to navigate to the appropriate URL\n"
-            "- Homepage/list data may be inaccurate. Always visit detail pages for precise values\n"
-            "- When done, use the stop tool with your answers\n"
+            "- Only visit allowed domains\n"
+            "- Finish data collection for one subtask, then move on\n"
             "- Keep responses action-only; no commentary\n"
         )
 
@@ -324,9 +317,10 @@ class FunctionCallingProtocol(AgentProtocol):
     def parse_response(self, raw: str, tool_calls: Optional[List[Any]] = None) -> Optional[BrowserAction]:
         """Parse tool_calls from LLM response.
 
-        Fallback support is intentionally narrow for Qwen-family outputs:
+        Fallback support covers common text-encoded tool-call styles:
         - <tool_call>{...}</tool_call>
         - raw JSON object {"name": "...", "arguments": {...}}
+        - [tool_call: stop({...})]
         """
         parsed = self._parse_primary_tool_call(tool_calls)
         if parsed is None and raw:
@@ -369,6 +363,60 @@ class FunctionCallingProtocol(AgentProtocol):
             return "recoverable_truncated_tool_json"
         return "terminal_natural_language"
 
+    def debug_parse_metadata(self, raw: str, tool_calls: Optional[List[Any]] = None) -> Dict[str, Any]:
+        branch = "none"
+        preview_calls: list[dict[str, Any]] = []
+        if tool_calls:
+            for call in tool_calls[:2]:
+                fn_name = None
+                fn_args = None
+                if hasattr(call, "function") and hasattr(call.function, "name"):
+                    fn_name = call.function.name
+                    fn_args = call.function.arguments
+                elif hasattr(call, "function") and isinstance(call.function, dict):
+                    fn_name = call.function.get("name")
+                    fn_args = call.function.get("arguments")
+                elif isinstance(call, dict):
+                    function = call.get("function", {})
+                    fn_name = function.get("name")
+                    fn_args = function.get("arguments")
+                preview_calls.append(
+                    {
+                        "name": fn_name,
+                        "arguments_preview": str(fn_args)[:200] if fn_args is not None else None,
+                    }
+                )
+        if self._parse_primary_tool_call(tool_calls) is not None:
+            branch = "tool_calls"
+        else:
+            stripped = (raw or "").strip()
+            if stripped:
+                stripped = re.sub(r"^\s*<think>.*?</think>\s*", "", stripped, flags=re.DOTALL).strip()
+                tag_match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", stripped, re.DOTALL)
+                bracket_tool_match = re.fullmatch(r"\[\s*tool_call:\s*(.+?)\s*\]", stripped, flags=re.DOTALL)
+                if tag_match and self._parse_qwen_fallback(raw) is not None:
+                    branch = "tool_call_tag"
+                elif bracket_tool_match and self._parse_qwen_fallback(raw) is not None:
+                    branch = "bracket_tool_call"
+                elif re.match(r"^\s*\{", stripped) and self._parse_qwen_fallback(raw) is not None:
+                    branch = "raw_json_object"
+                elif re.match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", stripped) and self._parse_qwen_fallback(raw) is not None:
+                    branch = "qwen_function_text"
+                elif re.match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", stripped):
+                    branch = "qwen_function_text_unparsed"
+                elif stripped.startswith("[tool_call:"):
+                    branch = "bracket_tool_call_unparsed"
+                elif "<tool_call>" in stripped or "</tool_call>" in stripped:
+                    branch = "tool_call_tag_unparsed"
+                elif re.match(r"^\s*\{", stripped):
+                    branch = "raw_json_object_unparsed"
+                else:
+                    branch = "natural_language"
+        return {
+            "protocol_parser_branch": branch,
+            "tool_calls_preview": preview_calls,
+        }
+
     def _parse_primary_tool_call(self, tool_calls: Optional[List[Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
         if not tool_calls:
             return None
@@ -402,6 +450,10 @@ class FunctionCallingProtocol(AgentProtocol):
         for candidate in self._qwen_payload_candidates(stripped):
             payload = self._parse_qwen_payload(candidate)
             if not isinstance(payload, dict):
+                repaired_candidate = self._repair_function_text_payload(candidate)
+                if repaired_candidate and repaired_candidate != candidate:
+                    payload = self._parse_qwen_payload(repaired_candidate)
+            if not isinstance(payload, dict):
                 continue
             fn_name = payload.get("name")
             fn_args = payload.get("arguments", {})
@@ -424,6 +476,10 @@ class FunctionCallingProtocol(AgentProtocol):
         stripped = payload_text.strip()
         add(re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.DOTALL).strip())
         add(re.sub(r"^<[^>]+>\s*|\s*</[^>]+>$", "", stripped, flags=re.DOTALL).strip())
+
+        bracket_tool_match = re.fullmatch(r"\[\s*tool_call:\s*(.+?)\s*\]", stripped, flags=re.DOTALL)
+        if bracket_tool_match:
+            add(bracket_tool_match.group(1))
 
         wrapper_match = re.fullmatch(r"([`_]+)\s*(.+?)\s*\1", stripped, flags=re.DOTALL)
         if wrapper_match:
@@ -449,6 +505,14 @@ class FunctionCallingProtocol(AgentProtocol):
             flags=re.DOTALL,
         )
         if not match:
+            repaired = self._repair_function_text_payload(sanitized)
+            if repaired is not None:
+                match = re.fullmatch(
+                    r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*(\{.*\})\s*\)\s*",
+                    repaired,
+                    flags=re.DOTALL,
+                )
+        if not match:
             return None
 
         fn_name = match.group(1)
@@ -462,6 +526,25 @@ class FunctionCallingProtocol(AgentProtocol):
         if not isinstance(fn_args, dict):
             return None
         return {"name": fn_name, "arguments": fn_args}
+
+    def _repair_function_text_payload(self, payload_text: str) -> Optional[str]:
+        stripped = payload_text.strip()
+        prefix_match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", stripped)
+        if not prefix_match or not stripped.endswith(")"):
+            return None
+
+        fn_name = prefix_match.group(1)
+        body = stripped[prefix_match.end():-1].strip()
+        if not body.startswith("{"):
+            return None
+
+        opens = body.count("{")
+        closes = body.count("}")
+        if opens <= closes:
+            return None
+
+        repaired_body = body + ("}" * (opens - closes))
+        return f"{fn_name}({repaired_body})"
 
     def _normalize_tool_call(self, fn_name: Any, fn_args: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
         if not isinstance(fn_name, str) or fn_name not in VALID_ACTION_TYPES:

@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 
 from liveweb_arena.utils.llm_client import LLMClient, LLMResponse
@@ -20,6 +22,7 @@ class _FakeToolCall:
 class _FakeChoice:
     def __init__(self, content: str = "", tool_calls=None):
         self.message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
+        self.finish_reason = "stop"
 
 
 class _FakeChatCompletions:
@@ -70,6 +73,42 @@ class _FakeAsyncHTTPClient:
 class _FakeBuiltHTTPClient:
     def __init__(self, recorder, *args, **kwargs):
         recorder.append(kwargs)
+
+
+class _FakeRateLimitError(Exception):
+    def __init__(self, message: str, *, response):
+        super().__init__(message)
+        self.response = response
+
+
+class _RateLimitThenSuccessCompletions:
+    def __init__(self, recorder, failures_before_success: int = 2):
+        self._recorder = recorder
+        self._remaining = failures_before_success
+
+    async def create(self, **kwargs):
+        self._recorder.append(kwargs)
+        if self._remaining > 0:
+            self._remaining -= 1
+            response = httpx.Response(
+                429,
+                headers={"retry-after": "0"},
+                request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+            )
+            raise _FakeRateLimitError("rate limited", response=response)
+        return SimpleNamespace(
+            id=kwargs["extra_body"]["request_id"],
+            choices=[_FakeChoice(tool_calls=[_FakeToolCall("goto", '{"url":"https://example.com"}')])],
+            usage=_FakeResponseUsage(),
+        )
+
+
+class _RateLimitThenSuccessOpenAI:
+    def __init__(self, completions):
+        self.chat = SimpleNamespace(completions=completions)
+
+    async def close(self):
+        return None
 
 
 @pytest.mark.anyio
@@ -123,6 +162,30 @@ async def test_chat_with_tools_sends_reasoning_controls_via_extra_body(monkeypat
     payload = requests[0]
     assert payload["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert payload["extra_body"]["separate_reasoning"] is True
+
+
+@pytest.mark.anyio
+async def test_chat_with_tools_uses_openrouter_reasoning_none_when_thinking_disabled(monkeypatch):
+    requests = []
+
+    def _factory(**kwargs):
+        return _FakeAsyncOpenAI(requests, **kwargs)
+
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.openai.AsyncOpenAI", _factory)
+    monkeypatch.setenv("LIVEWEB_ENABLE_THINKING", "0")
+
+    client = LLMClient(base_url="https://openrouter.ai/api/v1", api_key="or")
+    await client.chat_with_tools(
+        system="system",
+        user="user",
+        model="minimax/minimax-m2.7",
+        tools=[{"type": "function", "function": {"name": "goto", "parameters": {"type": "object"}}}],
+        temperature=0.0,
+        timeout_s=5,
+    )
+
+    payload = requests[0]
+    assert payload["extra_body"]["reasoning"] == {"effort": "none", "exclude": True}
 
 
 @pytest.mark.anyio
@@ -227,3 +290,81 @@ def test_build_httpx_client_disables_trust_env_for_local_routes(monkeypatch):
 
     assert built_clients[0]["trust_env"] is False
     assert built_clients[1]["trust_env"] is True
+
+
+@pytest.mark.anyio
+async def test_chat_with_tools_records_empty_response_audit(monkeypatch):
+    requests = []
+
+    class _EmptyChatCompletions:
+        async def create(self, **kwargs):
+            requests.append(kwargs)
+            return SimpleNamespace(
+                id=kwargs["extra_body"]["request_id"],
+                choices=[_FakeChoice(content="", tool_calls=[])],
+                usage=_FakeResponseUsage(),
+            )
+
+    class _EmptyAsyncOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=_EmptyChatCompletions())
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.openai.AsyncOpenAI", lambda **kwargs: _EmptyAsyncOpenAI(**kwargs))
+
+    client = LLMClient(base_url="https://openrouter.ai/api/v1", api_key="k", strict_serial=True)
+    with pytest.raises(Exception):
+        await client.chat_with_tools(
+            system="system",
+            user="user",
+            model="z-ai/glm-5",
+            tools=[{"type": "function", "function": {"name": "goto", "parameters": {"type": "object"}}}],
+            temperature=0.0,
+            timeout_s=5,
+        )
+
+    audit = client.get_last_failure_metadata()
+    assert audit["failure_type"] == "empty_response"
+    assert audit["model"] == "z-ai/glm-5"
+    assert audit["base_url"] == "https://openrouter.ai/api/v1"
+    assert audit["usage"]["completion_tokens"] == 2
+
+
+@pytest.mark.anyio
+async def test_chat_with_tools_retries_on_rate_limit_even_in_strict_serial(monkeypatch):
+    requests = []
+    completions = _RateLimitThenSuccessCompletions(requests)
+
+    monkeypatch.setattr(
+        "liveweb_arena.utils.llm_client.openai.AsyncOpenAI",
+        lambda **kwargs: _RateLimitThenSuccessOpenAI(completions),
+    )
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.openai.RateLimitError", _FakeRateLimitError)
+
+    client = LLMClient(base_url="https://openrouter.ai/api/v1", api_key="k", strict_serial=True)
+    response = await client.chat_with_tools(
+        system="system",
+        user="user",
+        model="minimax/minimax-m2.7",
+        tools=[{"type": "function", "function": {"name": "goto", "parameters": {"type": "object"}}}],
+        temperature=0.0,
+        timeout_s=5,
+    )
+
+    assert isinstance(response, LLMResponse)
+    assert len(requests) == 3
+
+
+@pytest.mark.anyio
+async def test_global_rate_limit_window_delays_following_requests(monkeypatch):
+    client = LLMClient(base_url="https://openrouter.ai/api/v1", api_key="k", strict_serial=True)
+    client._GLOBAL_RATE_LIMIT_UNTIL[client._base_url] = asyncio.get_running_loop().time() + 0.2
+    # convert monotonic-ish test window to wall time used by implementation
+    import time as _time
+    client._GLOBAL_RATE_LIMIT_UNTIL[client._base_url] = _time.time() + 0.2
+    start = _time.time()
+    await client._wait_for_global_rate_limit_window(client._base_url)
+    elapsed = _time.time() - start
+    assert elapsed >= 0.15

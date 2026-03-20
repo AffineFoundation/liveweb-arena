@@ -203,3 +203,28 @@ async def test_agent_loop_skips_recovery_when_context_budget_exceeded(monkeypatc
     assert usage is None
     assert override == "recoverable_context_overflow"
     assert llm_client.recovery_calls == 0
+
+
+@pytest.mark.anyio
+async def test_agent_loop_explicit_disable_recovery_overrides_env(monkeypatch):
+    monkeypatch.setenv("LIVEWEB_ENABLE_FORMAT_RECOVERY", "1")
+
+    llm_client = _FakeLLMClient(
+        initial_response=LLMResponse(content="<tool_call>{\"name\":\"goto\""),
+        recovery_responses=[
+            LLMResponse(tool_calls=[ToolCall(id="call_1", function={"name": "stop", "arguments": "{\"answers\":{\"a1\":\"42\"}}"})]),
+        ],
+    )
+    loop = AgentLoop(
+        session=_FakeSession(),
+        llm_client=llm_client,
+        protocol=FunctionCallingProtocol(),
+        max_steps=2,
+        enable_format_recovery=False,
+    )
+
+    trajectory, final_answer, usage = await loop.run(task=_task(), model="qwen", temperature=0.0, seed=1)
+
+    assert final_answer is None
+    assert loop.is_parse_failed() is True
+    assert llm_client.recovery_calls == 0

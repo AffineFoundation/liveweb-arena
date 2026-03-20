@@ -1,6 +1,7 @@
 """OpenAI-compatible LLM client with retry, streaming, tool calls, and multi-server routing."""
 
 import asyncio
+import email.utils
 import ipaddress
 import os
 import random
@@ -262,8 +263,10 @@ class LLMClient:
     MAX_RETRIES = 10
     BASE_DELAY = 1.0
     MAX_DELAY = 30.0
+    RATE_LIMIT_MAX_DELAY = float(os.getenv("LIVEWEB_LLM_RATE_LIMIT_MAX_DELAY", "120"))
     DEFAULT_TIMEOUT = 600
     MAX_CHUNKS = int(os.getenv("LIVEWEB_LLM_MAX_CHUNKS", "32000"))
+    _GLOBAL_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 
     def __init__(
         self,
@@ -291,6 +294,7 @@ class LLMClient:
         self._separate_reasoning = self._read_optional_bool_env("LIVEWEB_SEPARATE_REASONING")
         self._format_recovery_temperature = self._read_float_env("LIVEWEB_FORMAT_RECOVERY_TEMPERATURE", 0.35)
         self._format_recovery_top_p = self._read_float_env("LIVEWEB_FORMAT_RECOVERY_TOP_P", 0.95)
+        self._last_failure_metadata: Dict[str, object] = {}
         if self._strict_serial:
             self._max_retries = 1
 
@@ -305,6 +309,12 @@ class LLMClient:
         route_key = (self._route_key or "default").replace(":", "-").replace("/", "-")
         route_key = route_key[:48]
         return f"liveweb-{request_kind}-{route_key}-{uuid.uuid4().hex[:12]}"
+
+    def _set_last_failure_metadata(self, metadata: Optional[Dict[str, object]]) -> None:
+        self._last_failure_metadata = dict(metadata or {})
+
+    def get_last_failure_metadata(self) -> Dict[str, object]:
+        return dict(self._last_failure_metadata)
 
     @staticmethod
     def _read_max_completion_tokens() -> Optional[int]:
@@ -342,14 +352,93 @@ class LLMClient:
             log("LLM", f"Invalid {name}={raw!r}; using default {default}")
             return default
 
-    def _apply_reasoning_controls(self, params: Dict[str, object]) -> None:
+    @staticmethod
+    def _is_openrouter_base_url(base_url: str) -> bool:
+        hostname = (urlparse(base_url).hostname or "").lower()
+        return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
+
+    def _apply_reasoning_controls(self, params: Dict[str, object], *, base_url: str) -> None:
         extra_body = dict(params.get("extra_body") or {})
         if self._enable_thinking is not None:
             extra_body["chat_template_kwargs"] = {"enable_thinking": self._enable_thinking}
         if self._separate_reasoning is not None:
             extra_body["separate_reasoning"] = self._separate_reasoning
+        if self._is_openrouter_base_url(base_url) and self._enable_thinking is False:
+            extra_body["reasoning"] = {
+                "effort": "none",
+                "exclude": True,
+            }
         if extra_body:
             params["extra_body"] = extra_body
+
+    async def _wait_for_global_rate_limit_window(self, base_url: str) -> None:
+        while True:
+            until = self._GLOBAL_RATE_LIMIT_UNTIL.get(base_url, 0.0)
+            now = time.time()
+            if until <= now:
+                return
+            await asyncio.sleep(min(5.0, max(0.1, until - now)))
+
+    @staticmethod
+    def _parse_retry_after(value: object) -> float | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            seconds = float(text)
+            return max(0.0, seconds)
+        except ValueError:
+            pass
+        try:
+            dt = email.utils.parsedate_to_datetime(text)
+            return max(0.0, dt.timestamp() - time.time())
+        except Exception:
+            return None
+
+    def _compute_rate_limit_delay(self, error: Exception, attempt: int) -> float:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        for key in (
+            "retry-after",
+            "x-ratelimit-reset",
+            "ratelimit-reset",
+            "x-ratelimit-reset-requests",
+        ):
+            delay = self._parse_retry_after(headers.get(key))
+            if delay is not None and delay > 0:
+                return min(self.RATE_LIMIT_MAX_DELAY, delay + random.uniform(0, 1))
+        fallback = min(self.RATE_LIMIT_MAX_DELAY, self.BASE_DELAY * (2 ** min(attempt, 8)))
+        return fallback + random.uniform(0, 1)
+
+    async def _wait_for_rate_limit_reset(
+        self,
+        *,
+        error: Exception,
+        attempt: int,
+        request_id: str | None,
+        model: str,
+        base_url: str,
+    ) -> None:
+        delay = self._compute_rate_limit_delay(error, attempt)
+        self._GLOBAL_RATE_LIMIT_UNTIL[base_url] = max(
+            self._GLOBAL_RATE_LIMIT_UNTIL.get(base_url, 0.0),
+            time.time() + delay,
+        )
+        self._set_last_failure_metadata(
+            {
+                "failure_stage": "chat_with_tools",
+                "failure_type": "rate_limit",
+                "model": model,
+                "base_url": base_url,
+                "request_id": request_id,
+                "retry_delay_s": delay,
+                "attempt": attempt + 1,
+            }
+        )
+        log("LLM", f"Rate limited; waiting {delay:.1f}s before retry")
+        await asyncio.sleep(delay)
 
     @staticmethod
     def _server_root_url(base_url: str) -> str:
@@ -434,7 +523,9 @@ class LLMClient:
         messages.append({"role": "user", "content": user})
 
         last_error = None
-        for attempt in range(self._max_retries):
+        attempt = 0
+        rate_limit_attempt = 0
+        while True:
             lease = None
             request_id = None
             request_start = time.time()
@@ -605,14 +696,18 @@ class LLMClient:
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": user})
+        self._set_last_failure_metadata(None)
 
         last_error = None
-        for attempt in range(self._max_retries):
+        attempt = 0
+        rate_limit_attempt = 0
+        while True:
             lease = None
             request_id = None
             request_start = time.time()
             try:
                 lease = await self._acquire_lease()
+                await self._wait_for_global_rate_limit_window(lease.base_url)
                 request_id = self._generate_request_id("tools")
                 response = await asyncio.wait_for(
                     self._make_request_with_tools(
@@ -648,6 +743,9 @@ class LLMClient:
                         attempt + 1,
                     )
                 log("LLM", f"Total timeout ({actual_timeout}s) exceeded, attempt {attempt + 1}/{self._max_retries}")
+                attempt += 1
+                if attempt >= self._max_retries:
+                    raise last_error or Exception("LLM request failed after all retries")
                 await self._backoff(attempt)
                 continue
 
@@ -665,19 +763,20 @@ class LLMClient:
                 await self._abort_request(
                     lease,
                     request_id,
-                    f"rate limit (attempt {attempt + 1})",
+                    f"rate limit (attempt {rate_limit_attempt + 1})",
                 )
                 if lease is not None:
                     await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
                 last_error = e
-                if self._strict_serial:
-                    self._raise_strict_serial_error(
-                        "Strict-serial LLM request hit rate limit",
-                        e,
-                        attempt + 1,
-                    )
-                log("LLM", f"Rate limit hit, attempt {attempt + 1}/{self._max_retries}")
-                await self._backoff(attempt)
+                await self._wait_for_rate_limit_reset(
+                    error=e,
+                    attempt=rate_limit_attempt,
+                    request_id=request_id,
+                    model=model,
+                    base_url=lease.base_url if lease is not None else self._base_url,
+                )
+                rate_limit_attempt += 1
+                continue
 
             except openai.BadRequestError as e:
                 await self._abort_request(
@@ -702,6 +801,16 @@ class LLMClient:
                     await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
                 if e.status_code in self.RETRY_STATUS_CODES:
                     last_error = e
+                    if e.status_code == 429:
+                        await self._wait_for_rate_limit_reset(
+                            error=e,
+                            attempt=rate_limit_attempt,
+                            request_id=request_id,
+                            model=model,
+                            base_url=lease.base_url if lease is not None else self._base_url,
+                        )
+                        rate_limit_attempt += 1
+                        continue
                     if self._strict_serial:
                         self._raise_strict_serial_error(
                             f"Strict-serial LLM API error {e.status_code}",
@@ -709,6 +818,9 @@ class LLMClient:
                             attempt + 1,
                         )
                     log("LLM", f"API error {e.status_code}, attempt {attempt + 1}/{self._max_retries}")
+                    attempt += 1
+                    if attempt >= self._max_retries:
+                        raise last_error or Exception("LLM request failed after all retries")
                     await self._backoff(attempt)
                 else:
                     raise
@@ -729,6 +841,9 @@ class LLMClient:
                         attempt + 1,
                     )
                 log("LLM", f"Connection error, attempt {attempt + 1}/{self._max_retries}: {e}")
+                attempt += 1
+                if attempt >= self._max_retries:
+                    raise last_error or Exception("LLM request failed after all retries")
                 await self._backoff(attempt)
 
             except Exception as e:
@@ -750,9 +865,10 @@ class LLMClient:
                         attempt + 1,
                     )
                 log("LLM", f"Error, attempt {attempt + 1}/{self._max_retries}: {e}")
+                attempt += 1
+                if attempt >= self._max_retries:
+                    raise last_error or Exception("LLM request failed after all retries")
                 await self._backoff(attempt)
-
-        raise last_error or Exception("LLM request failed after all retries")
 
     async def chat_with_tools_recovery(
         self,
@@ -773,15 +889,23 @@ class LLMClient:
             if system:
                 messages.append({"role": "system", "content": system})
             messages.append({"role": "user", "content": user})
+            remediation = (
+                "The previous assistant output had invalid tool-call formatting. "
+                "Emit exactly one valid tool call now. No explanation, no prose, no markdown, no XML."
+            )
+            if assistant_prefix:
+                messages.append({"role": "assistant", "content": assistant_prefix})
+                remediation = (
+                    "Continue from the assistant's last output and emit exactly one valid tool call now. "
+                    "No explanation, no prose, no markdown, no XML."
+                )
             messages.append(
                 {
                     "role": "user",
-                    "content": (
-                        "The previous assistant output had invalid tool-call formatting. "
-                        "Emit exactly one valid tool call now. No explanation, no prose, no markdown, no XML."
-                    ),
+                    "content": remediation,
                 }
             )
+        self._set_last_failure_metadata(None)
 
         last_error = None
         for attempt in range(self._max_retries):
@@ -790,6 +914,7 @@ class LLMClient:
             request_start = time.time()
             try:
                 lease = await self._acquire_lease()
+                await self._wait_for_global_rate_limit_window(lease.base_url)
                 request_id = self._generate_request_id("format-recovery")
                 response = await asyncio.wait_for(
                     self._make_request_with_tools(
@@ -818,14 +943,28 @@ class LLMClient:
                 if lease is not None:
                     await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
                 last_error = e
+                if isinstance(e, openai.RateLimitError) or (
+                    isinstance(e, openai.APIStatusError) and getattr(e, "status_code", None) == 429
+                ):
+                    await self._wait_for_rate_limit_reset(
+                        error=e,
+                        attempt=rate_limit_attempt,
+                        request_id=request_id,
+                        model=model,
+                        base_url=lease.base_url if lease is not None else self._base_url,
+                    )
+                    rate_limit_attempt += 1
+                    continue
                 if self._strict_serial:
                     self._raise_strict_serial_error(
                         f"Strict-serial format recovery error: {e}",
                         e,
                         attempt + 1,
                     )
+                attempt += 1
+                if attempt >= self._max_retries:
+                    raise last_error or Exception("LLM format recovery failed after all retries")
                 await self._backoff(attempt)
-
         raise last_error or Exception("LLM format recovery failed after all retries")
 
     async def _acquire_lease(self) -> _ServerLease:
@@ -894,7 +1033,7 @@ class LLMClient:
                 params["max_tokens"] = effective_max_completion_tokens
                 params["max_completion_tokens"] = effective_max_completion_tokens
             params["extra_body"] = {"request_id": request_id}
-            self._apply_reasoning_controls(params)
+            self._apply_reasoning_controls(params, base_url=base_url)
 
             start_time = time.time()
             response = await client.chat.completions.create(**params)
@@ -905,6 +1044,16 @@ class LLMClient:
 
             choice = response.choices[0] if response.choices else None
             if not choice:
+                self._set_last_failure_metadata(
+                    {
+                        "failure_stage": "chat_with_tools",
+                        "failure_type": "no_choices",
+                        "model": model,
+                        "base_url": base_url,
+                        "request_id": request_id,
+                        "attempt": 1,
+                    }
+                )
                 raise ValueError("LLM returned no choices")
 
             content = choice.message.content or ""
@@ -921,6 +1070,22 @@ class LLMClient:
             usage = response.usage.model_dump() if response.usage else None
 
             if not content and not parsed_tool_calls:
+                self._set_last_failure_metadata(
+                    {
+                        "failure_stage": "chat_with_tools",
+                        "failure_type": "empty_response",
+                        "model": model,
+                        "base_url": base_url,
+                        "request_id": getattr(response, "id", request_id),
+                        "finish_reason": getattr(choice, "finish_reason", None),
+                        "usage": usage,
+                        "choice_message_preview": {
+                            "content": content[:200],
+                            "tool_call_count": len(parsed_tool_calls),
+                        },
+                        "attempt": 1,
+                    }
+                )
                 raise ValueError("LLM returned empty response (no content, no tool_calls)")
 
             return LLMResponse(
@@ -974,7 +1139,7 @@ class LLMClient:
                 params["max_tokens"] = self._max_completion_tokens
                 params["max_completion_tokens"] = self._max_completion_tokens
             params["extra_body"] = {"request_id": request_id}
-            self._apply_reasoning_controls(params)
+            self._apply_reasoning_controls(params, base_url=base_url)
 
             start_time = time.time()
             stream = await client.chat.completions.create(**params)

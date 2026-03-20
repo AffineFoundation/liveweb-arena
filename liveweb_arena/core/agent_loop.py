@@ -67,6 +67,7 @@ class AgentLoop:
         llm_client: LLMClient,
         protocol: AgentProtocol,
         max_steps: int = 30,
+        enable_format_recovery: Optional[bool] = None,
         on_navigation: Optional[NavigationCallback] = None,
         on_step_complete: Optional[StepCompleteCallback] = None,
         on_observation: Optional[ObservationCallback] = None,
@@ -81,7 +82,11 @@ class AgentLoop:
         self._failfast_action_failures = int(os.getenv("LIVEWEB_FAILFAST_ACTION_FAILURES", "5"))
         self._failfast_error_pages = int(os.getenv("LIVEWEB_FAILFAST_ERROR_PAGES", "10"))
         self._failfast_blank_observations = int(os.getenv("LIVEWEB_FAILFAST_BLANK_OBSERVATIONS", "4"))
-        self._enable_format_recovery = os.getenv("LIVEWEB_ENABLE_FORMAT_RECOVERY", "1") == "1"
+        self._enable_format_recovery = (
+            enable_format_recovery
+            if enable_format_recovery is not None
+            else (os.getenv("LIVEWEB_ENABLE_FORMAT_RECOVERY", "1") == "1")
+        )
         self._format_recovery_max_retries = int(os.getenv("LIVEWEB_FORMAT_RECOVERY_MAX_RETRIES", "4"))
         self._format_recovery_max_new_tokens = int(os.getenv("LIVEWEB_FORMAT_RECOVERY_MAX_NEW_TOKENS", "96"))
         self._format_recovery_empty_max_retries = int(
@@ -100,6 +105,8 @@ class AgentLoop:
         self._format_recovery_successes = 0
         self._format_recovery_exhausted = 0
         self._format_failure_class_counts: Counter[str] = Counter()
+        self._last_parse_failure_metadata: dict[str, Any] = {}
+        self._last_llm_failure_metadata: dict[str, Any] = {}
 
     def get_trajectory(self) -> List[TrajectoryStep]:
         """Get current trajectory (for partial recovery on timeout)"""
@@ -134,6 +141,12 @@ class AgentLoop:
                 else 0.0
             ),
         }
+
+    def get_last_parse_failure_metadata(self) -> dict[str, Any]:
+        return dict(self._last_parse_failure_metadata)
+
+    def get_last_llm_failure_metadata(self) -> dict[str, Any]:
+        return dict(self._last_llm_failure_metadata)
 
     async def _call_llm(
         self, system_prompt: str, user_prompt: str, model: str,
@@ -332,6 +345,8 @@ class AgentLoop:
         self._format_recovery_successes = 0
         self._format_recovery_exhausted = 0
         self._format_failure_class_counts = Counter()
+        self._last_parse_failure_metadata = {}
+        self._last_llm_failure_metadata = {}
 
         system_prompt = self._protocol.build_system_prompt(task)
         log("Agent", f"Starting loop, max_steps={self._max_steps}, protocol=function_calling")
@@ -421,6 +436,7 @@ class AgentLoop:
 
             except Exception as e:
                 consecutive_errors += 1
+                self._last_llm_failure_metadata = self._llm_client.get_last_failure_metadata()
                 max_consecutive = 3
                 log("Agent", f"LLM error ({consecutive_errors}/{max_consecutive}): {type(e).__name__}: {e}", force=True)
 
@@ -438,27 +454,36 @@ class AgentLoop:
             # Parse failed - terminate immediately
             if action is None:
                 failure_class = self._protocol.classify_format_failure(raw_response, usage.tool_calls if usage else None)
+                parse_debug = self._protocol.debug_parse_metadata(raw_response, usage.tool_calls if usage else None)
                 self._format_failure_class_counts[failure_class] += 1
+                self._last_parse_failure_metadata = {
+                    "format_failure_class": failure_class,
+                    "raw_response_preview": (raw_response or "")[:400],
+                    **parse_debug,
+                }
                 if failure_class.startswith("recoverable_"):
-                    log("Agent", f"Parse failed, attempting format recovery: {failure_class}", force=True)
-                    raw_response, action, usage, failure_override = await self._attempt_format_recovery(
-                        model=model,
-                        seed=seed,
-                        raw_response=raw_response,
-                        messages=self._build_recovery_messages(
-                            system_prompt=system_prompt,
-                            user_prompt=user_prompt,
+                    if self._enable_format_recovery:
+                        log("Agent", f"Parse failed, attempting format recovery: {failure_class}", force=True)
+                        raw_response, action, usage, failure_override = await self._attempt_format_recovery(
+                            model=model,
+                            seed=seed,
+                            raw_response=raw_response,
+                            messages=self._build_recovery_messages(
+                                system_prompt=system_prompt,
+                                user_prompt=user_prompt,
+                                failure_class=failure_class,
+                            ),
                             failure_class=failure_class,
-                        ),
-                        failure_class=failure_class,
-                    )
-                    if failure_override is not None:
-                        if self._format_failure_class_counts[failure_class] > 0:
-                            self._format_failure_class_counts[failure_class] -= 1
-                        self._format_failure_class_counts[failure_override] += 1
-                    if usage:
-                        for key in self._total_usage:
-                            self._total_usage[key] += usage.get(key, 0)
+                        )
+                        if failure_override is not None:
+                            if self._format_failure_class_counts[failure_class] > 0:
+                                self._format_failure_class_counts[failure_class] -= 1
+                            self._format_failure_class_counts[failure_override] += 1
+                        if usage:
+                            for key in self._total_usage:
+                                self._total_usage[key] += usage.get(key, 0)
+                    else:
+                        log("Agent", f"Parse failed with format recovery disabled: {failure_class}", force=True)
 
                 if action is None:
                     log("Agent", f"PARSE FAILED: {raw_response[:200]!r}", force=True)

@@ -164,6 +164,35 @@ def test_parse_qwen_function_style_with_wrapper_noise(protocol):
     assert action.params == {"url": "https://news.ycombinator.com"}
 
 
+def test_parse_bracket_tool_call_stop_fallback(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"}})]'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_bracket_tool_call_goto_fallback(protocol):
+    raw = '[tool_call: goto({"url":"https://example.com"})]'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "goto"
+    assert action.params == {"url": "https://example.com"}
+
+
+def test_debug_parse_metadata_identifies_bracket_tool_call(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"}})]'
+    metadata = protocol.debug_parse_metadata(raw, None)
+    assert metadata["protocol_parser_branch"] == "bracket_tool_call"
+    assert metadata["tool_calls_preview"] == []
+
+
+def test_debug_parse_metadata_identifies_unparsed_natural_language(protocol):
+    raw = "I will think first and then browse later."
+    metadata = protocol.debug_parse_metadata(raw, None)
+    assert metadata["protocol_parser_branch"] == "natural_language"
+
+
 def test_parse_qwen_fallback_rejects_natural_language(protocol):
     raw = 'I should stop now. {"name":"stop","arguments":{"answers":{"a1":"42"}}}'
     assert protocol.parse_response(raw, None) is None
@@ -176,6 +205,19 @@ def test_classify_format_failure_empty_response_is_recoverable(protocol):
 def test_classify_format_failure_truncated_tool_call_is_recoverable(protocol):
     raw = "<tool_call>{\"name\":\"goto\",\"arguments\":{\"url\":\"https://example.com\"}"
     assert protocol.classify_format_failure(raw, None) == "recoverable_truncated_tool_json"
+
+
+def test_classify_format_failure_valid_bracket_tool_call_is_not_failure(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"}})]'
+    assert protocol.classify_format_failure(raw, None) == "none"
+
+
+def test_parse_bracket_tool_call_repairs_missing_outer_brace(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"})]'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
 
 
 def test_classify_format_failure_natural_language_is_terminal(protocol):

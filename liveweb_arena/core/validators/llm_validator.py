@@ -50,6 +50,12 @@ VALIDATION_MODELS: List[str] = [
     "Qwen/Qwen3-32B",
 ]
 
+OPENROUTER_VALIDATION_MODELS: List[str] = [
+    "google/gemini-3-flash-preview",
+    "z-ai/glm-5",
+    "xiaomi/mimo-v2-pro",
+]
+
 OPENAI_VALIDATION_MODELS: List[str] = [
     "gpt-4",
     "gpt-3.5-turbo",
@@ -62,8 +68,10 @@ def _get_validation_models(llm_client) -> List[str]:
 
     Priority:
     1. VALIDATION_MODELS env var (comma-separated)
-    2. OpenAI-safe defaults when base_url points to api.openai.com
-    3. Project default VALIDATION_MODELS
+    2. Provider-specific env override (e.g. VALIDATION_OPENROUTER_MODELS)
+    3. OpenAI-safe defaults when base_url points to api.openai.com
+    4. OpenRouter-safe defaults when base_url points to openrouter.ai
+    5. Project default VALIDATION_MODELS
     """
     env_models = os.getenv("VALIDATION_MODELS", "")
     if env_models.strip():
@@ -72,8 +80,23 @@ def _get_validation_models(llm_client) -> List[str]:
             return models
 
     base_url = str(getattr(llm_client, "_base_url", "")).lower()
+    provider_env_key = ""
+    if "api.openai.com" in base_url:
+        provider_env_key = "VALIDATION_OPENAI_MODELS"
+    elif "openrouter.ai" in base_url:
+        provider_env_key = "VALIDATION_OPENROUTER_MODELS"
+
+    if provider_env_key:
+        provider_models = os.getenv(provider_env_key, "")
+        if provider_models.strip():
+            models = [m.strip() for m in provider_models.split(",") if m.strip()]
+            if models:
+                return models
+
     if "api.openai.com" in base_url:
         return OPENAI_VALIDATION_MODELS
+    if "openrouter.ai" in base_url:
+        return OPENROUTER_VALIDATION_MODELS
 
     return VALIDATION_MODELS
 
