@@ -278,7 +278,10 @@ def _filter_by_emission(subnets: Dict[str, Any]) -> Dict[str, Any]:
 
 def _get_file_cache_path() -> Path:
     """Get path for taostats subnet file cache."""
-    cache_dir = os.environ.get("LIVEWEB_CACHE_DIR", "/var/lib/liveweb-arena/cache")
+    cache_dir = os.environ.get(
+        "LIVEWEB_CACHE_DIR",
+        str(Path(__file__).resolve().parents[3] / ".cache" / "liveweb"),
+    )
     return Path(cache_dir) / "_plugin_init" / "taostats_subnets.json"
 
 

@@ -20,12 +20,14 @@ Directory structure:
 import asyncio
 import contextlib
 import fcntl
+import html
 import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import unquote, urlparse
@@ -37,6 +39,149 @@ logger = logging.getLogger(__name__)
 
 # Default TTL: 48 hours
 DEFAULT_TTL = 48 * 3600
+_TEXT_CONTENT_SEPARATOR = "\n\n--- Page Text Content ---\n"
+
+
+def _is_stooq_url(url: str) -> bool:
+    return "stooq.com" in (urlparse(url).hostname or "").lower()
+
+
+def _is_retryable_stooq_prefetch_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "timeout",
+            "err_aborted",
+            "frame was detached",
+            "target page, context or browser has been closed",
+            "transport closed",
+            "handler is closed",
+            "browser has been closed",
+            "connection closed",
+        )
+    )
+
+
+def _is_taostats_url(url: str) -> bool:
+    return "taostats.io" in (urlparse(url).hostname or "").lower()
+
+
+def _is_taostats_detail_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if "taostats.io" not in host:
+        return False
+    return path.startswith("/subnet/") or re.match(r"^/subnets/\d+(?:/chart)?/?$", path) is not None
+
+
+def _is_retryable_taostats_detail_prefetch_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "target page, context or browser has been closed",
+            "targetclosederror",
+            "err_aborted",
+            "frame was detached",
+            "handler is closed",
+            "transport closed",
+            "connection closed",
+            "browser has been closed",
+        )
+    )
+
+
+def _build_taostats_prefetch_evidence(
+    *,
+    url: str,
+    exc: BaseException,
+    prefetch_phase: str,
+    wait_target: str | None = None,
+    background_refresh: bool = False,
+) -> dict[str, Any] | None:
+    if not _is_taostats_detail_url(url) or not _is_retryable_taostats_detail_prefetch_error(exc):
+        return None
+    return {
+        "classification": "env_taostats_detail_prefetch_invalidated",
+        "page_kind": "taostats_detail",
+        "prefetch_phase": prefetch_phase,
+        "wait_target": wait_target,
+        "background_refresh": background_refresh,
+        "raw_exception_type": type(exc).__name__,
+        "raw_exception_message": str(exc),
+    }
+
+
+class _VisibleTextExtractor(HTMLParser):
+    """Best-effort visible text extractor for cached HTML fallback."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        text = _compact_text(data)
+        if text:
+            self._parts.append(text)
+
+    def text(self) -> str:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for part in self._parts:
+            if part in seen:
+                continue
+            seen.add(part)
+            lines.append(part)
+        return "\n".join(lines)
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
+
+
+def _extract_visible_text_from_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+    parser = _VisibleTextExtractor()
+    parser.feed(html_text)
+    return parser.text()
+
+
+def _merge_accessibility_and_page_text(
+    accessibility_tree: Optional[str],
+    page_text: Optional[str],
+) -> str:
+    a11y = (accessibility_tree or "").strip()
+    text = (page_text or "").strip()
+    if not text:
+        return a11y
+    compact_text = _compact_text(text)
+    if not compact_text:
+        return a11y
+    if not a11y:
+        return text if len(compact_text) >= 20 else a11y
+
+    compact_a11y = _compact_text(a11y)
+    if compact_text == compact_a11y or compact_text in compact_a11y:
+        return a11y
+    if len(compact_a11y) < 64 and len(compact_text) >= len(compact_a11y) + 16:
+        return a11y + _TEXT_CONTENT_SEPARATOR + text
+    if len(compact_text) <= max(256, int(len(compact_a11y) * 0.75)):
+        return a11y
+    return a11y + _TEXT_CONTENT_SEPARATOR + text
 
 
 class CacheFatalError(Exception):
@@ -108,12 +253,17 @@ class CachedPage:
 
     @classmethod
     def from_dict(cls, data: dict) -> "CachedPage":
+        html_text = data["html"]
+        accessibility_tree = _merge_accessibility_and_page_text(
+            data.get("accessibility_tree"),
+            _extract_visible_text_from_html(html_text),
+        ) or None
         return cls(
             url=data["url"],
-            html=data["html"],
+            html=html_text,
             api_data=data.get("api_data"),
             fetched_at=data["fetched_at"],
-            accessibility_tree=data.get("accessibility_tree"),
+            accessibility_tree=accessibility_tree,
             need_api=data.get("need_api", True),  # Default True for old caches
         )
 
@@ -313,6 +463,15 @@ class CacheManager:
         self.allow_stale = os.environ.get("LIVEWEB_CACHE_ALLOW_STALE", "1") == "1"
         self.stale_max_age = int(os.environ.get("LIVEWEB_CACHE_STALE_MAX_AGE", str(24 * 3600)))
         self.max_cache_fetches = int(os.environ.get("LIVEWEB_MAX_CACHE_FETCHES", "6"))
+        self.enable_shared_cache = os.environ.get("LIVEWEB_ENABLE_SHARED_CACHE", "1") == "1"
+        self.shared_cache_dir = Path(
+            os.environ.get(
+                "LIVEWEB_SHARED_CACHE_DIR",
+                str(Path(__file__).resolve().parents[2] / ".cache" / "persistent" / "shared"),
+            )
+        )
+        if self.shared_cache_dir == self.cache_dir:
+            self.enable_shared_cache = False
         self._playwright = None
         self._browser = None
         self._browser_lock = asyncio.Lock()
@@ -320,6 +479,32 @@ class CacheManager:
         self._global_fetch_semaphore = asyncio.Semaphore(max(1, self.max_cache_fetches))
         self._domain_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._refresh_tasks: Dict[str, asyncio.Task] = {}
+
+    def _browser_launch_options(self, *, direct: bool = False) -> dict[str, Any]:
+        from liveweb_arena.core.block_patterns import STEALTH_BROWSER_ARGS
+
+        args = [
+            *STEALTH_BROWSER_ARGS,
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ]
+        if direct:
+            args.append("--no-proxy-server")
+        return {
+            "headless": True,
+            "channel": "chromium",
+            "args": args,
+        }
+
+    def _context_options(self) -> dict[str, Any]:
+        from liveweb_arena.core.block_patterns import STEALTH_USER_AGENT
+
+        return {
+            "viewport": {"width": 1280, "height": 720},
+            "user_agent": STEALTH_USER_AGENT,
+            "ignore_https_errors": True,
+            "accept_downloads": False,
+        }
 
     async def _ensure_browser(self):
         """Ensure shared Playwright browser is running (lazy singleton)."""
@@ -329,11 +514,8 @@ class CacheManager:
             if self._browser is not None:
                 return
             from playwright.async_api import async_playwright
-            from liveweb_arena.core.block_patterns import STEALTH_BROWSER_ARGS
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=True, args=STEALTH_BROWSER_ARGS,
-            )
+            self._browser = await self._playwright.chromium.launch(**self._browser_launch_options())
 
     async def shutdown(self):
         """Shutdown shared browser and Playwright."""
@@ -391,7 +573,7 @@ class CacheManager:
         page_type = "data" if need_api else "nav"
 
         # 1. Quick check (no lock)
-        status, cached = self._load_with_status(cache_file, need_api)
+        status, cached = self._load_with_status(normalized, cache_file, need_api)
         if status == "valid" and cached:
             log("Cache", f"HIT {page_type} - {url_display(normalized)}")
             return CacheFetchResult(
@@ -415,7 +597,7 @@ class CacheManager:
         lock_fd = await async_file_lock_acquire(lock_file)
         try:
             # 3. Double check (another process may have updated)
-            status, cached = self._load_with_status(cache_file, need_api)
+            status, cached = self._load_with_status(normalized, cache_file, need_api)
             if status == "valid" and cached:
                 log("Cache", f"HIT {page_type} (after lock) - {url_display(normalized)}")
                 return CacheFetchResult(
@@ -476,7 +658,38 @@ class CacheManager:
         finally:
             async_file_lock_release(lock_fd)
 
-    def _load_with_status(self, cache_file: Path, need_api: bool) -> tuple[str, Optional[CachedPage]]:
+    def _load_with_status(
+        self,
+        normalized_url: str,
+        cache_file: Path,
+        need_api: bool,
+    ) -> tuple[str, Optional[CachedPage]]:
+        status, cached = self._load_with_status_from_file(cache_file, need_api, delete_invalid=True)
+        if status in {"valid", "stale"} and cached:
+            return status, cached
+
+        shared_file = self._shared_cache_file(normalized_url)
+        if shared_file is None:
+            return status, cached
+
+        shared_status, shared_cached = self._load_with_status_from_file(
+            shared_file,
+            need_api,
+            delete_invalid=False,
+        )
+        if shared_status in {"valid", "stale"} and shared_cached:
+            with contextlib.suppress(Exception):
+                self._save_to_path(cache_file, shared_cached)
+            return shared_status, shared_cached
+        return status, cached
+
+    def _load_with_status_from_file(
+        self,
+        cache_file: Path,
+        need_api: bool,
+        *,
+        delete_invalid: bool,
+    ) -> tuple[str, Optional[CachedPage]]:
         """Load cache and classify it as valid, stale, invalid, or missing."""
         if not cache_file.exists():
             return "missing", None
@@ -485,12 +698,14 @@ class CacheManager:
             cached = self._load(cache_file)
         except Exception as e:
             logger.warning(f"Failed to load cache {cache_file}: {e}")
-            self._delete_cache(cache_file)
+            if delete_invalid:
+                self._delete_cache(cache_file)
             return "invalid", None
 
         if not cached.is_complete() or (need_api and not cached.api_data):
             log("Cache", f"Incomplete (missing API) - deleting {url_display(cached.url)}")
-            self._delete_cache(cache_file)
+            if delete_invalid:
+                self._delete_cache(cache_file)
             return "invalid", None
 
         age = time.time() - cached.fetched_at
@@ -500,7 +715,8 @@ class CacheManager:
         if self.allow_stale and age <= self.ttl + self.stale_max_age:
             return "stale", cached
 
-        self._delete_cache(cache_file)
+        if delete_invalid:
+            self._delete_cache(cache_file)
         return "expired", None
 
     def _load_if_valid(self, cache_file: Path, need_api: bool) -> Optional[CachedPage]:
@@ -510,7 +726,7 @@ class CacheManager:
         configured TTL and completeness rules. Stale, invalid, expired, and
         missing entries all map to ``None``.
         """
-        status, cached = self._load_with_status(cache_file, need_api)
+        status, cached = self._load_with_status_from_file(cache_file, need_api, delete_invalid=True)
         return cached if status == "valid" else None
 
     async def _fetch_and_build_cache(
@@ -553,11 +769,21 @@ class CacheManager:
             html, accessibility_tree = page_result
 
             if api_error is not None:
+                plugin_failure_metadata = {}
+                try:
+                    from liveweb_arena.plugins.base_client import APIFetchError
+
+                    if isinstance(api_error, APIFetchError):
+                        plugin_failure_metadata = dict(api_error.metadata or {})
+                except Exception:
+                    plugin_failure_metadata = {}
                 raise CacheFatalError(
                     f"API data fetch failed (GT will be invalid): {api_error}",
                     url=url,
                     kind="api_error",
                     fatal=False,
+                    evidence={"plugin_failure_metadata": plugin_failure_metadata},
+                    plugin_name=getattr(plugin, "name", None),
                 )
             if not api_data:
                 raise CacheFatalError(
@@ -591,6 +817,18 @@ class CacheManager:
         try:
             await self._ensure_single(url, plugin, need_api, allow_stale_lookup=False)
         except Exception as e:
+            evidence = None
+            if isinstance(e, CacheFatalError):
+                evidence = dict(getattr(e, "evidence", {}) or {})
+                taostats_evidence = _build_taostats_prefetch_evidence(
+                    url=url,
+                    exc=e,
+                    prefetch_phase="background_refresh",
+                    background_refresh=True,
+                )
+                if taostats_evidence:
+                    evidence.update(taostats_evidence)
+                    e.evidence = evidence
             log("Cache", f"Background refresh skipped for {url_display(normalized)}: {e}")
         finally:
             self._refresh_tasks.pop(normalized, None)
@@ -610,6 +848,8 @@ class CacheManager:
     def _domain_limit_for_key(self, domain_key: str) -> int:
         env_name = f"LIVEWEB_CACHE_DOMAIN_LIMIT_{domain_key.upper()}"
         default_limit = int(os.environ.get("LIVEWEB_CACHE_DOMAIN_LIMIT_DEFAULT", "2"))
+        if domain_key == "stooq":
+            default_limit = int(os.environ.get("LIVEWEB_CACHE_DOMAIN_LIMIT_STOOQ", "1"))
         return max(1, int(os.environ.get(env_name, str(default_limit))))
 
     def _domain_semaphore(self, domain_key: str) -> asyncio.Semaphore:
@@ -635,46 +875,77 @@ class CacheManager:
 
     def _save(self, cache_file: Path, cached: CachedPage):
         """Save cache to file."""
+        self._save_to_path(cache_file, cached)
+        shared_file = self._shared_cache_file(normalize_url(cached.url))
+        if shared_file is not None:
+            with contextlib.suppress(Exception):
+                self._save_to_path(shared_file, cached)
+
+    @staticmethod
+    def _save_to_path(cache_file: Path, cached: CachedPage):
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(cached.to_dict(), f, ensure_ascii=False)
 
+    def _shared_cache_file(self, normalized_url: str) -> Optional[Path]:
+        if not self.enable_shared_cache:
+            return None
+        return url_to_cache_dir(self.shared_cache_dir, normalized_url) / "page.json"
+
     async def _fetch_page(self, url: str, plugin=None) -> tuple:
         """
-        Fetch page HTML and accessibility tree using shared Playwright browser.
+        Fetch page HTML and accessibility tree.
 
-        Args:
-            url: Page URL to fetch
-            plugin: Optional plugin for page setup (e.g., click "Show All")
-
-        Returns:
-            (html, accessibility_tree) tuple
+        Stooq gets one extra retry through a temporary direct browser because the
+        cache prefetch path is especially proxy-sensitive in this environment.
         """
-        from liveweb_arena.core.block_patterns import (
-            STEALTH_INIT_SCRIPT, STEALTH_USER_AGENT,
-            is_captcha_page, should_block_url,
-        )
-
         await self._ensure_browser()
         try:
-            context = await self._browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent=STEALTH_USER_AGENT,
-            )
+            return await self._fetch_page_once(self._browser, url, plugin)
+        except Exception as exc:
+            if not _is_stooq_url(url) or not _is_retryable_stooq_prefetch_error(exc):
+                raise
+            log("Cache", f"Retrying Stooq prefetch via direct browser: {type(exc).__name__}: {exc}")
+            direct_browser = await self._playwright.chromium.launch(**self._browser_launch_options(direct=True))
+            try:
+                return await self._fetch_page_once(direct_browser, url, plugin)
+            finally:
+                await direct_browser.close()
+
+    async def _fetch_page_once(self, browser, url: str, plugin=None) -> tuple:
+        from liveweb_arena.core.block_patterns import (
+            STEALTH_INIT_SCRIPT,
+            is_captcha_page,
+            should_block_url,
+        )
+
+        prefetch_phase = "new_context"
+        wait_target = None
+        try:
+            context = await browser.new_context(**self._context_options())
         except Exception:
-            # Browser process may have crashed — clean up and retry once
+            if browser is not self._browser:
+                raise
             await self.shutdown()
             await self._ensure_browser()
-            context = await self._browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent=STEALTH_USER_AGENT,
-            )
+            browser = self._browser
+            context = await browser.new_context(**self._context_options())
         try:
+            prefetch_phase = "new_page"
             page = await context.new_page()
             await page.add_init_script(STEALTH_INIT_SCRIPT)
+            prefetch_phase = "goto"
+            wait_target = None
 
-            # Block tracking/ads to avoid networkidle delays
-            # Merge global + plugin-specific block patterns
+            classification = plugin.classify_url(url) if plugin and hasattr(plugin, "classify_url") else None
+            if classification == "model_invalid_url_shape":
+                return await self._render_browser_error_page(
+                    page,
+                    title="Invalid page",
+                    message="This URL shape is not a stable Stooq page. Try a quote page like /q/?s=symbol instead.",
+                    url=url,
+                )
+
             plugin_block_res = []
             if plugin and hasattr(plugin, 'get_blocked_patterns'):
                 for pat in plugin.get_blocked_patterns():
@@ -693,10 +964,8 @@ class CacheManager:
                 await route.continue_()
 
             await page.route("**/*", _block_tracking)
-
             response = await page.goto(url, timeout=60000, wait_until="domcontentloaded")
 
-            # Layer 1: HTTP status check
             if response and response.status >= 400:
                 fatal = response.status not in (404, 410)
                 raise CacheFatalError(
@@ -708,23 +977,36 @@ class CacheManager:
                     evidence={"page_url": url},
                 )
 
-            # Wait for network idle (short timeout: ads are blocked, so
-            # legitimate content loads in ~3-4s; streaming endpoints like
-            # aq*.stooq.com keep connections open indefinitely)
             try:
+                prefetch_phase = "post_wait"
                 await page.wait_for_load_state("networkidle", timeout=5000)
             except Exception:
                 pass
 
-            # Plugin-specific page setup (e.g., click "ALL" to show all rows)
             if plugin and hasattr(plugin, 'setup_page_for_cache'):
                 try:
+                    prefetch_phase = "setup_page_for_cache"
                     await plugin.setup_page_for_cache(page, url)
                 except Exception as e:
+                    taostats_evidence = _build_taostats_prefetch_evidence(
+                        url=url,
+                        exc=e,
+                        prefetch_phase=getattr(e, "prefetch_phase", "setup_page_for_cache"),
+                        wait_target=getattr(e, "wait_target", None),
+                    )
+                    if taostats_evidence:
+                        raise CacheFatalError(
+                            f"Taostats detail prefetch setup failed: {e}",
+                            url=url,
+                            kind="taostats_prefetch_invalidated",
+                            fatal=False,
+                            evidence=taostats_evidence,
+                            plugin_name=getattr(plugin, "name", None),
+                        ) from e
                     log("Cache", f"Page setup failed (continuing): {e}")
 
-            # Scroll to trigger lazy loading
             for pos in [0, 500, 1000, 2000]:
+                prefetch_phase = "post_wait"
                 await page.evaluate(f"window.scrollTo(0, {pos})")
                 await page.wait_for_timeout(300)
 
@@ -732,8 +1014,6 @@ class CacheManager:
             await page.wait_for_timeout(500)
 
             html = await page.content()
-
-            # Layer 2: CAPTCHA/challenge detection
             page_title = await page.title()
             if is_captcha_page(html, page_title):
                 raise CacheFatalError(
@@ -741,8 +1021,6 @@ class CacheManager:
                     url=url,
                     evidence={"page_title": page_title},
                 )
-
-            # Layer 3: Minimum content length (real pages are >5KB)
             if len(html) < 1000:
                 raise CacheFatalError(
                     f"Page too short ({len(html)} bytes, title: {page_title!r})",
@@ -750,7 +1028,6 @@ class CacheManager:
                     evidence={"page_title": page_title, "html_length": len(html)},
                 )
 
-            # Extract accessibility tree for deterministic caching
             a11y_tree = ""
             try:
                 a11y_snapshot = await page.accessibility.snapshot()
@@ -759,29 +1036,79 @@ class CacheManager:
             except Exception:
                 pass
 
-            # If accessibility tree is empty, get page text content
-            if len(a11y_tree.strip()) < 100:
-                try:
-                    page_text = await page.evaluate("""
-                        () => {
-                            const preElements = document.querySelectorAll('pre');
-                            if (preElements.length > 0) {
-                                return Array.from(preElements).map(el => el.innerText).join('\\n');
-                            }
-                            return document.body.innerText || '';
+            page_text = ""
+            try:
+                page_text = await page.evaluate("""
+                    () => {
+                        const preElements = document.querySelectorAll('pre');
+                        if (preElements.length > 0) {
+                            return Array.from(preElements).map(el => el.innerText).join('\\n');
                         }
-                    """)
-                    if page_text.strip():
-                        if a11y_tree.strip():
-                            a11y_tree += "\n\n--- Page Text Content ---\n" + page_text
-                        else:
-                            a11y_tree = page_text
-                except Exception:
-                    pass
+                        return document.body.innerText || '';
+                    }
+                """)
+            except Exception:
+                page_text = ""
+
+            a11y_tree = _merge_accessibility_and_page_text(a11y_tree, page_text)
 
             return html, a11y_tree
+        except Exception as exc:
+            taostats_evidence = _build_taostats_prefetch_evidence(
+                url=url,
+                exc=exc,
+                prefetch_phase=getattr(exc, "prefetch_phase", prefetch_phase),
+                wait_target=getattr(exc, "wait_target", wait_target),
+            )
+            if taostats_evidence:
+                if isinstance(exc, CacheFatalError):
+                    exc.evidence.update(taostats_evidence)
+                    exc.plugin_name = getattr(plugin, "name", None)
+                    raise
+                raise CacheFatalError(
+                    f"Taostats detail prefetch invalidated: {exc}",
+                    url=url,
+                    kind="taostats_prefetch_invalidated",
+                    fatal=False,
+                    evidence=taostats_evidence,
+                    plugin_name=getattr(plugin, "name", None),
+                ) from exc
+            raise
         finally:
             await context.close()
+
+    async def _render_browser_error_page(self, page, *, title: str, message: str, url: str) -> tuple[str, str]:
+        safe_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_message = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_url = url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        html = (
+            "<!doctype html><html><head>"
+            f"<title>{safe_title}</title>"
+            "</head><body>"
+            f"<h1>{safe_title}</h1>"
+            f"<p>{safe_message}</p>"
+            f"<p>URL: {safe_url}</p>"
+            "</body></html>"
+        )
+        await page.set_content(html, wait_until="domcontentloaded")
+
+        a11y_tree = ""
+        try:
+            a11y_snapshot = await page.accessibility.snapshot()
+            if a11y_snapshot:
+                a11y_tree = self._format_accessibility_tree(a11y_snapshot)
+        except Exception:
+            pass
+
+        if len(a11y_tree.strip()) < 20:
+            try:
+                page_text = await page.evaluate("() => document.body.innerText || ''")
+                if page_text.strip():
+                    a11y_tree = page_text
+            except Exception:
+                pass
+
+        return await page.content(), a11y_tree
 
     def _format_accessibility_tree(self, node: dict, indent: int = 0) -> str:
         """Format accessibility tree node recursively."""

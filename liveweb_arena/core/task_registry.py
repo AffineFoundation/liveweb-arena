@@ -251,7 +251,7 @@ class TaskRegistry:
             - template_ids: Tuple of template IDs in this combination
             - templates: List of (plugin, template_name) tuples
             - variation_seed: Seed for variation within this combination
-            - num_tasks: Number of sub-tasks (3-5)
+            - num_tasks: Number of sub-tasks (1-4)
 
         Raises:
             ValueError: If task_id is out of valid range
@@ -273,7 +273,7 @@ class TaskRegistry:
         template_ids = cls._combinations[combo_index]
         templates = [cls.TEMPLATES[tid] for tid in template_ids]
 
-        num_tasks = (variation_seed % 3) + 2
+        num_tasks = (variation_seed % 4) + 1
 
         return {
             "task_id": task_id,

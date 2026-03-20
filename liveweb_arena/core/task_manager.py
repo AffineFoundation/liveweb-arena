@@ -129,20 +129,13 @@ class TaskManager:
             subtask.answer_tag = f"answer{i + 1}"
             subtasks.append(subtask)
 
-        # Include hints only for plugins used in the task
-        # Avoids eagerly instantiating unused plugins (which may trigger API calls)
-        plugin_hints: Dict[str, str] = {}
-        for plugin_name in plugins_to_use:
-            plugin = self._get_plugin(plugin_name)
-            plugin_hints[plugin_name] = f"Use {', '.join(plugin.allowed_domains)} to find information."
-
         # Build combined intent (without start_url - Agent decides navigation)
         combined_intent = self._build_combined_intent(subtasks)
 
         return CompositeTask(
             subtasks=subtasks,
             combined_intent=combined_intent,
-            plugin_hints=plugin_hints,
+            plugin_hints={},
             seed=seed,
         )
 

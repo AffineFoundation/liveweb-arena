@@ -1,25 +1,28 @@
 import sys
 import types
+import os
+
+USE_REAL_BROWSER_SMOKE = os.getenv("LIVEWEB_REAL_BROWSER_SMOKE") == "1"
+
+if not USE_REAL_BROWSER_SMOKE:
+    playwright_module = types.ModuleType("playwright")
+    async_api_module = types.ModuleType("playwright.async_api")
 
 
-playwright_module = types.ModuleType("playwright")
-async_api_module = types.ModuleType("playwright.async_api")
+    async def _async_playwright():
+        raise RuntimeError("playwright is stubbed for unit tests")
 
 
-async def _async_playwright():
-    raise RuntimeError("playwright is stubbed for unit tests")
+    async_api_module.async_playwright = _async_playwright
+    async_api_module.Browser = object
+    async_api_module.BrowserContext = object
+    async_api_module.Page = object
+    async_api_module.Playwright = object
 
+    playwright_module.async_api = async_api_module
 
-async_api_module.async_playwright = _async_playwright
-async_api_module.Browser = object
-async_api_module.BrowserContext = object
-async_api_module.Page = object
-async_api_module.Playwright = object
-
-playwright_module.async_api = async_api_module
-
-sys.modules.setdefault("playwright", playwright_module)
-sys.modules.setdefault("playwright.async_api", async_api_module)
+    sys.modules.setdefault("playwright", playwright_module)
+    sys.modules.setdefault("playwright.async_api", async_api_module)
 
 
 openai_module = types.ModuleType("openai")

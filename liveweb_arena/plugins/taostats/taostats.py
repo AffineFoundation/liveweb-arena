@@ -13,6 +13,13 @@ from liveweb_arena.plugins.base import BasePlugin
 from .api_client import fetch_single_subnet_data, fetch_homepage_api_data, initialize_cache
 
 
+class TaostatsPrefetchSetupError(RuntimeError):
+    def __init__(self, message: str, *, prefetch_phase: str, wait_target: str | None = None):
+        super().__init__(message)
+        self.prefetch_phase = prefetch_phase
+        self.wait_target = wait_target
+
+
 class TaostatsPlugin(BasePlugin):
     """
     Taostats plugin for Bittensor network data.
@@ -143,22 +150,40 @@ class TaostatsPlugin(BasePlugin):
         On taostats.io/subnets, the default view shows only 10-25 rows.
         Click "ALL" to show all ~128 subnets for complete visibility.
         """
-        if not self._is_list_page(url):
+        if self._is_list_page(url):
+            try:
+                all_button = page.get_by_text("ALL", exact=True).first
+                if await all_button.is_visible(timeout=5000):
+                    await all_button.click()
+                    await page.wait_for_timeout(2500)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                await page.locator("text=Rows:").first.wait_for(timeout=5000)
+            except Exception:
+                pass
             return
 
-        try:
-            # Click the "ALL" option in the rows selector
-            # The selector shows: 10, 25, 50, 100, ALL
-            all_button = page.locator('text="ALL"').first
-            if await all_button.is_visible(timeout=3000):
-                await all_button.click()
-                # Wait for table to update with all rows
-                await page.wait_for_timeout(2000)
-                # Wait for network to settle after loading all rows
+        if self._extract_subnet_id(url):
+            last_error = None
+            for selector in (
+                "text=Statistics",
+                "text=Transactions",
+                "text=Holders",
+                "text=Price Impact",
+            ):
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-        except Exception:
-            # If "ALL" button not found or click fails, continue with default view
-            pass
+                    await page.locator(selector).first.wait_for(timeout=4000)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = TaostatsPrefetchSetupError(
+                        f"Taostats detail wait failed for {selector}: {exc}",
+                        prefetch_phase="setup_page_for_cache",
+                        wait_target=selector,
+                    )
+                    continue
+            if last_error is not None:
+                raise last_error
+            await page.wait_for_timeout(2000)

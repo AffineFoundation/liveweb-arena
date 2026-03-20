@@ -16,10 +16,17 @@ class APIFetchError(Exception):
     All API clients should raise this instead of returning None/empty dict.
     """
 
-    def __init__(self, message: str, source: str = None, status_code: int = None):
+    def __init__(
+        self,
+        message: str,
+        source: str = None,
+        status_code: int = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.source = source
         self.status_code = status_code
+        self.metadata = dict(metadata or {})
 
 
 def validate_api_response(data: Any, expected_type: type, context: str) -> None:

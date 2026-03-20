@@ -15,8 +15,16 @@ from .api_client import fetch_single_coin_data, fetch_homepage_api_data
 # URL slug to API coin ID mapping for coins where they differ
 # CoinGecko sometimes uses different identifiers in URLs vs API
 URL_SLUG_TO_COIN_ID = {
+    "bnb": "binancecoin",
+    "binance-coin": "binancecoin",
+    "binancecoin": "binancecoin",
+    "xrp": "ripple",
+    "ada": "cardano",
+    "polkadot-new": "polkadot",
+    "polkadot": "polkadot",
     "polygon": "polygon-ecosystem-token",  # Polygon rebranded MATIC to POL
     "matic-network": "polygon-ecosystem-token",
+    "near-protocol": "near",
     "avalanche": "avalanche-2",
     "hedera": "hedera-hashgraph",
     "lido-staked-ether": "staked-ether",

@@ -77,6 +77,19 @@ class TestCachedPage:
         d = page.to_dict()
         assert d["accessibility_tree"] == "tree"
 
+    def test_from_dict_enriches_sparse_a11y_from_html(self):
+        d = {
+            "url": "https://taostats.io/subnets/75",
+            "html": "<html><body><nav>taostats</nav><main><h1>Hippius</h1><div>Statistics</div><div>Price Impact</div></main></body></html>",
+            "api_data": {"netuid": 75},
+            "fetched_at": 1.0,
+            "accessibility_tree": "taostats",
+            "need_api": True,
+        }
+        page = CachedPage.from_dict(d)
+        assert "Hippius" in page.accessibility_tree
+        assert "Statistics" in page.accessibility_tree
+
 
 # ── PageRequirement ──────────────────────────────────────────────────
 
@@ -262,3 +275,31 @@ class TestCacheManagerLoadIfValid:
         mgr = CacheManager(cache_dir=tmp_path, ttl=3600)
         # need_api=True but cache has no api_data → rejected
         assert mgr._load_if_valid(cache_file, need_api=True) is None
+
+    def test_load_with_status_uses_shared_cache_fallback(self, tmp_path, monkeypatch):
+        local_cache = tmp_path / "local"
+        shared_cache = tmp_path / "shared"
+        monkeypatch.setenv("LIVEWEB_SHARED_CACHE_DIR", str(shared_cache))
+        monkeypatch.setenv("LIVEWEB_ENABLE_SHARED_CACHE", "1")
+        mgr = CacheManager(cache_dir=local_cache, ttl=3600)
+
+        url = "https://stooq.com/q/?s=jnj.us"
+        normalized = normalize_url(url)
+        shared_file = url_to_cache_dir(shared_cache, normalized) / "page.json"
+        shared_file.parent.mkdir(parents=True, exist_ok=True)
+        shared_page = CachedPage(
+            url=url,
+            html="<html><body><h1>JNJ</h1><p>Price 123</p></body></html>",
+            api_data={"symbol": "jnj.us"},
+            fetched_at=time.time(),
+            need_api=True,
+        )
+        with open(shared_file, "w") as f:
+            json.dump(shared_page.to_dict(), f)
+
+        local_file = url_to_cache_dir(local_cache, normalized) / "page.json"
+        status, cached = mgr._load_with_status(normalized, local_file, need_api=True)
+        assert status == "valid"
+        assert cached is not None
+        assert cached.api_data == {"symbol": "jnj.us"}
+        assert local_file.exists()
