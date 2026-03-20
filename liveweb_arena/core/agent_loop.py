@@ -82,6 +82,12 @@ class AgentLoop:
         self._failfast_action_failures = int(os.getenv("LIVEWEB_FAILFAST_ACTION_FAILURES", "5"))
         self._failfast_error_pages = int(os.getenv("LIVEWEB_FAILFAST_ERROR_PAGES", "10"))
         self._failfast_blank_observations = int(os.getenv("LIVEWEB_FAILFAST_BLANK_OBSERVATIONS", "4"))
+        self._failfast_disallowed_domain_consecutive = int(
+            os.getenv("LIVEWEB_FAILFAST_DISALLOWED_DOMAIN_CONSECUTIVE", "2")
+        )
+        self._failfast_disallowed_domain_total = int(
+            os.getenv("LIVEWEB_FAILFAST_DISALLOWED_DOMAIN_TOTAL", "3")
+        )
         self._enable_format_recovery = (
             enable_format_recovery
             if enable_format_recovery is not None
@@ -119,6 +125,28 @@ class AgentLoop:
     def get_final_answer(self) -> Any:
         """Get final answer if available"""
         return self._final_answer
+
+    def _extract_disallowed_domain_url(self, observation: Any) -> Optional[str]:
+        metadata = None
+        if hasattr(self._session, "get_last_navigation_metadata"):
+            try:
+                metadata = self._session.get_last_navigation_metadata()
+            except Exception:
+                metadata = None
+
+        if isinstance(metadata, dict) and metadata.get("classification_hint") == "model_disallowed_domain":
+            evidence = metadata.get("evidence") or {}
+            return (
+                evidence.get("blocked_url")
+                or metadata.get("url")
+                or getattr(observation, "url", None)
+            )
+
+        obs_text = (getattr(observation, "accessibility_tree", "") or "").lower()
+        if "domain not allowed" in obs_text:
+            return getattr(observation, "url", None)
+
+        return None
 
     def get_format_recovery_stats(self) -> dict:
         attempts = self._format_recovery_attempts
@@ -356,6 +384,8 @@ class AgentLoop:
         consecutive_error_pages = 0
         consecutive_action_failures = 0
         consecutive_blank_observations = 0
+        consecutive_disallowed_domain_hits = 0
+        total_disallowed_domain_hits = 0
         max_error_page_retries = self._failfast_error_pages
 
         effective_step = 0  # Count all steps including error pages (AI sees them)
@@ -572,6 +602,33 @@ class AgentLoop:
                     await self._on_step_complete(step)
                 except Exception as e:
                     log("Agent", f"Step complete callback error: {e}")
+
+            blocked_url = self._extract_disallowed_domain_url(obs)
+            if blocked_url:
+                consecutive_disallowed_domain_hits += 1
+                total_disallowed_domain_hits += 1
+                log(
+                    "Agent",
+                    (
+                        "Disallowed domain encountered "
+                        f"(consecutive={consecutive_disallowed_domain_hits}, total={total_disallowed_domain_hits}): "
+                        f"{blocked_url}"
+                    ),
+                )
+                if (
+                    consecutive_disallowed_domain_hits >= self._failfast_disallowed_domain_consecutive
+                    or total_disallowed_domain_hits >= self._failfast_disallowed_domain_total
+                ):
+                    raise BrowserFatalError(
+                        (
+                            "Too many disallowed-domain navigations "
+                            f"(consecutive={consecutive_disallowed_domain_hits}, total={total_disallowed_domain_hits})"
+                        ),
+                        url=blocked_url,
+                        attempts=consecutive_disallowed_domain_hits,
+                    )
+            else:
+                consecutive_disallowed_domain_hits = 0
 
         # Check if max steps reached without completion
         if self._final_answer is None and effective_step >= self._max_steps:

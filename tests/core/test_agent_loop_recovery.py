@@ -1,6 +1,6 @@
 import pytest
 
-from liveweb_arena.core.agent_loop import AgentLoop
+from liveweb_arena.core.agent_loop import AgentLoop, BrowserFatalError
 from liveweb_arena.core.agent_protocol import FunctionCallingProtocol
 from liveweb_arena.core.models import BrowserObservation, CompositeTask
 from liveweb_arena.utils.llm_client import LLMResponse, ToolCall
@@ -12,6 +12,27 @@ class _FakeSession:
 
     async def execute_action(self, action):
         return BrowserObservation(url="https://example.com", title="Done", accessibility_tree="root")
+
+    def get_last_navigation_metadata(self):
+        return None
+
+
+class _FakeSessionWithBlockedSequence:
+    def __init__(self, observations, metadatas):
+        self._observations = list(observations)
+        self._metadatas = list(metadatas)
+        self._last_navigation_metadata = None
+
+    async def goto(self, url: str):
+        self._last_navigation_metadata = None
+        return BrowserObservation(url=url, title="Blank", accessibility_tree="root")
+
+    async def execute_action(self, action):
+        self._last_navigation_metadata = self._metadatas.pop(0)
+        return self._observations.pop(0)
+
+    def get_last_navigation_metadata(self):
+        return self._last_navigation_metadata
 
 
 class _FakeSubTask:
@@ -34,6 +55,17 @@ class _FakeLLMClient:
         self.recovery_calls += 1
         self.recovery_messages.append(kwargs.get("messages"))
         return self.recovery_responses.pop(0)
+
+
+class _QueuedLLMClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    async def chat_with_tools(self, **kwargs):
+        return self._responses.pop(0)
+
+    async def chat_with_tools_recovery(self, **kwargs):
+        raise AssertionError("Recovery should not be called in this test")
 
 
 def _task():
@@ -228,3 +260,101 @@ async def test_agent_loop_explicit_disable_recovery_overrides_env(monkeypatch):
     assert final_answer is None
     assert loop.is_parse_failed() is True
     assert llm_client.recovery_calls == 0
+
+
+@pytest.mark.anyio
+async def test_agent_loop_failfasts_after_consecutive_disallowed_domain_hits(monkeypatch):
+    monkeypatch.setenv("LIVEWEB_FAILFAST_DISALLOWED_DOMAIN_CONSECUTIVE", "2")
+    monkeypatch.setenv("LIVEWEB_FAILFAST_DISALLOWED_DOMAIN_TOTAL", "3")
+
+    blocked_obs = BrowserObservation(
+        url="https://finance.yahoo.com/quote/V/",
+        title="Domain not allowed",
+        accessibility_tree="Domain not allowed. Please return to an allowed site and continue the task.",
+    )
+    session = _FakeSessionWithBlockedSequence(
+        observations=[blocked_obs, blocked_obs],
+        metadatas=[
+            {
+                "classification_hint": "model_disallowed_domain",
+                "url": "https://finance.yahoo.com/quote/V/",
+                "evidence": {"blocked_url": "https://finance.yahoo.com/quote/V/"},
+            },
+            {
+                "classification_hint": "model_disallowed_domain",
+                "url": "https://finance.yahoo.com/quote/V/",
+                "evidence": {"blocked_url": "https://finance.yahoo.com/quote/V/"},
+            },
+        ],
+    )
+    llm_client = _QueuedLLMClient(
+        responses=[
+            LLMResponse(tool_calls=[ToolCall(id="call_1", function={"name": "goto", "arguments": "{\"url\":\"https://finance.yahoo.com/quote/V/\"}"})]),
+            LLMResponse(tool_calls=[ToolCall(id="call_2", function={"name": "goto", "arguments": "{\"url\":\"https://finance.yahoo.com/quote/V/\"}"})]),
+        ]
+    )
+    loop = AgentLoop(
+        session=session,
+        llm_client=llm_client,
+        protocol=FunctionCallingProtocol(),
+        max_steps=5,
+    )
+
+    with pytest.raises(BrowserFatalError) as exc_info:
+        await loop.run(task=_task(), model="qwen", temperature=0.0, seed=1)
+
+    assert "disallowed-domain" in str(exc_info.value)
+    assert exc_info.value.url == "https://finance.yahoo.com/quote/V/"
+    assert len(loop.get_trajectory()) == 2
+
+
+@pytest.mark.anyio
+async def test_agent_loop_resets_disallowed_domain_consecutive_counter_after_recovery(monkeypatch):
+    monkeypatch.setenv("LIVEWEB_FAILFAST_DISALLOWED_DOMAIN_CONSECUTIVE", "2")
+    monkeypatch.setenv("LIVEWEB_FAILFAST_DISALLOWED_DOMAIN_TOTAL", "3")
+
+    blocked_obs = BrowserObservation(
+        url="https://finance.yahoo.com/quote/V/",
+        title="Domain not allowed",
+        accessibility_tree="Domain not allowed. Please return to an allowed site and continue the task.",
+    )
+    good_obs = BrowserObservation(
+        url="https://example.com",
+        title="Example",
+        accessibility_tree="root content with enough accessible text to avoid blank observation failfast",
+    )
+    session = _FakeSessionWithBlockedSequence(
+        observations=[blocked_obs, good_obs, blocked_obs],
+        metadatas=[
+            {
+                "classification_hint": "model_disallowed_domain",
+                "url": "https://finance.yahoo.com/quote/V/",
+                "evidence": {"blocked_url": "https://finance.yahoo.com/quote/V/"},
+            },
+            None,
+            {
+                "classification_hint": "model_disallowed_domain",
+                "url": "https://finance.yahoo.com/quote/V/",
+                "evidence": {"blocked_url": "https://finance.yahoo.com/quote/V/"},
+            },
+        ],
+    )
+    llm_client = _QueuedLLMClient(
+        responses=[
+            LLMResponse(tool_calls=[ToolCall(id="call_1", function={"name": "goto", "arguments": "{\"url\":\"https://finance.yahoo.com/quote/V/\"}"})]),
+            LLMResponse(tool_calls=[ToolCall(id="call_2", function={"name": "goto", "arguments": "{\"url\":\"https://example.com\"}"})]),
+            LLMResponse(tool_calls=[ToolCall(id="call_3", function={"name": "goto", "arguments": "{\"url\":\"https://finance.yahoo.com/quote/V/\"}"})]),
+            LLMResponse(tool_calls=[ToolCall(id="call_4", function={"name": "stop", "arguments": "{\"answers\":{\"a1\":\"42\"}}"})]),
+        ]
+    )
+    loop = AgentLoop(
+        session=session,
+        llm_client=llm_client,
+        protocol=FunctionCallingProtocol(),
+        max_steps=5,
+    )
+
+    trajectory, final_answer, _usage = await loop.run(task=_task(), model="qwen", temperature=0.0, seed=1)
+
+    assert final_answer == {"answers": {"a1": "42"}}
+    assert len(trajectory) == 4
