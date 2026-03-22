@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import openai
@@ -277,6 +277,10 @@ class LLMClient:
         route_key: Optional[str] = None,
         max_retries: Optional[int] = None,
         strict_serial: bool = False,
+        enable_thinking: Optional[bool] = None,
+        separate_reasoning: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
+        strip_reasoning_output: bool = False,
     ):
         if router is None and (not base_url or not api_key):
             raise ValueError("LLMClient requires either router or both base_url/api_key")
@@ -290,8 +294,22 @@ class LLMClient:
         self._strict_serial = strict_serial
         self._max_retries = max(1, int(max_retries or self.MAX_RETRIES))
         self._max_completion_tokens = self._read_max_completion_tokens()
-        self._enable_thinking = self._read_optional_bool_env("LIVEWEB_ENABLE_THINKING")
-        self._separate_reasoning = self._read_optional_bool_env("LIVEWEB_SEPARATE_REASONING")
+        self._enable_thinking = (
+            enable_thinking if enable_thinking is not None else self._read_optional_bool_env("LIVEWEB_ENABLE_THINKING")
+        )
+        self._separate_reasoning = (
+            separate_reasoning
+            if separate_reasoning is not None
+            else self._read_optional_bool_env("LIVEWEB_SEPARATE_REASONING")
+        )
+        self._reasoning_effort = (
+            reasoning_effort.strip().lower()
+            if isinstance(reasoning_effort, str) and reasoning_effort.strip()
+            else (os.getenv("LIVEWEB_REASONING_EFFORT", "").strip().lower() or None)
+        )
+        self._strip_reasoning_output = bool(
+            strip_reasoning_output or (os.getenv("LIVEWEB_STRIP_REASONING_OUTPUT", "0") == "1")
+        )
         self._format_recovery_temperature = self._read_float_env("LIVEWEB_FORMAT_RECOVERY_TEMPERATURE", 0.35)
         self._format_recovery_top_p = self._read_float_env("LIVEWEB_FORMAT_RECOVERY_TOP_P", 0.95)
         self._last_failure_metadata: Dict[str, object] = {}
@@ -368,16 +386,63 @@ class LLMClient:
             extra_body["chat_template_kwargs"] = {"enable_thinking": self._enable_thinking}
         if self._separate_reasoning is not None:
             extra_body["separate_reasoning"] = self._separate_reasoning
-        if self._is_openrouter_base_url(base_url) and self._enable_thinking is False:
-            if self._is_openrouter_kimi_model(model):
-                extra_body["reasoning"] = {"enabled": False}
+        reasoning_payload: Dict[str, object] | None = None
+        if self._enable_thinking is False:
+            if self._is_openrouter_base_url(base_url) and self._is_openrouter_kimi_model(model):
+                reasoning_payload = {"enabled": False}
+            elif self._is_openrouter_base_url(base_url):
+                reasoning_payload = {"effort": "none", "exclude": True}
             else:
-                extra_body["reasoning"] = {
-                    "effort": "none",
-                    "exclude": True,
-                }
+                reasoning_payload = {"enabled": False}
+        elif self._reasoning_effort:
+            reasoning_payload = {"effort": self._reasoning_effort}
+        if reasoning_payload is not None:
+            extra_body["reasoning"] = reasoning_payload
         if extra_body:
             params["extra_body"] = extra_body
+
+    @staticmethod
+    def _extract_visible_content(message: Any) -> str:
+        content = getattr(message, "content", "") or ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    text = getattr(item, "text", None)
+                    if text:
+                        parts.append(str(text))
+                    continue
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in {"reasoning", "reasoning_content", "thinking"}:
+                    continue
+                text = item.get("text")
+                if text is None:
+                    text = item.get("content")
+                if text:
+                    parts.append(str(text))
+            return "".join(parts)
+        return str(content)
+
+    def _sanitize_usage(self, usage: Optional[dict]) -> Optional[dict]:
+        if usage is None or not self._strip_reasoning_output:
+            return usage
+        sanitized = dict(usage)
+        for key in ("reasoning_tokens", "reasoning", "reasoning_content"):
+            sanitized.pop(key, None)
+        for nested_key in ("completion_tokens_details", "prompt_tokens_details"):
+            nested = sanitized.get(nested_key)
+            if isinstance(nested, dict):
+                nested_copy = dict(nested)
+                for key in list(nested_copy.keys()):
+                    if "reasoning" in str(key).lower():
+                        nested_copy.pop(key, None)
+                sanitized[nested_key] = nested_copy
+        return sanitized
 
     async def _wait_for_global_rate_limit_window(self, base_url: str) -> None:
         while True:
@@ -461,6 +526,8 @@ class LLMClient:
             hostname = (urlparse(base_url).hostname or "").strip()
             if not hostname:
                 return False
+            if hostname in {"api.aicodemirror.com"}:
+                return True
             if hostname in {"localhost", "127.0.0.1"}:
                 return True
             ip = ipaddress.ip_address(hostname)
@@ -1064,7 +1131,7 @@ class LLMClient:
                 )
                 raise ValueError("LLM returned no choices")
 
-            content = choice.message.content or ""
+            content = self._extract_visible_content(choice.message)
             parsed_tool_calls = []
             if choice.message.tool_calls:
                 for tc in choice.message.tool_calls:
@@ -1075,7 +1142,7 @@ class LLMClient:
                         )
                     )
 
-            usage = response.usage.model_dump() if response.usage else None
+            usage = self._sanitize_usage(response.usage.model_dump() if response.usage else None)
 
             if not content and not parsed_tool_calls:
                 self._set_last_failure_metadata(
@@ -1173,10 +1240,13 @@ class LLMClient:
                     )
                     break
 
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content_parts.append(chunk.choices[0].delta.content)
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    delta_content = self._extract_visible_content(delta)
+                    if delta_content:
+                        content_parts.append(delta_content)
                 if chunk.usage:
-                    usage = chunk.usage.model_dump()
+                    usage = self._sanitize_usage(chunk.usage.model_dump())
 
                 elapsed = time.time() - start_time
                 if is_verbose() and elapsed - last_progress >= 1.0:

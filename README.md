@@ -17,6 +17,24 @@ cp .env.example .env
 python eval.py --seed 42 --verbose
 ```
 
+## Runtime Profiles
+
+Downstream integrations may now choose between two explicit episode runtime
+profiles:
+
+- `strict_eval`
+- `fast_collect`
+
+`strict_eval` is intended for upstream-compatible capability measurement.
+`fast_collect` is intended for accelerated candidate-trajectory generation. The
+runtime profile only changes episode execution behavior; final benchmark scoring
+should still come from a strict judge.
+
+See:
+
+- [docs/runtime-profiles.md](/home/xmyf/liveweb-arena/docs/runtime-profiles.md)
+- [docs/downstream-alignment.md](/home/xmyf/liveweb-arena/docs/downstream-alignment.md)
+
 ## Usage
 
 ```bash

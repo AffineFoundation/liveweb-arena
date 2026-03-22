@@ -246,9 +246,40 @@ class FunctionCallingProtocol(AgentProtocol):
     Models trained on this data can deploy with any tool-calling framework.
     """
 
-    def __init__(self, max_recent_steps: int = 5):
+    def __init__(
+        self,
+        max_recent_steps: int = 5,
+        prompt_profile: str | None = None,
+        strict_compat: bool = False,
+    ):
         self._max_recent_steps = max_recent_steps
+        self._prompt_profile = (prompt_profile or "").strip().lower() or None
+        self._strict_compat = strict_compat
         self._tools = self._build_tools()
+
+    def _extra_system_rules(self) -> str:
+        if self._prompt_profile != "gpt54_strict_domains":
+            return ""
+        return (
+            "## Model-Specific Rules\n\n"
+            "- Do not use Google Search, Google Finance, Yahoo Finance, CoinMarketCap, XE, TradingView, DuckDuckGo, MarketWatch, WSJ, CNBC, or Bloomberg.\n"
+            "- Go directly to the allowed domains for this task. If a page says 'Domain not allowed', immediately switch to an allowed domain.\n"
+            "- Never call stop with an empty answers object.\n"
+            "- When you call stop, every required answer tag must be present and mapped to a non-empty short string.\n"
+            "- If the current page already shows the requested value, extract it from the page and call stop. Do not browse elsewhere.\n"
+            "- For task2, solve the first subtask completely, then solve the second subtask. Do not replace allowed sites with general search.\n\n"
+        )
+
+    def _extra_step_rules(self) -> str:
+        if self._prompt_profile != "gpt54_strict_domains":
+            return ""
+        return (
+            "\nImportant reminders for this model:"
+            "\n- Never call stop with {\"answers\": {}}."
+            "\n- If you use stop, fill every answer tag with a non-empty short string."
+            "\n- Do not use Google, Yahoo, CoinMarketCap, XE, TradingView, or search engines."
+            "\n- If the answer is visible on the current allowed page, extract it now instead of browsing away."
+        )
 
     def _build_tools(self) -> List[dict]:
         """Build OpenAI-format tool definitions from BROWSER_ACTIONS."""
@@ -265,25 +296,23 @@ class FunctionCallingProtocol(AgentProtocol):
         return tools
 
     def build_system_prompt(self, task: CompositeTask) -> str:
+        hints = ""
+        if task.plugin_hints:
+            hints = "## Available Information Sources\n\n"
+            for _, usage_hint in task.plugin_hints.items():
+                hints += usage_hint + "\n\n"
         return (
             "You are a web automation agent that interacts with real websites to complete tasks.\n\n"
             "You have access to a browser and can navigate to any website to gather information.\n"
             "Use the provided tools to interact with the browser.\n\n"
-            "## Response Rules\n\n"
-            "- You must use OpenAI function calling / tool calls for every action.\n"
-            "- Do not output natural language explanations before or after a tool call.\n"
-            "- Do not output chain-of-thought, hidden reasoning, analysis, or planning text.\n"
-            "- Do not output <think>, </think>, <tool_call>, XML, markdown code fences, or raw JSON in message text.\n"
-            "- Your assistant message should contain only the tool call selected by the model.\n"
-            "- If you have enough information, call the stop tool immediately with the final answers.\n"
-            "- Never describe what you are about to do in text; just call the correct tool.\n\n"
+            f"{hints}"
             f"{task.combined_intent}\n\n"
+            f"{self._extra_system_rules()}"
             "## Tips\n\n"
             "- First analyze the task and decide which website to visit\n"
             "- Use the goto tool to navigate to the appropriate URL\n"
-            "- Only visit allowed domains\n"
-            "- Finish data collection for one subtask, then move on\n"
-            "- Keep responses action-only; no commentary\n"
+            "- Homepage/list data may be inaccurate. Always visit detail pages for precise values\n"
+            "- When done, use the stop tool with your answers\n"
         )
 
     def build_step_prompt(
@@ -305,10 +334,13 @@ class FunctionCallingProtocol(AgentProtocol):
             obs, trajectory, current_step, max_steps,
             self._max_recent_steps, format_step,
         )
+        if self._strict_compat:
+            return prompt + "\nWhat is your next action? Use one of the available tools."
         return (
             prompt
             + "\nWhat is your next action? Use one of the available tools."
             + "\nReturn only a tool call. Do not output any text explanation, <think> block, XML tag, markdown, or raw JSON."
+            + self._extra_step_rules()
         )
 
     def get_tools(self) -> List[dict]:
@@ -323,7 +355,7 @@ class FunctionCallingProtocol(AgentProtocol):
         - [tool_call: stop({...})]
         """
         parsed = self._parse_primary_tool_call(tool_calls)
-        if parsed is None and raw:
+        if parsed is None and raw and not self._strict_compat:
             parsed = self._parse_qwen_fallback(raw)
         if parsed is None:
             return None
@@ -338,6 +370,8 @@ class FunctionCallingProtocol(AgentProtocol):
         return BrowserAction(action_type=fn_name, params=params)
 
     def classify_format_failure(self, raw: str, tool_calls: Optional[List[Any]] = None) -> str:
+        if self._strict_compat:
+            return "none" if self._parse_primary_tool_call(tool_calls) is not None else "terminal"
         if self._parse_primary_tool_call(tool_calls) is not None:
             return "none"
         if raw and self._parse_qwen_fallback(raw) is not None:
@@ -388,6 +422,8 @@ class FunctionCallingProtocol(AgentProtocol):
                 )
         if self._parse_primary_tool_call(tool_calls) is not None:
             branch = "tool_calls"
+        elif self._strict_compat:
+            branch = "strict_unparsed"
         else:
             stripped = (raw or "").strip()
             if stripped:

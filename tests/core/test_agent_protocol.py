@@ -15,6 +15,34 @@ def protocol():
     return FunctionCallingProtocol()
 
 
+def test_gpt54_prompt_profile_adds_strict_system_rules():
+    from liveweb_arena.core.models import CompositeTask
+    from liveweb_arena.plugins.base import SubTask
+
+    task = CompositeTask(
+        subtasks=[SubTask(plugin_name="coingecko", intent="Example?", validation_info={}, answer_tag="answer1")],
+        combined_intent="## Tasks to Complete\n\n1. Example?\n   Answer tag: answer1\n\n## Output Requirements\n\nWhen you have completed all tasks, use the \"stop\" action with your answers in this JSON format:\n\n```json\n{\"answers\": {\"answer1\": \"...\"}}\n```",
+        plugin_hints={},
+        seed=1,
+    )
+    profile_protocol = FunctionCallingProtocol(prompt_profile="gpt54_strict_domains")
+    prompt = profile_protocol.build_system_prompt(task)
+    assert "Do not use Google Search, Google Finance, Yahoo Finance" in prompt
+    assert "Never call stop with an empty answers object." in prompt
+
+
+def test_gpt54_prompt_profile_adds_step_reminders():
+    obs = BrowserObservation(
+        url="https://www.coingecko.com/en/coins/optimism",
+        title="Optimism",
+        accessibility_tree="Circulating Supply 2,117,847,344",
+    )
+    profile_protocol = FunctionCallingProtocol(prompt_profile="gpt54_strict_domains")
+    prompt = profile_protocol.build_step_prompt(obs, [], current_step=2, max_steps=40)
+    assert 'Never call stop with {"answers": {}}.' in prompt
+    assert "Do not use Google, Yahoo, CoinMarketCap, XE, TradingView, or search engines." in prompt
+
+
 # ── get_tools ──────────────────────────────────────────────────────
 
 def test_get_tools_returns_all_actions(protocol):
@@ -118,6 +146,19 @@ def test_parse_qwen_tool_call_tag_fallback(protocol):
     assert action is not None
     assert action.action_type == "goto"
     assert action.params["url"] == "https://example.com"
+
+
+def test_strict_compat_protocol_does_not_accept_qwen_fallback_text():
+    protocol = FunctionCallingProtocol(strict_compat=True)
+    raw = """
+<think>
+</think>
+<tool_call>
+{"name":"goto","arguments":{"url":"https://example.com"}}
+</tool_call>
+"""
+    assert protocol.parse_response(raw, None) is None
+    assert protocol.classify_format_failure(raw, None) == "terminal"
 
 
 def test_parse_qwen_stop_fallback(protocol):

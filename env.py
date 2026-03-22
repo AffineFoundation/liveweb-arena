@@ -21,6 +21,14 @@ from liveweb_arena.core.interceptor import CacheInterceptor
 from liveweb_arena.core.models import BrowserObservation, CompositeTask, TrajectoryStep
 from liveweb_arena.core.reward import StepwiseRewardCalculator, RewardConfig, RewardBreakdown
 from liveweb_arena.core.reachability_audit import audit_reachability_failure
+from liveweb_arena.core.runtime_profiles import (
+    FAST_COLLECT_PROFILE,
+    STRICT_EVAL_PROFILE,
+    is_fast_collect_profile,
+    normalize_runtime_profile,
+    runtime_profile_to_behavior_mode,
+)
+from liveweb_arena.core.task_registry_loader import parse_task_id as parse_task_id_for_runtime
 from liveweb_arena.plugins.base import BasePlugin
 from liveweb_arena.plugins import get_all_plugins
 from liveweb_arena.core.validators.llm_validator import validate_answers_with_llm
@@ -77,7 +85,10 @@ def _maybe_promote_disallowed_domain_failure(
     allowed_domains: Set[str],
     failure_reason: str | None,
     reachability_audit,
+    mode: str = "eval",
 ) -> tuple[str | None, Any]:
+    if mode != "collect":
+        return failure_reason, reachability_audit
     if interceptor is None:
         return failure_reason, reachability_audit
     blocked = {}
@@ -216,6 +227,13 @@ class Actor:
         cache_dir: Optional[Path] = None,
         use_cache: bool = True,
         llm_router: Optional[MultiServerLLMRouter] = None,
+        llm_enable_thinking: Optional[bool] = None,
+        llm_separate_reasoning: Optional[bool] = None,
+        llm_reasoning_effort: Optional[str] = None,
+        llm_strip_reasoning_output: bool = False,
+        llm_prompt_profile: Optional[str] = None,
+        runtime_profile: Optional[str] = None,
+        behavior_mode: str = "eval",
     ):
         """
         Initialize Actor.
@@ -232,6 +250,13 @@ class Actor:
         self._lock = asyncio.Lock()
         self.use_cache = use_cache
         self.llm_router = llm_router
+        self.llm_enable_thinking = llm_enable_thinking
+        self.llm_separate_reasoning = llm_separate_reasoning
+        self.llm_reasoning_effort = llm_reasoning_effort
+        self.llm_strip_reasoning_output = llm_strip_reasoning_output
+        self.llm_prompt_profile = llm_prompt_profile
+        self.runtime_profile = normalize_runtime_profile(runtime_profile or behavior_mode)
+        self.behavior_mode = runtime_profile_to_behavior_mode(self.runtime_profile)
 
         # Episode storage for OpenEnv interface
         self._episodes: Dict[str, EpisodeState] = {}
@@ -316,6 +341,7 @@ class Actor:
         max_concurrency: int = 2,
         task_id: Optional[int] = None,
         mode: str = "eval",
+        runtime_profile: Optional[str] = None,
         route_key: Optional[str] = None,
     ) -> dict:
         """
@@ -343,8 +369,7 @@ class Actor:
 
         # Parse task_id to get templates and other config if not explicitly provided
         if task_id is not None and templates is None:
-            from liveweb_arena.core.task_registry import parse_task_id
-            task_config = parse_task_id(task_id)
+            task_config = parse_task_id_for_runtime(task_id, runtime_profile=runtime_profile or mode or self.runtime_profile)
             templates = task_config["templates"]
             # Use task_id's num_tasks if not explicitly provided
             if num_subtasks is None:
@@ -372,8 +397,10 @@ class Actor:
 
         async with self._semaphore:
             try:
-                effective_route_key = route_key or f"{mode}:task:{task_id or 'none'}:seed:{seed}"
-                if mode == "collect":
+                effective_runtime_profile = normalize_runtime_profile(runtime_profile or mode or self.runtime_profile)
+                effective_mode = runtime_profile_to_behavior_mode(effective_runtime_profile)
+                effective_route_key = route_key or f"{effective_mode}:task:{task_id or 'none'}:seed:{seed}"
+                if is_fast_collect_profile(effective_runtime_profile):
                     result = await self._run_collection(
                         model=model,
                         base_url=base_url,
@@ -385,6 +412,7 @@ class Actor:
                         timeout=timeout,
                         temperature=temperature,
                         task_id=task_id,
+                        runtime_profile=effective_runtime_profile,
                         route_key=effective_route_key,
                     )
                 else:
@@ -399,6 +427,7 @@ class Actor:
                         timeout=timeout,
                         temperature=temperature,
                         task_id=task_id,
+                        runtime_profile=effective_runtime_profile,
                         route_key=effective_route_key,
                     )
             except Exception as e:
@@ -436,12 +465,32 @@ class Actor:
                 route_key=route_key,
                 max_retries=max_retries,
                 strict_serial=strict_serial,
+                enable_thinking=self.llm_enable_thinking,
+                separate_reasoning=self.llm_separate_reasoning,
+                reasoning_effort=self.llm_reasoning_effort,
+                strip_reasoning_output=self.llm_strip_reasoning_output,
             )
         return LLMClient(
             base_url=base_url,
             api_key=api_key,
             max_retries=max_retries,
             strict_serial=strict_serial,
+            enable_thinking=self.llm_enable_thinking,
+            separate_reasoning=self.llm_separate_reasoning,
+            reasoning_effort=self.llm_reasoning_effort,
+            strip_reasoning_output=self.llm_strip_reasoning_output,
+        )
+
+    def _build_protocol(
+        self,
+        mode: Optional[str] = None,
+        runtime_profile: Optional[str] = None,
+    ) -> FunctionCallingProtocol:
+        effective_runtime_profile = normalize_runtime_profile(runtime_profile or mode or self.runtime_profile)
+        prompt_profile = self.llm_prompt_profile if is_fast_collect_profile(effective_runtime_profile) else None
+        return FunctionCallingProtocol(
+            prompt_profile=prompt_profile,
+            strict_compat=(effective_runtime_profile == STRICT_EVAL_PROFILE),
         )
 
     async def _run_agent_loop(
@@ -456,6 +505,8 @@ class Actor:
         temperature: float,
         seed: int,
         allowed_domains: Set[str],
+        runtime_profile: Optional[str] = None,
+        behavior_mode: Optional[str] = None,
         plugins_used: Optional[Dict[str, BasePlugin]] = None,
         enable_format_recovery: Optional[bool] = None,
         on_navigation=None,
@@ -467,6 +518,8 @@ class Actor:
             llm_client=llm_client,
             protocol=protocol,
             max_steps=max_steps,
+            runtime_profile=runtime_profile or behavior_mode or self.runtime_profile,
+            behavior_mode=behavior_mode or self.behavior_mode,
             enable_format_recovery=enable_format_recovery,
             on_navigation=on_navigation,
             on_observation=on_observation,
@@ -484,9 +537,18 @@ class Actor:
                 agent_loop.run(task=task, model=model, temperature=temperature, seed=seed),
                 timeout=timeout,
             )
-            if agent_loop.is_parse_failed():
+            if agent_loop.is_invalid_generated_url():
+                failure_reason = "invalid_generated_url"
+                log("Actor", "Invalid generated URL - marking as failed", force=True)
+            elif agent_loop.is_invalid_stop_payload():
+                failure_reason = "invalid_stop_payload"
+                log("Actor", "Invalid stop payload - marking as failed", force=True)
+            elif agent_loop.is_parse_failed():
                 failure_reason = "parse_failed"
                 log("Actor", "Parse failed - model output not valid JSON", force=True)
+            elif agent_loop.is_action_loop_detected():
+                failure_reason = "action_loop_detected"
+                log("Actor", "Detected repetitive action loop - marking as failed", force=True)
             elif agent_loop.is_max_steps_reached():
                 failure_reason = "max_steps_reached"
                 log("Actor", "Max steps reached without completion - marking as failed", force=True)
@@ -496,33 +558,18 @@ class Actor:
             log("Actor", error_message, force=True)
         except BrowserFatalError as e:
             is_required_domain = False
-            is_disallowed_domain = False
             plugin_name = None
             plugin = None
             navigation_metadata = session.get_last_navigation_metadata() if hasattr(session, "get_last_navigation_metadata") else None
-            action_stage = str((navigation_metadata or {}).get("navigation_stage") or "")
             if e.url:
                 for domain in allowed_domains:
                     if _url_matches_domain(e.url, domain):
                         is_required_domain = True
                         break
-                is_disallowed_domain = bool(allowed_domains) and not is_required_domain
                 plugin = _find_plugin_for_url(plugins_used, e.url)
                 plugin_name = getattr(plugin, "name", None) if plugin is not None else None
 
-            if is_disallowed_domain:
-                failure_reason = "disallowed_domain"
-                log("Actor", f"Disallowed domain navigation: {e.url}", force=True)
-                reachability_audit = audit_reachability_failure(
-                    url=e.url or "",
-                    plugin_name=plugin_name,
-                    plugin=plugin,
-                    exception=e,
-                    reason=str(e),
-                    allowed_domains=allowed_domains,
-                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
-                )
-            elif is_required_domain and not action_stage.startswith("action_"):
+            if is_required_domain:
                 failure_reason = "site_unreachable"
                 error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
                 log("Actor", f"Infrastructure error: {error_message}", force=True)
@@ -574,10 +621,7 @@ class Actor:
                         "interceptor": interceptor_metadata,
                     },
                 )
-                if reachability_audit and reachability_audit.classification == "model_disallowed_domain":
-                    failure_reason = "disallowed_domain"
-                    error_message = None
-                elif reachability_audit and reachability_audit.classification == "model_invalid_selector":
+                if reachability_audit and reachability_audit.classification == "model_invalid_selector":
                     failure_reason = "invalid_selector"
                     error_message = None
                 elif reachability_audit and reachability_audit.classification == "model_invalid_ui_target":
@@ -609,6 +653,7 @@ class Actor:
         timeout: int,
         temperature: float,
         task_id: Optional[int] = None,
+        runtime_profile: Optional[str] = None,
         route_key: Optional[str] = None,
     ) -> dict:
         """Internal evaluation logic."""
@@ -686,7 +731,7 @@ class Actor:
                     interceptor, cached_pages, plugins_used, gt_collector, obs, self.use_cache,
                 )
 
-            active_protocol = FunctionCallingProtocol()
+            active_protocol = self._build_protocol(runtime_profile=STRICT_EVAL_PROFILE)
             trajectory, final_answer, usage, failure_reason, error_message, agent_loop = await self._run_agent_loop(
                 task=task,
                 session=session,
@@ -699,17 +744,12 @@ class Actor:
                 temperature=temperature,
                 seed=seed,
                 allowed_domains=allowed_domains,
+                runtime_profile=STRICT_EVAL_PROFILE,
+                behavior_mode="eval",
                 on_navigation=on_navigation,
                 on_observation=on_observation,
             )
             reachability_audit = getattr(agent_loop, "_reachability_audit", None)
-            failure_reason, reachability_audit = _maybe_promote_disallowed_domain_failure(
-                interceptor=interceptor,
-                trajectory=trajectory,
-                allowed_domains=allowed_domains,
-                failure_reason=failure_reason,
-                reachability_audit=reachability_audit,
-            )
 
             # GT is collected in real-time via on_observation callback
             # For API_ONLY and HYBRID templates, fetch remaining API GT
@@ -807,15 +847,6 @@ class Actor:
                 total_score = 0.0
                 success = False
 
-            if not success and failure_reason in {None, "browser_error", "max_steps_reached", "parse_failed"}:
-                failure_reason, reachability_audit = _maybe_promote_disallowed_domain_failure(
-                    interceptor=interceptor,
-                    trajectory=trajectory,
-                    allowed_domains=allowed_domains,
-                    failure_reason=failure_reason,
-                    reachability_audit=reachability_audit,
-                )
-
             # Compute step-wise rewards from trajectory (post-hoc)
             reward_calc = StepwiseRewardCalculator(
                 target_assets=set(),
@@ -872,6 +903,7 @@ class Actor:
                     "usage": usage,
                     "answer_details": answer_validations,
                     "conversation": conversation,
+                    "runtime_profile": STRICT_EVAL_PROFILE,
                     "failure_reason": failure_reason,
                     "cache_stats": interceptor_stats,
                     "reachability_audit": reachability_audit.to_dict() if reachability_audit else None,
@@ -880,6 +912,7 @@ class Actor:
                     "is_environment_failure": reachability_audit.is_environment_failure if reachability_audit else False,
                     "is_model_hallucination": reachability_audit.is_model_hallucination if reachability_audit else False,
                     **agent_loop.get_format_recovery_stats(),
+                    **agent_loop.get_local_recovery_stats(),
                 },
                 "rewards": {
                     "step_rewards": step_rewards,
@@ -931,6 +964,7 @@ class Actor:
         timeout: int,
         temperature: float,
         task_id: Optional[int] = None,
+        runtime_profile: Optional[str] = None,
         route_key: Optional[str] = None,
     ) -> dict:
         await self._ensure_browser()
@@ -954,7 +988,7 @@ class Actor:
             session, interceptor = await self._setup_interceptor(
                 session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
             )
-            active_protocol = FunctionCallingProtocol()
+            active_protocol = self._build_protocol(runtime_profile=FAST_COLLECT_PROFILE)
             base_route_key = route_key or f"collect:task:{task_id or 'none'}:seed:{seed}"
             llm_client = self._build_llm_client(
                 base_url=base_url,
@@ -981,6 +1015,8 @@ class Actor:
                 temperature=temperature,
                 seed=seed,
                 allowed_domains=allowed_domains,
+                runtime_profile=FAST_COLLECT_PROFILE,
+                behavior_mode="collect",
                 on_navigation=on_navigation,
                 on_observation=None,
             )
@@ -991,6 +1027,7 @@ class Actor:
                 allowed_domains=allowed_domains,
                 failure_reason=failure_reason,
                 reachability_audit=reachability_audit,
+                mode="collect",
             )
 
             interceptor_stats = interceptor.get_stats()
@@ -1007,6 +1044,7 @@ class Actor:
                     "task_id": task_id,
                     "seed": seed,
                     "num_subtasks": num_subtasks,
+                    "runtime_profile": FAST_COLLECT_PROFILE,
                     "final_url": final_url,
                     "usage": usage,
                     "final_answer": final_answer,
@@ -1020,6 +1058,7 @@ class Actor:
                     "is_environment_failure": reachability_audit.is_environment_failure if reachability_audit else False,
                     "is_model_hallucination": reachability_audit.is_model_hallucination if reachability_audit else False,
                     **agent_loop.get_format_recovery_stats(),
+                    **agent_loop.get_local_recovery_stats(),
                 },
             }
             if error_message:
@@ -1095,8 +1134,7 @@ class Actor:
         templates = None
         num_subtasks = 2
         if task_id is not None:
-            from liveweb_arena.core.task_registry import parse_task_id
-            task_config = parse_task_id(task_id)
+            task_config = parse_task_id_for_runtime(task_id, runtime_profile=self.runtime_profile)
             templates = task_config["templates"]
             num_subtasks = task_config["num_tasks"]
             # Use variation_seed from task_id if seed was auto-generated
@@ -1179,7 +1217,7 @@ class Actor:
             )
 
             # Build agent protocol and system prompt
-            policy = FunctionCallingProtocol()
+            policy = self._build_protocol(mode="eval")
             system_prompt = policy.build_system_prompt(task)
 
             # Navigate to about:blank and get initial observation

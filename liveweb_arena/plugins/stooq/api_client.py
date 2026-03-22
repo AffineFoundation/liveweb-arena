@@ -396,12 +396,23 @@ def initialize_cache():
         logger.info("Stooq init: homepage cache valid (quick check)")
         return
 
-    # Acquire file lock — only one process fetches, others wait
+    strict_eval_mode = os.environ.get("LIVEWEB_RUNTIME_PROFILE", "").strip().lower() == "strict_eval"
+
+    # Acquire file lock — only one process fetches, others wait.
+    # In strict-eval, this warmup is only an optimization; if another worker is
+    # already warming the cache, skip instead of blocking the whole episode.
     lock_path = _get_file_cache_path().with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = open(lock_path, "w")
     try:
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)  # Blocking wait
+        lock_flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if strict_eval_mode else 0)
+        try:
+            fcntl.flock(fd.fileno(), lock_flags)
+        except BlockingIOError:
+            if strict_eval_mode:
+                logger.info("Stooq init: lock busy in strict-eval, skipping warmup")
+                return
+            raise
 
         # Re-check after acquiring lock — another process may have filled cache
         if _is_file_cache_valid():

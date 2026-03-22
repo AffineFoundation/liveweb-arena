@@ -9,8 +9,11 @@ from liveweb_arena.utils.llm_client import LLMClient, LLMResponse
 
 
 class _FakeResponseUsage:
+    def __init__(self, payload=None):
+        self._payload = payload or {"prompt_tokens": 10, "completion_tokens": 2}
+
     def model_dump(self):
-        return {"prompt_tokens": 10, "completion_tokens": 2}
+        return dict(self._payload)
 
 
 class _FakeToolCall:
@@ -20,8 +23,8 @@ class _FakeToolCall:
 
 
 class _FakeChoice:
-    def __init__(self, content: str = "", tool_calls=None):
-        self.message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
+    def __init__(self, content: str = "", tool_calls=None, reasoning_content=None):
+        self.message = SimpleNamespace(content=content, tool_calls=tool_calls or [], reasoning_content=reasoning_content)
         self.finish_reason = "stop"
 
 
@@ -213,6 +216,95 @@ async def test_chat_with_tools_uses_kimi_reasoning_enabled_false_when_thinking_d
 
 
 @pytest.mark.anyio
+async def test_chat_with_tools_uses_low_reasoning_effort_when_enabled(monkeypatch):
+    requests = []
+
+    def _factory(**kwargs):
+        return _FakeAsyncOpenAI(requests, **kwargs)
+
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.openai.AsyncOpenAI", _factory)
+
+    client = LLMClient(
+        base_url="https://api.aicodemirror.com/api/codex/backend-api/codex/v1",
+        api_key="k",
+        enable_thinking=True,
+        separate_reasoning=True,
+        reasoning_effort="low",
+        strip_reasoning_output=True,
+    )
+    await client.chat_with_tools(
+        system="system",
+        user="user",
+        model="gpt-5.4",
+        tools=[{"type": "function", "function": {"name": "goto", "parameters": {"type": "object"}}}],
+        temperature=0.0,
+        timeout_s=5,
+    )
+
+    payload = requests[0]
+    assert payload["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert payload["extra_body"]["separate_reasoning"] is True
+    assert payload["extra_body"]["reasoning"] == {"effort": "low"}
+
+
+@pytest.mark.anyio
+async def test_chat_with_tools_strips_reasoning_output_from_content_and_usage(monkeypatch):
+    requests = []
+
+    class _ReasoningOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=self)
+
+        async def create(self, **kwargs):
+            requests.append(kwargs)
+            return SimpleNamespace(
+                id=kwargs["extra_body"]["request_id"],
+                choices=[
+                    _FakeChoice(
+                        content=[
+                            {"type": "reasoning", "text": "hidden chain of thought"},
+                            {"type": "output_text", "text": "Visible answer"},
+                        ],
+                        tool_calls=[],
+                        reasoning_content="hidden chain of thought",
+                    )
+                ],
+                usage=_FakeResponseUsage(
+                    {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 4,
+                        "completion_tokens_details": {"reasoning_tokens": 9, "accepted_prediction_tokens": 0},
+                    }
+                ),
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("liveweb_arena.utils.llm_client.openai.AsyncOpenAI", _ReasoningOpenAI)
+
+    client = LLMClient(
+        base_url="https://api.aicodemirror.com/api/codex/backend-api/codex/v1",
+        api_key="k",
+        enable_thinking=True,
+        separate_reasoning=True,
+        reasoning_effort="low",
+        strip_reasoning_output=True,
+    )
+    response = await client.chat_with_tools(
+        system="system",
+        user="user",
+        model="gpt-5.4",
+        tools=None,
+        temperature=0.0,
+        timeout_s=5,
+    )
+
+    assert response.content == "Visible answer"
+    assert response.usage["completion_tokens_details"] == {"accepted_prediction_tokens": 0}
+
+
+@pytest.mark.anyio
 async def test_chat_with_tools_recovery_uses_stochastic_small_request(monkeypatch):
     requests = []
 
@@ -286,6 +378,7 @@ async def test_chat_with_tools_timeout_triggers_abort(monkeypatch):
         ("http://172.16.0.5:31050/v1", True),
         ("http://169.254.0.20:31050/v1", True),
         ("http://[::1]:31050/v1", True),
+        ("https://api.aicodemirror.com/api/codex/backend-api/codex/v1", True),
         ("https://api.openai.com/v1", False),
         ("https://example.com/v1", False),
     ],
@@ -311,9 +404,14 @@ def test_build_httpx_client_disables_trust_env_for_local_routes(monkeypatch):
         base_url="https://api.openai.com/v1",
         timeout=object(),
     )
+    client._build_httpx_client(
+        base_url="https://api.aicodemirror.com/api/codex/backend-api/codex/v1",
+        timeout=object(),
+    )
 
     assert built_clients[0]["trust_env"] is False
     assert built_clients[1]["trust_env"] is True
+    assert built_clients[2]["trust_env"] is False
 
 
 @pytest.mark.anyio
