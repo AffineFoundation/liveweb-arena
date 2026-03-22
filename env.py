@@ -1,6 +1,7 @@
 """LiveWeb Arena - Main evaluation entry point"""
 
 import asyncio
+import json
 import os
 import random
 import time
@@ -9,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from liveweb_arena.core.browser import BrowserEngine, BrowserSession
+from liveweb_arena.core.browser import BrowserEngine, BrowserSession, is_browser_transport_error
 from liveweb_arena.core.task_manager import TaskManager
 from liveweb_arena.core.agent_protocol import FunctionCallingProtocol
 from liveweb_arena.core.agent_loop import AgentLoop, BrowserFatalError
@@ -19,10 +20,19 @@ from liveweb_arena.core.cache import CacheManager, CachedPage, CacheFatalError, 
 from liveweb_arena.core.interceptor import CacheInterceptor
 from liveweb_arena.core.models import BrowserObservation, CompositeTask, TrajectoryStep
 from liveweb_arena.core.reward import StepwiseRewardCalculator, RewardConfig, RewardBreakdown
+from liveweb_arena.core.reachability_audit import audit_reachability_failure
+from liveweb_arena.core.runtime_profiles import (
+    FAST_COLLECT_PROFILE,
+    STRICT_EVAL_PROFILE,
+    is_fast_collect_profile,
+    normalize_runtime_profile,
+    runtime_profile_to_behavior_mode,
+)
+from liveweb_arena.core.task_registry_loader import parse_task_id as parse_task_id_for_runtime
 from liveweb_arena.plugins.base import BasePlugin
 from liveweb_arena.plugins import get_all_plugins
 from liveweb_arena.core.validators.llm_validator import validate_answers_with_llm
-from liveweb_arena.utils.llm_client import LLMClient, LLMFatalError
+from liveweb_arena.utils.llm_client import LLMClient, LLMFatalError, MultiServerLLMRouter
 from liveweb_arena.utils.logger import log
 from urllib.parse import urlparse
 
@@ -66,6 +76,52 @@ def _find_plugin_for_url(plugins_used: Dict[str, "BasePlugin"], url: str) -> Opt
         if hasattr(p, 'is_url_allowed') and p.is_url_allowed(url):
             return p
     return None
+
+
+def _maybe_promote_disallowed_domain_failure(
+    *,
+    interceptor,
+    trajectory: list,
+    allowed_domains: Set[str],
+    failure_reason: str | None,
+    reachability_audit,
+    mode: str = "eval",
+) -> tuple[str | None, Any]:
+    if mode != "collect":
+        return failure_reason, reachability_audit
+    if interceptor is None:
+        return failure_reason, reachability_audit
+    blocked = {}
+    if hasattr(interceptor, "get_last_blocked_document_metadata"):
+        blocked = interceptor.get_last_blocked_document_metadata()
+    blocked_url = blocked.get("blocked_url")
+    if not blocked_url:
+        return failure_reason, reachability_audit
+    if failure_reason in {"agent_timeout", "llm_error", "cache_error", "site_unreachable"}:
+        return failure_reason, reachability_audit
+
+    last_url = None
+    last_observation = None
+    if trajectory:
+        observation = getattr(trajectory[-1], "observation", None)
+        last_url = getattr(observation, "url", None)
+        last_observation = getattr(observation, "accessibility_tree", None)
+
+    blocked_marker = "Domain not allowed"
+    same_last_url = bool(last_url and normalize_url(last_url) == normalize_url(blocked_url))
+    blocked_page_visible = blocked_marker in str(last_observation or "")
+    if not same_last_url and not blocked_page_visible:
+        return failure_reason, reachability_audit
+
+    audit = audit_reachability_failure(
+        url=blocked_url,
+        plugin_name=None,
+        plugin=None,
+        reason="Domain not allowed",
+        allowed_domains=allowed_domains,
+        evidence={"interceptor": blocked},
+    )
+    return "disallowed_domain", audit
 
 
 async def _handle_navigation_event(interceptor, cached_pages, plugins_used, url, use_cache):
@@ -170,6 +226,14 @@ class Actor:
         api_key: str = None,
         cache_dir: Optional[Path] = None,
         use_cache: bool = True,
+        llm_router: Optional[MultiServerLLMRouter] = None,
+        llm_enable_thinking: Optional[bool] = None,
+        llm_separate_reasoning: Optional[bool] = None,
+        llm_reasoning_effort: Optional[str] = None,
+        llm_strip_reasoning_output: bool = False,
+        llm_prompt_profile: Optional[str] = None,
+        runtime_profile: Optional[str] = None,
+        behavior_mode: str = "eval",
     ):
         """
         Initialize Actor.
@@ -185,6 +249,14 @@ class Actor:
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._lock = asyncio.Lock()
         self.use_cache = use_cache
+        self.llm_router = llm_router
+        self.llm_enable_thinking = llm_enable_thinking
+        self.llm_separate_reasoning = llm_separate_reasoning
+        self.llm_reasoning_effort = llm_reasoning_effort
+        self.llm_strip_reasoning_output = llm_strip_reasoning_output
+        self.llm_prompt_profile = llm_prompt_profile
+        self.runtime_profile = normalize_runtime_profile(runtime_profile or behavior_mode)
+        self.behavior_mode = runtime_profile_to_behavior_mode(self.runtime_profile)
 
         # Episode storage for OpenEnv interface
         self._episodes: Dict[str, EpisodeState] = {}
@@ -196,7 +268,7 @@ class Actor:
             if env_cache_dir:
                 cache_dir = Path(env_cache_dir)
             else:
-                cache_dir = Path("/var/lib/liveweb-arena/cache")
+                cache_dir = Path(__file__).resolve().parent / ".cache" / "liveweb"
         self.cache_manager = CacheManager(cache_dir)
 
     def _collect_plugin_info(self, task: CompositeTask):
@@ -216,7 +288,10 @@ class Actor:
         return plugins_used, allowed_domains, list(set(blocked_patterns))
 
     async def _setup_interceptor(self, session, cached_pages, allowed_domains, blocked_patterns, plugins_used):
-        """Create and install CacheInterceptor. Returns interceptor."""
+        """Create and install CacheInterceptor. Returns (session, interceptor)."""
+        if hasattr(session, "set_allowed_domains"):
+            session.set_allowed_domains(allowed_domains)
+
         def url_validator(url):
             for p in plugins_used.values():
                 if hasattr(p, 'is_url_allowed') and p.is_url_allowed(url):
@@ -233,16 +308,29 @@ class Actor:
             plugin_resolver=plugin_resolver,
             offline=self.use_cache,
         )
-        if self.use_cache:
-            await session.set_cache_interceptor(interceptor)
-        if not self.use_cache and blocked_patterns:
-            await session.block_urls(blocked_patterns)
-        return interceptor
+        for attempt in range(2):
+            try:
+                if self.use_cache:
+                    await session.set_cache_interceptor(interceptor)
+                if not self.use_cache and blocked_patterns:
+                    await session.block_urls(blocked_patterns)
+                return session, interceptor
+            except Exception as exc:
+                if attempt == 0 and is_browser_transport_error(exc):
+                    log("Actor", f"Session setup hit browser transport error, rebuilding session: {exc}", force=True)
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
+                    await self._ensure_browser()
+                    session = await self.browser.new_session()
+                    continue
+                raise
 
     async def evaluate(
         self,
         model: str,
-        base_url: str,
+        base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         seed: Optional[int] = None,
         num_subtasks: Optional[int] = None,
@@ -252,6 +340,9 @@ class Actor:
         temperature: float = 0.7,
         max_concurrency: int = 2,
         task_id: Optional[int] = None,
+        mode: str = "eval",
+        runtime_profile: Optional[str] = None,
+        route_key: Optional[str] = None,
     ) -> dict:
         """
         Run a single evaluation.
@@ -268,6 +359,8 @@ class Actor:
             temperature: LLM temperature
             max_concurrency: Container-local concurrency limit
             task_id: Optional task ID for deterministic question type
+            mode: "eval" for scored evaluation, "collect" for lightweight trajectory collection
+            route_key: Optional key for sticky LLM routing
 
         Returns:
             Evaluation result dict with scores and metadata
@@ -276,8 +369,7 @@ class Actor:
 
         # Parse task_id to get templates and other config if not explicitly provided
         if task_id is not None and templates is None:
-            from liveweb_arena.core.task_registry import parse_task_id
-            task_config = parse_task_id(task_id)
+            task_config = parse_task_id_for_runtime(task_id, runtime_profile=runtime_profile or mode or self.runtime_profile)
             templates = task_config["templates"]
             # Use task_id's num_tasks if not explicitly provided
             if num_subtasks is None:
@@ -296,24 +388,48 @@ class Actor:
         # Allow per-call API key override
         current_api_key = api_key or self.api_key
 
+        if self.llm_router is None and not base_url:
+            raise ValueError("base_url is required when Actor is not configured with llm_router")
+
         # Initialize semaphore for concurrency control
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(max_concurrency)
 
         async with self._semaphore:
             try:
-                result = await self._run_evaluation(
-                    model=model,
-                    base_url=base_url,
-                    api_key=current_api_key,
-                    seed=seed,
-                    num_subtasks=num_subtasks,
-                    templates=templates,
-                    max_steps=max_steps,
-                    timeout=timeout,
-                    temperature=temperature,
-                    task_id=task_id,
-                )
+                effective_runtime_profile = normalize_runtime_profile(runtime_profile or mode or self.runtime_profile)
+                effective_mode = runtime_profile_to_behavior_mode(effective_runtime_profile)
+                effective_route_key = route_key or f"{effective_mode}:task:{task_id or 'none'}:seed:{seed}"
+                if is_fast_collect_profile(effective_runtime_profile):
+                    result = await self._run_collection(
+                        model=model,
+                        base_url=base_url,
+                        api_key=current_api_key,
+                        seed=seed,
+                        num_subtasks=num_subtasks,
+                        templates=templates,
+                        max_steps=max_steps,
+                        timeout=timeout,
+                        temperature=temperature,
+                        task_id=task_id,
+                        runtime_profile=effective_runtime_profile,
+                        route_key=effective_route_key,
+                    )
+                else:
+                    result = await self._run_evaluation(
+                        model=model,
+                        base_url=base_url,
+                        api_key=current_api_key,
+                        seed=seed,
+                        num_subtasks=num_subtasks,
+                        templates=templates,
+                        max_steps=max_steps,
+                        timeout=timeout,
+                        temperature=temperature,
+                        task_id=task_id,
+                        runtime_profile=effective_runtime_profile,
+                        route_key=effective_route_key,
+                    )
             except Exception as e:
                 import traceback
                 result = {
@@ -333,10 +449,202 @@ class Actor:
         result["time_taken"] = time.time() - start_time
         return result
 
+    def _build_llm_client(
+        self,
+        base_url: Optional[str],
+        api_key: str,
+        route_key: str,
+        *,
+        max_retries: Optional[int] = None,
+        strict_serial: bool = False,
+    ) -> LLMClient:
+        if self.llm_router is not None:
+            return LLMClient(
+                api_key=api_key,
+                router=self.llm_router,
+                route_key=route_key,
+                max_retries=max_retries,
+                strict_serial=strict_serial,
+                enable_thinking=self.llm_enable_thinking,
+                separate_reasoning=self.llm_separate_reasoning,
+                reasoning_effort=self.llm_reasoning_effort,
+                strip_reasoning_output=self.llm_strip_reasoning_output,
+            )
+        return LLMClient(
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=max_retries,
+            strict_serial=strict_serial,
+            enable_thinking=self.llm_enable_thinking,
+            separate_reasoning=self.llm_separate_reasoning,
+            reasoning_effort=self.llm_reasoning_effort,
+            strip_reasoning_output=self.llm_strip_reasoning_output,
+        )
+
+    def _build_protocol(
+        self,
+        mode: Optional[str] = None,
+        runtime_profile: Optional[str] = None,
+    ) -> FunctionCallingProtocol:
+        effective_runtime_profile = normalize_runtime_profile(runtime_profile or mode or self.runtime_profile)
+        prompt_profile = self.llm_prompt_profile if is_fast_collect_profile(effective_runtime_profile) else None
+        return FunctionCallingProtocol(
+            prompt_profile=prompt_profile,
+            strict_compat=(effective_runtime_profile == STRICT_EVAL_PROFILE),
+        )
+
+    async def _run_agent_loop(
+        self,
+        task: CompositeTask,
+        session,
+        llm_client: LLMClient,
+        protocol,
+        model: str,
+        max_steps: int,
+        timeout: int,
+        temperature: float,
+        seed: int,
+        allowed_domains: Set[str],
+        runtime_profile: Optional[str] = None,
+        behavior_mode: Optional[str] = None,
+        plugins_used: Optional[Dict[str, BasePlugin]] = None,
+        enable_format_recovery: Optional[bool] = None,
+        on_navigation=None,
+        on_observation=None,
+    ):
+        plugins_used = plugins_used or {}
+        agent_loop = AgentLoop(
+            session=session,
+            llm_client=llm_client,
+            protocol=protocol,
+            max_steps=max_steps,
+            runtime_profile=runtime_profile or behavior_mode or self.runtime_profile,
+            behavior_mode=behavior_mode or self.behavior_mode,
+            enable_format_recovery=enable_format_recovery,
+            on_navigation=on_navigation,
+            on_observation=on_observation,
+        )
+
+        failure_reason = None
+        error_message = None
+        fatal_error_map = {
+            LLMFatalError: "llm_error",
+            CacheFatalError: "cache_error",
+        }
+
+        try:
+            trajectory, final_answer, usage = await asyncio.wait_for(
+                agent_loop.run(task=task, model=model, temperature=temperature, seed=seed),
+                timeout=timeout,
+            )
+            if agent_loop.is_invalid_generated_url():
+                failure_reason = "invalid_generated_url"
+                log("Actor", "Invalid generated URL - marking as failed", force=True)
+            elif agent_loop.is_invalid_stop_payload():
+                failure_reason = "invalid_stop_payload"
+                log("Actor", "Invalid stop payload - marking as failed", force=True)
+            elif agent_loop.is_parse_failed():
+                failure_reason = "parse_failed"
+                log("Actor", "Parse failed - model output not valid JSON", force=True)
+            elif agent_loop.is_action_loop_detected():
+                failure_reason = "action_loop_detected"
+                log("Actor", "Detected repetitive action loop - marking as failed", force=True)
+            elif agent_loop.is_max_steps_reached():
+                failure_reason = "max_steps_reached"
+                log("Actor", "Max steps reached without completion - marking as failed", force=True)
+        except asyncio.TimeoutError:
+            failure_reason = "agent_timeout"
+            error_message = f"Agent timeout after {timeout}s"
+            log("Actor", error_message, force=True)
+        except BrowserFatalError as e:
+            is_required_domain = False
+            plugin_name = None
+            plugin = None
+            navigation_metadata = session.get_last_navigation_metadata() if hasattr(session, "get_last_navigation_metadata") else None
+            if e.url:
+                for domain in allowed_domains:
+                    if _url_matches_domain(e.url, domain):
+                        is_required_domain = True
+                        break
+                plugin = _find_plugin_for_url(plugins_used, e.url)
+                plugin_name = getattr(plugin, "name", None) if plugin is not None else None
+
+            if is_required_domain:
+                failure_reason = "site_unreachable"
+                error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
+                log("Actor", f"Infrastructure error: {error_message}", force=True)
+                reachability_audit = audit_reachability_failure(
+                    url=e.url or "",
+                    plugin_name=plugin_name,
+                    plugin=plugin,
+                    exception=e,
+                    reason=error_message,
+                    allowed_domains=allowed_domains,
+                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
+                )
+            else:
+                failure_reason = "browser_error"
+                log("Actor", f"Browser error (agent issue): {e}", force=True)
+                reachability_audit = audit_reachability_failure(
+                    url=e.url or "",
+                    plugin_name=plugin_name,
+                    plugin=plugin,
+                    exception=e,
+                    reason=str(e),
+                    allowed_domains=allowed_domains,
+                    evidence={"attempts": e.attempts, "navigation_metadata": navigation_metadata or {}},
+                )
+                if reachability_audit and reachability_audit.classification == "model_invalid_selector":
+                    failure_reason = "invalid_selector"
+                elif reachability_audit and reachability_audit.classification == "model_invalid_ui_target":
+                    failure_reason = "invalid_ui_target"
+        except (LLMFatalError, CacheFatalError) as e:
+            failure_reason = fatal_error_map[type(e)]
+            error_message = f"{failure_reason}: {e}"
+            log("Actor", f"Fatal error - {error_message}", force=True)
+            reachability_audit = None
+            if isinstance(e, CacheFatalError) and getattr(e, "url", None):
+                plugin = _find_plugin_for_url(plugins_used, e.url)
+                interceptor_metadata = {}
+                if "interceptor" in (getattr(e, "evidence", {}) or {}):
+                    interceptor_metadata = (e.evidence or {}).get("interceptor") or {}
+                reachability_audit = audit_reachability_failure(
+                    url=e.url,
+                    plugin_name=getattr(plugin, "name", None) if plugin is not None else None,
+                    plugin=plugin,
+                    exception=e,
+                    reason=error_message,
+                    allowed_domains=allowed_domains,
+                    http_status=getattr(e, "status_code", None),
+                    evidence={
+                        **(getattr(e, "evidence", {}) or {}),
+                        "interceptor": interceptor_metadata,
+                    },
+                )
+                if reachability_audit and reachability_audit.classification == "model_invalid_selector":
+                    failure_reason = "invalid_selector"
+                    error_message = None
+                elif reachability_audit and reachability_audit.classification == "model_invalid_ui_target":
+                    failure_reason = "invalid_ui_target"
+                    error_message = None
+        else:
+            reachability_audit = None
+
+        setattr(agent_loop, "_reachability_audit", reachability_audit)
+        if reachability_audit:
+            log("ReachabilityAudit", json.dumps(reachability_audit.to_dict(), ensure_ascii=False), force=True)
+
+        if failure_reason and failure_reason not in ("max_steps_reached", "parse_failed"):
+            trajectory = agent_loop.get_trajectory()
+            final_answer = agent_loop.get_final_answer()
+            usage = agent_loop.get_usage()
+
+        return trajectory, final_answer, usage, failure_reason, error_message, agent_loop
+
     async def _run_evaluation(
         self,
         model: str,
-        base_url: str,
+        base_url: Optional[str],
         api_key: str,
         seed: int,
         num_subtasks: int,
@@ -345,6 +653,8 @@ class Actor:
         timeout: int,
         temperature: float,
         task_id: Optional[int] = None,
+        runtime_profile: Optional[str] = None,
+        route_key: Optional[str] = None,
     ) -> dict:
         """Internal evaluation logic."""
         await self._ensure_browser()
@@ -389,11 +699,18 @@ class Actor:
             session = await self.browser.new_session()
 
             # Set up interceptor
-            interceptor = await self._setup_interceptor(
+            session, interceptor = await self._setup_interceptor(
                 session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
             )
 
-            llm_client = LLMClient(base_url=base_url, api_key=api_key)
+            base_route_key = route_key or f"eval:task:{task_id or 'none'}:seed:{seed}"
+            agent_llm_client = self._build_llm_client(
+                base_url=base_url,
+                api_key=api_key,
+                route_key=f"{base_route_key}:agent",
+                max_retries=1,
+                strict_serial=True,
+            )
 
             # Initialize unified GT collector
             gt_collector = GTCollector(
@@ -414,73 +731,25 @@ class Actor:
                     interceptor, cached_pages, plugins_used, gt_collector, obs, self.use_cache,
                 )
 
-            active_protocol = FunctionCallingProtocol()
-            agent_loop = AgentLoop(
+            active_protocol = self._build_protocol(runtime_profile=STRICT_EVAL_PROFILE)
+            trajectory, final_answer, usage, failure_reason, error_message, agent_loop = await self._run_agent_loop(
+                task=task,
                 session=session,
-                llm_client=llm_client,
+                plugins_used=plugins_used,
+                llm_client=agent_llm_client,
                 protocol=active_protocol,
+                model=model,
                 max_steps=effective_max_steps,
+                timeout=timeout,
+                temperature=temperature,
+                seed=seed,
+                allowed_domains=allowed_domains,
+                runtime_profile=STRICT_EVAL_PROFILE,
+                behavior_mode="eval",
                 on_navigation=on_navigation,
                 on_observation=on_observation,
             )
-
-            # Failure tracking:
-            #   failure_reason: what happened (always set on failure, goes into extra)
-            #   error_message: set = evaluation is INVALID (mechanism issue, not agent capability)
-            #     Valid failures (no error_message): max_steps_reached
-            #     Invalid failures (error_message set): llm_error, browser_error, cache_error, agent_timeout, gt_failure
-            failure_reason = None
-            error_message = None
-
-            # Fatal errors that invalidate evaluation (system issues, not agent capability)
-            _FATAL_ERROR_MAP = {
-                LLMFatalError: "llm_error",
-                CacheFatalError: "cache_error",
-            }
-
-            try:
-                trajectory, final_answer, usage = await asyncio.wait_for(
-                    agent_loop.run(task=task, model=model, temperature=temperature, seed=seed),
-                    timeout=timeout,
-                )
-                if agent_loop.is_parse_failed():
-                    failure_reason = "parse_failed"
-                    log("Actor", "Parse failed - model output not valid JSON", force=True)
-                elif agent_loop.is_max_steps_reached():
-                    failure_reason = "max_steps_reached"
-                    log("Actor", "Max steps reached without completion - marking as failed", force=True)
-            except asyncio.TimeoutError:
-                failure_reason = "agent_timeout"
-                error_message = f"Agent timeout after {timeout}s"
-                log("Actor", error_message, force=True)
-            except BrowserFatalError as e:
-                # Check if the failed URL belongs to a required domain
-                # If so, it's an infrastructure issue (site unreachable), not agent error
-                is_required_domain = False
-                if e.url:
-                    for domain in allowed_domains:
-                        if _url_matches_domain(e.url, domain):
-                            is_required_domain = True
-                            break
-
-                if is_required_domain:
-                    failure_reason = "site_unreachable"
-                    error_message = f"Required site unreachable: {e.url} (after {e.attempts} attempts)"
-                    log("Actor", f"Infrastructure error: {error_message}", force=True)
-                else:
-                    failure_reason = "browser_error"
-                    log("Actor", f"Browser error (agent issue): {e}", force=True)
-            except (LLMFatalError, CacheFatalError) as e:
-                failure_reason = _FATAL_ERROR_MAP[type(e)]
-                error_message = f"{failure_reason}: {e}"
-                log("Actor", f"Fatal error - {error_message}", force=True)
-
-            # Exception path: recover partial state from agent loop
-            # (parse_failed and max_steps_reached are normal exits, not exceptions)
-            if failure_reason and failure_reason not in ("max_steps_reached", "parse_failed"):
-                trajectory = agent_loop.get_trajectory()
-                final_answer = agent_loop.get_final_answer()
-                usage = agent_loop.get_usage()
+            reachability_audit = getattr(agent_loop, "_reachability_audit", None)
 
             # GT is collected in real-time via on_observation callback
             # For API_ONLY and HYBRID templates, fetch remaining API GT
@@ -546,8 +815,13 @@ class Actor:
             answer_validations = pre_failed_validations.copy()
 
             if subtasks_to_validate:
+                validator_llm_client = self._build_llm_client(
+                    base_url=base_url,
+                    api_key=api_key,
+                    route_key=f"{base_route_key}:validator",
+                )
                 llm_validations = await validate_answers_with_llm(
-                    llm_client=llm_client,
+                    llm_client=validator_llm_client,
                     subtasks=subtasks_to_validate,
                     answers=parsed_answers,
                     ground_truths=ground_truths,
@@ -629,8 +903,16 @@ class Actor:
                     "usage": usage,
                     "answer_details": answer_validations,
                     "conversation": conversation,
+                    "runtime_profile": STRICT_EVAL_PROFILE,
                     "failure_reason": failure_reason,
                     "cache_stats": interceptor_stats,
+                    "reachability_audit": reachability_audit.to_dict() if reachability_audit else None,
+                    "reachability_classification": reachability_audit.classification if reachability_audit else None,
+                    "reachability_layer": reachability_audit.layer if reachability_audit else None,
+                    "is_environment_failure": reachability_audit.is_environment_failure if reachability_audit else False,
+                    "is_model_hallucination": reachability_audit.is_model_hallucination if reachability_audit else False,
+                    **agent_loop.get_format_recovery_stats(),
+                    **agent_loop.get_local_recovery_stats(),
                 },
                 "rewards": {
                     "step_rewards": step_rewards,
@@ -670,12 +952,131 @@ class Actor:
             if session is not None:
                 await session.close()
 
+    async def _run_collection(
+        self,
+        model: str,
+        base_url: Optional[str],
+        api_key: str,
+        seed: int,
+        num_subtasks: int,
+        templates: Optional[List[tuple]],
+        max_steps: Optional[int],
+        timeout: int,
+        temperature: float,
+        task_id: Optional[int] = None,
+        runtime_profile: Optional[str] = None,
+        route_key: Optional[str] = None,
+    ) -> dict:
+        await self._ensure_browser()
+
+        task = await self.task_manager.generate_composite_task(
+            seed=seed,
+            num_subtasks=num_subtasks,
+            templates=templates,
+        )
+        log("Actor", f"[collect] Generated {len(task.subtasks)} subtasks, seed={seed}")
+
+        total_expected_steps = sum(st.expected_steps for st in task.subtasks)
+        effective_max_steps = max(max_steps or 0, total_expected_steps) if max_steps is not None else total_expected_steps
+        plugins_used, allowed_domains, blocked_patterns = self._collect_plugin_info(task)
+        cached_pages: Dict[str, CachedPage] = {}
+
+        session = None
+        interceptor = None
+        try:
+            session = await self.browser.new_session()
+            session, interceptor = await self._setup_interceptor(
+                session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
+            )
+            active_protocol = self._build_protocol(runtime_profile=FAST_COLLECT_PROFILE)
+            base_route_key = route_key or f"collect:task:{task_id or 'none'}:seed:{seed}"
+            llm_client = self._build_llm_client(
+                base_url=base_url,
+                api_key=api_key,
+                route_key=f"{base_route_key}:agent",
+                max_retries=1,
+                strict_serial=True,
+            )
+
+            async def on_navigation(url: str):
+                await _handle_navigation_event(
+                    interceptor, cached_pages, plugins_used, url, self.use_cache,
+                )
+
+            trajectory, final_answer, usage, failure_reason, error_message, agent_loop = await self._run_agent_loop(
+                task=task,
+                session=session,
+                plugins_used=plugins_used,
+                llm_client=llm_client,
+                protocol=active_protocol,
+                model=model,
+                max_steps=effective_max_steps,
+                timeout=timeout,
+                temperature=temperature,
+                seed=seed,
+                allowed_domains=allowed_domains,
+                runtime_profile=FAST_COLLECT_PROFILE,
+                behavior_mode="collect",
+                on_navigation=on_navigation,
+                on_observation=None,
+            )
+            reachability_audit = getattr(agent_loop, "_reachability_audit", None)
+            failure_reason, reachability_audit = _maybe_promote_disallowed_domain_failure(
+                interceptor=interceptor,
+                trajectory=trajectory,
+                allowed_domains=allowed_domains,
+                failure_reason=failure_reason,
+                reachability_audit=reachability_audit,
+                mode="collect",
+            )
+
+            interceptor_stats = interceptor.get_stats()
+            final_url = trajectory[-1].observation.url if trajectory else None
+            conversation = self._build_conversation(task, trajectory, active_protocol)
+
+            result = {
+                "task_name": f"liveweb_arena_collect:{num_subtasks}tasks",
+                "score": 0.0,
+                "success": final_answer is not None and failure_reason is None,
+                "time_taken": 0.0,
+                "extra": {
+                    "mode": "collect",
+                    "task_id": task_id,
+                    "seed": seed,
+                    "num_subtasks": num_subtasks,
+                    "runtime_profile": FAST_COLLECT_PROFILE,
+                    "final_url": final_url,
+                    "usage": usage,
+                    "final_answer": final_answer,
+                    "conversation": conversation,
+                    "failure_reason": failure_reason,
+                    "cache_stats": interceptor_stats,
+                    "trajectory_steps": len(trajectory),
+                    "reachability_audit": reachability_audit.to_dict() if reachability_audit else None,
+                    "reachability_classification": reachability_audit.classification if reachability_audit else None,
+                    "reachability_layer": reachability_audit.layer if reachability_audit else None,
+                    "is_environment_failure": reachability_audit.is_environment_failure if reachability_audit else False,
+                    "is_model_hallucination": reachability_audit.is_model_hallucination if reachability_audit else False,
+                    **agent_loop.get_format_recovery_stats(),
+                    **agent_loop.get_local_recovery_stats(),
+                },
+            }
+            if error_message:
+                result["error"] = error_message
+            return result
+        finally:
+            if interceptor is not None:
+                interceptor.cleanup()
+            cached_pages.clear()
+            if session is not None:
+                await session.close()
+
     async def _ensure_browser(self):
-        """Ensure browser is started (lazy initialization)."""
+        """Ensure browser is started and healthy."""
         async with self._lock:
             if self.browser is None:
                 self.browser = BrowserEngine(headless=True)
-                await self.browser.start()
+            await self.browser.ensure_healthy()
 
     async def shutdown(self):
         """Shutdown browser, cache manager, and cleanup resources."""
@@ -733,8 +1134,7 @@ class Actor:
         templates = None
         num_subtasks = 2
         if task_id is not None:
-            from liveweb_arena.core.task_registry import parse_task_id
-            task_config = parse_task_id(task_id)
+            task_config = parse_task_id_for_runtime(task_id, runtime_profile=self.runtime_profile)
             templates = task_config["templates"]
             num_subtasks = task_config["num_tasks"]
             # Use variation_seed from task_id if seed was auto-generated
@@ -777,7 +1177,7 @@ class Actor:
             session = await self.browser.new_session()
 
             # Set up interceptor
-            interceptor = await self._setup_interceptor(
+            session, interceptor = await self._setup_interceptor(
                 session, cached_pages, allowed_domains, blocked_patterns, plugins_used,
             )
 
@@ -817,7 +1217,7 @@ class Actor:
             )
 
             # Build agent protocol and system prompt
-            policy = FunctionCallingProtocol()
+            policy = self._build_protocol(mode="eval")
             system_prompt = policy.build_system_prompt(task)
 
             # Navigate to about:blank and get initial observation

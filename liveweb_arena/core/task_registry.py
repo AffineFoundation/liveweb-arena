@@ -140,6 +140,19 @@ class TaskRegistry:
         81: ("openlibrary", "openlibrary_subject_multi_condition"),
         82: ("openlibrary", "openlibrary_book_comparison"),
         84: ("openlibrary", "openlibrary_author_editions"),
+
+        # Open Meteo templates
+        85: ("openmeteo", "openmeteo_current"),
+        86: ("openmeteo", "openmeteo_comparison"),
+        87: ("openmeteo", "openmeteo_hourly_extrema"),
+        88: ("openmeteo", "openmeteo_forecast_trend"),
+
+        # ArXiv templates
+        90: ("arxiv", "arxiv_paper_info"),
+        91: ("arxiv", "arxiv_author_extrema"),
+        92: ("arxiv", "arxiv_category_comparison"),
+        94: ("arxiv", "arxiv_multi_author_filter"),
+        95: ("arxiv", "arxiv_title_length_extrema"),
     }
 
     # Template versions - each version's combinations come AFTER all previous versions
@@ -164,6 +177,10 @@ class TaskRegistry:
         [80, 81],
         # Version 4: Additional Open Library templates
         [82, 84],
+        # Version 5: Open Meteo templates
+        [85, 86, 87, 88],
+        # Version 6: ArXiv templates
+        [90, 91, 92, 94, 95],
     ]
 
     # Combination registry: list of template ID tuples
@@ -251,7 +268,7 @@ class TaskRegistry:
             - template_ids: Tuple of template IDs in this combination
             - templates: List of (plugin, template_name) tuples
             - variation_seed: Seed for variation within this combination
-            - num_tasks: Number of sub-tasks (3-5)
+            - num_tasks: Number of sub-tasks (1-4)
 
         Raises:
             ValueError: If task_id is out of valid range
@@ -273,7 +290,7 @@ class TaskRegistry:
         template_ids = cls._combinations[combo_index]
         templates = [cls.TEMPLATES[tid] for tid in template_ids]
 
-        num_tasks = (variation_seed % 3) + 2
+        num_tasks = (variation_seed % 4) + 1
 
         return {
             "task_id": task_id,

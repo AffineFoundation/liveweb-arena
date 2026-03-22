@@ -20,6 +20,29 @@ def _interceptor(cached=None, domains=None, blocked=None, url_validator=None, of
     )
 
 
+class _FakeRequest:
+    def __init__(self, url: str, resource_type: str = "document"):
+        self.url = url
+        self.resource_type = resource_type
+
+
+class _FakeRoute:
+    def __init__(self, url: str, resource_type: str = "document"):
+        self.request = _FakeRequest(url, resource_type)
+        self.fulfilled = None
+        self.aborted = None
+        self.continued = False
+
+    async def fulfill(self, **kwargs):
+        self.fulfilled = kwargs
+
+    async def abort(self, error_code):
+        self.aborted = error_code
+
+    async def continue_(self):
+        self.continued = True
+
+
 # ── _should_block ──────────────────────────────────────────────────
 
 class TestShouldBlock:
@@ -70,6 +93,34 @@ class TestDomainAllowed:
         assert i._is_domain_allowed("http://localhost:8080/api")
 
 
+class TestSoftFailPolicy:
+    def test_soft_fail_url_pattern(self, monkeypatch):
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_DOMAINS", "")
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_URL_PATTERNS", "news.ycombinator.com/ask")
+        i = _interceptor()
+        assert i._should_soft_fail_domain("https://news.ycombinator.com/ask")
+        assert not i._should_soft_fail_domain("https://news.ycombinator.com/newest")
+
+    def test_required_soft_regex_policy(self, monkeypatch):
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_DOMAINS", "")
+        monkeypatch.setenv("LIVEWEB_SOFT_FAIL_URL_PATTERNS", "")
+        monkeypatch.setenv("LIVEWEB_REQUIRED_SOFT_URL_REGEXES", r"^news\.ycombinator\.com/?$,^news\.ycombinator\.com/(ask|show)(?:[/?].*)?$")
+        monkeypatch.setenv("LIVEWEB_PREFETCH_SOFT_URL_REGEXES", r"^channelsurfer\.tv(?:/.*)?$")
+        i = _interceptor()
+        assert i._soft_fail_policy("https://news.ycombinator.com/") == "required_soft"
+        assert i._soft_fail_policy("https://news.ycombinator.com/ask") == "required_soft"
+        assert i._soft_fail_policy("https://channelsurfer.tv/") == "prefetch_soft"
+        assert i._soft_fail_policy("https://news.ycombinator.com/newest") is None
+
+    def test_default_soft_fail_domains_cover_high_noise_sites(self, monkeypatch):
+        monkeypatch.delenv("LIVEWEB_SOFT_FAIL_DOMAINS", raising=False)
+        monkeypatch.delenv("LIVEWEB_PREFETCH_SOFT_URL_REGEXES", raising=False)
+        i = _interceptor()
+        assert i._should_soft_fail_domain("https://www.taostats.io/subnets")
+        assert i._should_soft_fail_domain("https://www.coingecko.com/en/coins/bitcoin")
+        assert i._should_soft_fail_domain("https://www.stooq.com/q/currency/usd-eur")
+
+
 # ── _find_cached_page ─────────────────────────────────────────────
 
 class TestFindCachedPage:
@@ -97,6 +148,18 @@ class TestFindCachedPage:
         page = CachedPage(url=url, html="<h1>BTC</h1>", api_data=None, fetched_at=1.0, need_api=True)
         i = _interceptor(cached={normalize_url(url): page})
         assert i._find_cached_page(url) is None
+
+    def test_find_any_cached_page_allows_stale_html_fallback(self):
+        url = "https://www.taostats.io/subnets"
+        page = CachedPage(url=url, html="<h1>Subnets</h1>", api_data=None, fetched_at=1.0, need_api=True)
+        i = _interceptor(cached={normalize_url(url): page})
+        assert i._find_any_cached_page(url) is page
+
+    def test_prefetch_timeout_for_high_noise_domains(self):
+        i = _interceptor()
+        assert i._prefetch_timeout_for_url("https://www.coingecko.com/en/coins/bitcoin", need_api=True) >= 35
+        assert i._prefetch_timeout_for_url("https://www.taostats.io/subnets", need_api=True) >= 35
+        assert i._prefetch_timeout_for_url("https://www.stooq.com/q/currency/usd-eur", need_api=False) >= 16
 
 
 # ── InterceptorStats ───────────────────────────────────────────────
@@ -138,6 +201,32 @@ class TestErrorManagement:
         i._pending_error = ValueError("bad")
         with pytest.raises(CacheFatalError):
             i.raise_if_error("https://x.com")
+
+    def test_error_metadata_roundtrip(self):
+        i = _interceptor()
+        i._last_error_metadata = {"classification": "env_prefetch_timeout", "soft_fail_triggered": True}
+        assert i.get_and_clear_error_metadata() == {
+            "classification": "env_prefetch_timeout",
+            "soft_fail_triggered": True,
+        }
+        assert i.get_and_clear_error_metadata() == {}
+
+
+@pytest.mark.anyio
+async def test_disallowed_document_navigation_stores_structured_metadata():
+    interceptor = _interceptor(domains={"coingecko.com"})
+    route = _FakeRoute("https://finance.yahoo.com/quote/AAPL/")
+
+    await interceptor.handle_route(route)
+
+    assert route.fulfilled is not None
+    assert route.fulfilled["status"] == 403
+    metadata = interceptor.get_last_blocked_document_metadata()
+    assert metadata["classification"] == "model_disallowed_domain"
+    assert metadata["blocked_domain"] == "finance.yahoo.com"
+    assert metadata["allowed_domains"] == ["coingecko.com"]
+    assert metadata["blocked_resource_type"] == "document"
+    assert metadata["blocked_by"] == "interceptor"
 
 
 # ── Accessibility tree cache ───────────────────────────────────────

@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from liveweb_arena.plugins.base_client import RateLimiter
+from liveweb_arena.plugins.base_client import APIFetchError, RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,19 @@ _rate_limited: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _negative_cache: contextvars.ContextVar[Optional[set]] = contextvars.ContextVar(
     "_stooq_negative_cache", default=None
 )
+_last_failure_metadata: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "_stooq_last_failure_metadata", default=None
+)
+_STOOQ_HTTP_TIMEOUT_S = float(os.environ.get("LIVEWEB_STOOQ_HTTP_TIMEOUT_S", "45"))
+
+
+def _get_plugin_cache_root() -> Path:
+    return Path(
+        os.environ.get(
+            "LIVEWEB_SHARED_PLUGIN_CACHE_DIR",
+            str(Path(__file__).resolve().parents[3] / ".cache" / "plugin-cache"),
+        )
+    )
 
 
 def _get_negative_cache() -> set:
@@ -44,9 +57,44 @@ def _get_negative_cache() -> set:
     return cache
 
 
+def _set_last_failure_metadata(metadata: dict[str, Any] | None) -> None:
+    _last_failure_metadata.set(dict(metadata or {}) if metadata else None)
+
+
+def get_last_failure_metadata() -> dict[str, Any]:
+    return dict(_last_failure_metadata.get() or {})
+
+
 class StooqRateLimitError(Exception):
     """Raised when Stooq API rate limit is exceeded."""
     pass
+
+
+def _create_stooq_http_session(
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: Optional[float] = None,
+) -> aiohttp.ClientSession:
+    """
+    Create a direct session for Stooq.
+
+    Stooq is materially less reliable through the current machine proxy path, so
+    these requests bypass proxy env and allow a longer total timeout for large CSV
+    responses.
+    """
+    total_timeout = timeout if timeout is not None else _STOOQ_HTTP_TIMEOUT_S
+    timeout_cfg = aiohttp.ClientTimeout(
+        total=total_timeout,
+        sock_connect=min(15, total_timeout),
+        sock_read=total_timeout,
+    )
+    connector = aiohttp.TCPConnector(ttl_dns_cache=300, limit=8, ssl=False)
+    return aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout_cfg,
+        trust_env=False,
+        connector=connector,
+    )
 
 
 def _parse_stooq_csv(csv_text: str, symbol: str = "") -> Optional[Dict[str, Any]]:
@@ -174,12 +222,11 @@ class StooqClient:
         await _global_csv_limiter.wait()
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with _create_stooq_http_session(timeout=max(timeout, _STOOQ_HTTP_TIMEOUT_S), headers={"User-Agent": "Mozilla/5.0"}) as session:
                 params = {"s": symbol, "i": "d"}
                 async with session.get(
                     cls.CSV_URL,
                     params=params,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if response.status != 200:
                         logger.warning(f"Stooq error for {symbol}: {response.status}")
@@ -247,16 +294,13 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
     failed = 0
 
     # Sequential fetch with global rate limiter — avoid IP bans
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": "Mozilla/5.0"},
-    ) as session:
+    async with _create_stooq_http_session(timeout=_STOOQ_HTTP_TIMEOUT_S, headers={"User-Agent": "Mozilla/5.0"}) as session:
         for symbol in assets:
             await _global_csv_limiter.wait()
             try:
                 url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
                 async with session.get(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as response:
                     if response.status != 200:
                         failed += 1
@@ -282,14 +326,45 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
 
 def _get_file_cache_path() -> Path:
     """Get path for stooq homepage file cache."""
-    cache_dir = os.environ.get("LIVEWEB_CACHE_DIR", "/var/lib/liveweb-arena/cache")
-    return Path(cache_dir) / "_plugin_init" / "stooq_homepage.json"
+    return _get_plugin_cache_root() / "stooq" / "homepage.json"
+
+
+def _get_symbol_cache_path(symbol: str) -> Path:
+    safe_symbol = symbol.replace("/", "_").replace("\\", "_")
+    return _get_plugin_cache_root() / "stooq" / "symbols" / f"{safe_symbol}.json"
 
 
 def _get_cache_ttl() -> int:
     """Get cache TTL from environment."""
     from liveweb_arena.core.cache import DEFAULT_TTL
     return int(os.environ.get("LIVEWEB_CACHE_TTL", str(DEFAULT_TTL)))
+
+
+def _load_symbol_cache(symbol: str, *, allow_stale: bool = False) -> Optional[Dict[str, Any]]:
+    cache_file = _get_symbol_cache_path(symbol)
+    if not cache_file.exists():
+        return None
+    try:
+        cached = json.loads(cache_file.read_text())
+    except Exception:
+        return None
+    fetched_at = float(cached.get("_fetched_at", 0))
+    payload = cached.get("data")
+    if not payload:
+        return None
+    age = time.time() - fetched_at
+    ttl = _get_cache_ttl()
+    if age <= ttl:
+        return payload
+    if allow_stale and age <= ttl + 24 * 3600:
+        return payload
+    return None
+
+
+def _save_symbol_cache(symbol: str, data: Dict[str, Any]) -> None:
+    cache_file = _get_symbol_cache_path(symbol)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps({"data": data, "_fetched_at": time.time()}))
 
 
 def _is_file_cache_valid() -> bool:
@@ -321,12 +396,23 @@ def initialize_cache():
         logger.info("Stooq init: homepage cache valid (quick check)")
         return
 
-    # Acquire file lock — only one process fetches, others wait
+    strict_eval_mode = os.environ.get("LIVEWEB_RUNTIME_PROFILE", "").strip().lower() == "strict_eval"
+
+    # Acquire file lock — only one process fetches, others wait.
+    # In strict-eval, this warmup is only an optimization; if another worker is
+    # already warming the cache, skip instead of blocking the whole episode.
     lock_path = _get_file_cache_path().with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = open(lock_path, "w")
     try:
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)  # Blocking wait
+        lock_flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if strict_eval_mode else 0)
+        try:
+            fcntl.flock(fd.fileno(), lock_flags)
+        except BlockingIOError:
+            if strict_eval_mode:
+                logger.info("Stooq init: lock busy in strict-eval, skipping warmup")
+                return
+            raise
 
         # Re-check after acquiring lock — another process may have filled cache
         if _is_file_cache_valid():
@@ -390,7 +476,7 @@ async def fetch_homepage_api_data() -> Dict[str, Any]:
     return {"assets": assets}
 
 
-async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
+async def fetch_single_asset_data(symbol: str) -> Dict[str, Any]:
     """
     Fetch price data for a single asset.
 
@@ -398,48 +484,164 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
     since Stooq's CSV API requires suffixed symbols for some markets.
     Uses negative cache to avoid repeated requests for symbols with no data.
     """
-    if _rate_limited.get():
-        raise StooqRateLimitError("Stooq API rate limited (persistent for this session)")
+    _set_last_failure_metadata(None)
 
-    neg = _get_negative_cache()
-    if symbol in neg:
-        return {}
-
-    # Try .us suffix first for bare symbols (canonical form for US stocks)
     variants = [symbol]
     if "." not in symbol and not symbol.startswith("^"):
         variants = [f"{symbol}.us", symbol]
 
     for sym in variants:
+        cached = _load_symbol_cache(sym)
+        if cached:
+            _set_last_failure_metadata(None)
+            return cached
+
+    if _rate_limited.get():
+        for sym in variants:
+            cached = _load_symbol_cache(sym, allow_stale=True)
+            if cached:
+                _set_last_failure_metadata(None)
+                return cached
+        metadata = {
+            "plugin": "stooq",
+            "failure_stage": "api_fetch",
+            "failure_type": "rate_limit",
+            "symbol": symbol,
+            "request_url": None,
+        }
+        _set_last_failure_metadata(metadata)
+        raise APIFetchError(
+            "Stooq API rate limited (persistent for this session)",
+            source="stooq",
+            metadata=metadata,
+        )
+
+    neg = _get_negative_cache()
+    if symbol in neg:
+        for sym in variants:
+            cached = _load_symbol_cache(sym)
+            if cached:
+                _set_last_failure_metadata(None)
+                return cached
+        metadata = {
+            "plugin": "stooq",
+            "failure_stage": "api_fetch",
+            "failure_type": "negative_cache",
+            "symbol": symbol,
+            "request_url": None,
+        }
+        _set_last_failure_metadata(metadata)
+        raise APIFetchError(
+            f"Stooq API negative cache hit for symbol={symbol}",
+            source="stooq",
+            metadata=metadata,
+        )
+
+    last_metadata: dict[str, Any] | None = None
+    for sym in variants:
         await _global_csv_limiter.wait()
+        url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+            async with _create_stooq_http_session(timeout=_STOOQ_HTTP_TIMEOUT_S, headers={"User-Agent": "Mozilla/5.0"}) as session:
                 async with session.get(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    headers={"User-Agent": "Mozilla/5.0"},
                 ) as response:
                     if response.status != 200:
+                        last_metadata = {
+                            "plugin": "stooq",
+                            "failure_stage": "api_fetch",
+                            "failure_type": "http_status",
+                            "symbol": sym,
+                            "request_url": url,
+                            "http_status": response.status,
+                        }
                         continue
 
                     text = await response.text()
                     if "Exceeded the daily hits limit" in text:
                         _rate_limited.set(True)
-                        raise StooqRateLimitError("Stooq API daily limit exceeded")
+                        cached = _load_symbol_cache(sym, allow_stale=True)
+                        if cached:
+                            _set_last_failure_metadata(None)
+                            return cached
+                        metadata = {
+                            "plugin": "stooq",
+                            "failure_stage": "api_fetch",
+                            "failure_type": "rate_limit",
+                            "symbol": sym,
+                            "request_url": url,
+                        }
+                        _set_last_failure_metadata(metadata)
+                        raise APIFetchError(
+                            "Stooq API daily limit exceeded",
+                            source="stooq",
+                            metadata=metadata,
+                        )
 
                     if "No data" in text:
+                        last_metadata = {
+                            "plugin": "stooq",
+                            "failure_stage": "api_fetch",
+                            "failure_type": "no_data",
+                            "symbol": sym,
+                            "request_url": url,
+                        }
                         continue
 
                     result = _parse_stooq_csv(text, sym)
                     if result:
+                        with contextlib.suppress(Exception):
+                            _save_symbol_cache(sym, result)
+                        _set_last_failure_metadata(None)
                         return result
+                    last_metadata = {
+                        "plugin": "stooq",
+                        "failure_stage": "csv_parse",
+                        "failure_type": "invalid_csv",
+                        "symbol": sym,
+                        "request_url": url,
+                    }
 
-        except StooqRateLimitError:
+        except APIFetchError:
             raise
+        except asyncio.TimeoutError:
+            last_metadata = {
+                "plugin": "stooq",
+                "failure_stage": "api_fetch",
+                "failure_type": "timeout",
+                "symbol": sym,
+                "request_url": url,
+            }
+            cached = _load_symbol_cache(sym, allow_stale=True)
+            if cached:
+                _set_last_failure_metadata(None)
+                return cached
         except Exception:
+            last_metadata = {
+                "plugin": "stooq",
+                "failure_stage": "api_fetch",
+                "failure_type": "request_error",
+                "symbol": sym,
+                "request_url": url,
+            }
+            cached = _load_symbol_cache(sym, allow_stale=True)
+            if cached:
+                _set_last_failure_metadata(None)
+                return cached
             continue
 
     # All variants failed — add to negative cache
     neg.add(symbol)
-    return {}
+    metadata = last_metadata or {
+        "plugin": "stooq",
+        "failure_stage": "api_fetch",
+        "failure_type": "no_data",
+        "symbol": symbol,
+        "request_url": None,
+    }
+    _set_last_failure_metadata(metadata)
+    raise APIFetchError(
+        f"Stooq API returned no data for symbol={symbol}",
+        source="stooq",
+        metadata=metadata,
+    )

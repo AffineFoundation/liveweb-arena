@@ -4,11 +4,17 @@ Stooq Plugin.
 Plugin for financial market data from stooq.com.
 """
 
+import asyncio
+import os
+import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from liveweb_arena.plugins.base import BasePlugin
-from .api_client import fetch_single_asset_data, fetch_homepage_api_data, initialize_cache
+from liveweb_arena.plugins.base_client import APIFetchError
+from liveweb_arena.utils.logger import log
+from .api_client import fetch_single_asset_data, fetch_homepage_api_data, get_last_failure_metadata, initialize_cache
 
 
 class StooqPlugin(BasePlugin):
@@ -27,6 +33,8 @@ class StooqPlugin(BasePlugin):
 
     name = "stooq"
     _known_symbols_cache = None
+    _quote_warmup_started = False
+    _quote_warmup_lock = threading.Lock()
 
     allowed_domains = [
         "stooq.com",
@@ -34,8 +42,73 @@ class StooqPlugin(BasePlugin):
     ]
 
     def initialize(self):
-        """Pre-warm homepage file cache before evaluation starts."""
+        """Pre-warm homepage file cache and a few common quote pages."""
         initialize_cache()
+        self._initialize_quote_warmup()
+
+    def _initialize_quote_warmup(self) -> None:
+        if os.environ.get("LIVEWEB_DISABLE_STOOQ_WARMUP", "").lower() in {"1", "true"}:
+            return
+
+        with StooqPlugin._quote_warmup_lock:
+            if StooqPlugin._quote_warmup_started:
+                return
+            StooqPlugin._quote_warmup_started = True
+
+        cache_dir = Path(
+            os.environ.get(
+                "LIVEWEB_CACHE_DIR",
+                str(Path(__file__).resolve().parents[3] / ".cache" / "liveweb"),
+            )
+        )
+        symbols_raw = os.environ.get("LIVEWEB_STOOQ_WARMUP_SYMBOLS", "jnj.us,aapl.us,^spx")
+        urls = [
+            f"https://stooq.com/q/?s={symbol.strip()}"
+            for symbol in symbols_raw.split(",")
+            if symbol.strip()
+        ]
+        if not urls:
+            return
+
+        async def _warm() -> None:
+            from liveweb_arena.core.cache import CacheManager, PageRequirement
+
+            mgr = CacheManager(cache_dir=cache_dir)
+            pending = []
+            try:
+                for url in urls:
+                    cached = mgr.get_cached(url)
+                    if cached and not cached.is_expired(mgr.ttl) and cached.is_complete():
+                        continue
+                    pending.append(PageRequirement.data(url))
+                if pending:
+                    try:
+                        await mgr.ensure_cached(pending, self)
+                    except Exception as exc:
+                        log("Stooq", f"Quote warmup skipped after fetch error: {exc}", force=True)
+            finally:
+                await mgr.shutdown()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(_warm())
+            except Exception as exc:
+                log("Stooq", f"Quote warmup skipped after init error: {exc}", force=True)
+            return
+
+        def _run_background() -> None:
+            try:
+                asyncio.run(_warm())
+            except Exception as exc:
+                log("Stooq", f"Quote warmup background task failed: {exc}", force=True)
+
+        threading.Thread(
+            target=_run_background,
+            name="stooq-quote-warmup",
+            daemon=True,
+        ).start()
 
     def get_blocked_patterns(self) -> List[str]:
         """Block direct CSV download and ads."""
@@ -43,6 +116,41 @@ class StooqPlugin(BasePlugin):
             "*/q/d/l/*",  # CSV download endpoint
             "*stooq.com/ads/*",  # Ad frames
         ]
+
+    def get_stable_url_patterns(self) -> List[str]:
+        return [
+            "/",
+            "/q/",
+            "/q/?s=",
+            "/q/i/?s=",
+            "/q/d/?s=",
+        ]
+
+    def classify_url(self, url: str) -> Optional[str]:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        query = parsed.query.lower()
+        if "stooq.com" not in host:
+            return None
+        if host.startswith("www."):
+            return "env_tls_error"
+        if (
+            "/q/conv/" in path
+            or "/s/mst/" in path
+            or "quote.php" in path
+            or "/q/plus/" in path
+            or path.startswith("/q/l/")
+            or path.startswith("/q/d/l/")
+            or path.startswith("/q/nl/")
+            or path.startswith("/t/")
+        ):
+            return "model_invalid_url_shape"
+        if "q=" in query and "s=" not in query and "e=" not in query:
+            return "model_invalid_url_shape"
+        if path.startswith("/q/s/"):
+            return "model_invalid_url_shape"
+        return None
 
     def get_synthetic_page(self, url: str) -> Optional[str]:
         """Return synthetic error page for unknown symbols (zero network requests)."""
@@ -102,10 +210,19 @@ class StooqPlugin(BasePlugin):
         if symbol:
             if symbol not in self._get_known_symbols():
                 return {}  # Unknown symbol — skip API, zero requests
-            data = await fetch_single_asset_data(symbol)
-            if not data:
-                raise ValueError(f"Stooq API returned no data for symbol={symbol}")
-            return data
+            try:
+                return await fetch_single_asset_data(symbol)
+            except APIFetchError as exc:
+                metadata = dict(exc.metadata or {})
+                metadata.setdefault("plugin", self.name)
+                metadata.setdefault("symbol", symbol)
+                metadata.setdefault("page_url", url)
+                raise APIFetchError(
+                    str(exc),
+                    source=exc.source or self.name,
+                    status_code=exc.status_code,
+                    metadata=metadata or get_last_failure_metadata(),
+                ) from exc
 
         # Homepage - return all assets
         if self._is_homepage(url):
@@ -162,3 +279,9 @@ class StooqPlugin(BasePlugin):
             return query["e"][0].lower()
 
         return ""
+
+    def is_plausible_asset_id(self, url: str) -> bool:
+        symbol = self._extract_symbol(url)
+        if not symbol:
+            return True
+        return symbol in self._get_known_symbols()

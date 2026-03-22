@@ -14,6 +14,7 @@ The protocol controls:
 """
 
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -170,6 +171,10 @@ class AgentProtocol(ABC):
     def serialize_step(self, step: TrajectoryStep) -> List[dict]:
         """Serialize a trajectory step as conversation messages for training export."""
 
+    def classify_format_failure(self, raw: str, tool_calls: Optional[List[Any]] = None) -> str:
+        """Classify whether a parse failure is worth a local recovery attempt."""
+        return "terminal"
+
 
 # Shared step prompt (observation format is protocol-independent)
 _STEP_PROMPT_TEMPLATE = """## Current Page State
@@ -190,7 +195,7 @@ Title: {title}
 
 _LAST_STEP_WARNING = """
 
-**THIS IS YOUR LAST STEP!** You MUST use the "stop" action now and provide your best answers based on the information you have gathered. Do not attempt any other action."""
+**THIS IS YOUR LAST STEP!** You MUST use the "stop" action now and provide your best answers based on the information you have gathered. Do not attempt any other action. Do not explore. Each answer must be a short final string only."""
 
 
 def _build_step_prompt_common(
@@ -241,9 +246,40 @@ class FunctionCallingProtocol(AgentProtocol):
     Models trained on this data can deploy with any tool-calling framework.
     """
 
-    def __init__(self, max_recent_steps: int = 5):
+    def __init__(
+        self,
+        max_recent_steps: int = 5,
+        prompt_profile: str | None = None,
+        strict_compat: bool = False,
+    ):
         self._max_recent_steps = max_recent_steps
+        self._prompt_profile = (prompt_profile or "").strip().lower() or None
+        self._strict_compat = strict_compat
         self._tools = self._build_tools()
+
+    def _extra_system_rules(self) -> str:
+        if self._prompt_profile != "gpt54_strict_domains":
+            return ""
+        return (
+            "## Model-Specific Rules\n\n"
+            "- Do not use Google Search, Google Finance, Yahoo Finance, CoinMarketCap, XE, TradingView, DuckDuckGo, MarketWatch, WSJ, CNBC, or Bloomberg.\n"
+            "- Go directly to the allowed domains for this task. If a page says 'Domain not allowed', immediately switch to an allowed domain.\n"
+            "- Never call stop with an empty answers object.\n"
+            "- When you call stop, every required answer tag must be present and mapped to a non-empty short string.\n"
+            "- If the current page already shows the requested value, extract it from the page and call stop. Do not browse elsewhere.\n"
+            "- For task2, solve the first subtask completely, then solve the second subtask. Do not replace allowed sites with general search.\n\n"
+        )
+
+    def _extra_step_rules(self) -> str:
+        if self._prompt_profile != "gpt54_strict_domains":
+            return ""
+        return (
+            "\nImportant reminders for this model:"
+            "\n- Never call stop with {\"answers\": {}}."
+            "\n- If you use stop, fill every answer tag with a non-empty short string."
+            "\n- Do not use Google, Yahoo, CoinMarketCap, XE, TradingView, or search engines."
+            "\n- If the answer is visible on the current allowed page, extract it now instead of browsing away."
+        )
 
     def _build_tools(self) -> List[dict]:
         """Build OpenAI-format tool definitions from BROWSER_ACTIONS."""
@@ -265,13 +301,13 @@ class FunctionCallingProtocol(AgentProtocol):
             hints = "## Available Information Sources\n\n"
             for _, usage_hint in task.plugin_hints.items():
                 hints += usage_hint + "\n\n"
-
         return (
             "You are a web automation agent that interacts with real websites to complete tasks.\n\n"
             "You have access to a browser and can navigate to any website to gather information.\n"
             "Use the provided tools to interact with the browser.\n\n"
             f"{hints}"
             f"{task.combined_intent}\n\n"
+            f"{self._extra_system_rules()}"
             "## Tips\n\n"
             "- First analyze the task and decide which website to visit\n"
             "- Use the goto tool to navigate to the appropriate URL\n"
@@ -298,38 +334,33 @@ class FunctionCallingProtocol(AgentProtocol):
             obs, trajectory, current_step, max_steps,
             self._max_recent_steps, format_step,
         )
-        return prompt + "\nWhat is your next action? Use one of the available tools."
+        if self._strict_compat:
+            return prompt + "\nWhat is your next action? Use one of the available tools."
+        return (
+            prompt
+            + "\nWhat is your next action? Use one of the available tools."
+            + "\nReturn only a tool call. Do not output any text explanation, <think> block, XML tag, markdown, or raw JSON."
+            + self._extra_step_rules()
+        )
 
     def get_tools(self) -> List[dict]:
         return self._tools
 
     def parse_response(self, raw: str, tool_calls: Optional[List[Any]] = None) -> Optional[BrowserAction]:
-        """Parse tool_calls from LLM response."""
-        if not tool_calls:
+        """Parse tool_calls from LLM response.
+
+        Fallback support covers common text-encoded tool-call styles:
+        - <tool_call>{...}</tool_call>
+        - raw JSON object {"name": "...", "arguments": {...}}
+        - [tool_call: stop({...})]
+        """
+        parsed = self._parse_primary_tool_call(tool_calls)
+        if parsed is None and raw and not self._strict_compat:
+            parsed = self._parse_qwen_fallback(raw)
+        if parsed is None:
             return None
 
-        # Use the first tool call — handle both OpenAI SDK objects and dicts
-        call = tool_calls[0]
-        if hasattr(call, 'function') and hasattr(call.function, 'name'):
-            # OpenAI SDK object (from streaming)
-            fn_name = call.function.name
-            fn_args = call.function.arguments
-        elif hasattr(call, 'function') and isinstance(call.function, dict):
-            # ToolCall dataclass (from chat_with_tools)
-            fn_name = call.function.get("name")
-            fn_args = call.function.get("arguments", "{}")
-        else:
-            # Plain dict
-            fn_name = call.get("function", {}).get("name")
-            fn_args = call.get("function", {}).get("arguments", "{}")
-
-        if not fn_name or fn_name not in VALID_ACTION_TYPES:
-            return None
-
-        try:
-            params = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
-        except json.JSONDecodeError:
-            return None
+        fn_name, params = parsed
 
         # Normalize stop action format for compatibility with existing agent_loop
         if fn_name == "stop":
@@ -337,6 +368,232 @@ class FunctionCallingProtocol(AgentProtocol):
             params = {"final": {"answers": answers}}
 
         return BrowserAction(action_type=fn_name, params=params)
+
+    def classify_format_failure(self, raw: str, tool_calls: Optional[List[Any]] = None) -> str:
+        if self._strict_compat:
+            return "none" if self._parse_primary_tool_call(tool_calls) is not None else "terminal"
+        if self._parse_primary_tool_call(tool_calls) is not None:
+            return "none"
+        if raw and self._parse_qwen_fallback(raw) is not None:
+            return "none"
+
+        stripped = (raw or "").strip()
+        if tool_calls:
+            return "recoverable_truncated_tool_json"
+        if not stripped:
+            return "recoverable_empty"
+
+        stripped = re.sub(r"^\s*<think>.*?</think>\s*", "", stripped, flags=re.DOTALL).strip()
+        if not stripped:
+            return "recoverable_empty"
+
+        if "<tool_call>" in stripped or "</tool_call>" in stripped:
+            return "recoverable_truncated_tool_json"
+        if re.match(r"^\s*\{", stripped):
+            return "recoverable_truncated_tool_json"
+        if re.match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", stripped):
+            return "recoverable_qwen_tool_text"
+        if stripped.startswith("[tool_call:"):
+            return "recoverable_truncated_tool_json"
+        return "terminal_natural_language"
+
+    def debug_parse_metadata(self, raw: str, tool_calls: Optional[List[Any]] = None) -> Dict[str, Any]:
+        branch = "none"
+        preview_calls: list[dict[str, Any]] = []
+        if tool_calls:
+            for call in tool_calls[:2]:
+                fn_name = None
+                fn_args = None
+                if hasattr(call, "function") and hasattr(call.function, "name"):
+                    fn_name = call.function.name
+                    fn_args = call.function.arguments
+                elif hasattr(call, "function") and isinstance(call.function, dict):
+                    fn_name = call.function.get("name")
+                    fn_args = call.function.get("arguments")
+                elif isinstance(call, dict):
+                    function = call.get("function", {})
+                    fn_name = function.get("name")
+                    fn_args = function.get("arguments")
+                preview_calls.append(
+                    {
+                        "name": fn_name,
+                        "arguments_preview": str(fn_args)[:200] if fn_args is not None else None,
+                    }
+                )
+        if self._parse_primary_tool_call(tool_calls) is not None:
+            branch = "tool_calls"
+        elif self._strict_compat:
+            branch = "strict_unparsed"
+        else:
+            stripped = (raw or "").strip()
+            if stripped:
+                stripped = re.sub(r"^\s*<think>.*?</think>\s*", "", stripped, flags=re.DOTALL).strip()
+                tag_match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", stripped, re.DOTALL)
+                bracket_tool_match = re.fullmatch(r"\[\s*tool_call:\s*(.+?)\s*\]", stripped, flags=re.DOTALL)
+                if tag_match and self._parse_qwen_fallback(raw) is not None:
+                    branch = "tool_call_tag"
+                elif bracket_tool_match and self._parse_qwen_fallback(raw) is not None:
+                    branch = "bracket_tool_call"
+                elif re.match(r"^\s*\{", stripped) and self._parse_qwen_fallback(raw) is not None:
+                    branch = "raw_json_object"
+                elif re.match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", stripped) and self._parse_qwen_fallback(raw) is not None:
+                    branch = "qwen_function_text"
+                elif re.match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", stripped):
+                    branch = "qwen_function_text_unparsed"
+                elif stripped.startswith("[tool_call:"):
+                    branch = "bracket_tool_call_unparsed"
+                elif "<tool_call>" in stripped or "</tool_call>" in stripped:
+                    branch = "tool_call_tag_unparsed"
+                elif re.match(r"^\s*\{", stripped):
+                    branch = "raw_json_object_unparsed"
+                else:
+                    branch = "natural_language"
+        return {
+            "protocol_parser_branch": branch,
+            "tool_calls_preview": preview_calls,
+        }
+
+    def _parse_primary_tool_call(self, tool_calls: Optional[List[Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not tool_calls:
+            return None
+
+        call = tool_calls[0]
+        if hasattr(call, "function") and hasattr(call.function, "name"):
+            fn_name = call.function.name
+            fn_args = call.function.arguments
+        elif hasattr(call, "function") and isinstance(call.function, dict):
+            fn_name = call.function.get("name")
+            fn_args = call.function.get("arguments", "{}")
+        else:
+            fn_name = call.get("function", {}).get("name")
+            fn_args = call.get("function", {}).get("arguments", "{}")
+
+        return self._normalize_tool_call(fn_name, fn_args)
+
+    def _parse_qwen_fallback(self, raw: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        stripped = raw.strip()
+        if not stripped:
+            return None
+
+        stripped = re.sub(r"^\s*<think>.*?</think>\s*", "", stripped, flags=re.DOTALL)
+        if not stripped:
+            return None
+
+        tag_match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", stripped, re.DOTALL)
+        if tag_match:
+            stripped = tag_match.group(1).strip()
+
+        for candidate in self._qwen_payload_candidates(stripped):
+            payload = self._parse_qwen_payload(candidate)
+            if not isinstance(payload, dict):
+                repaired_candidate = self._repair_function_text_payload(candidate)
+                if repaired_candidate and repaired_candidate != candidate:
+                    payload = self._parse_qwen_payload(repaired_candidate)
+            if not isinstance(payload, dict):
+                continue
+            fn_name = payload.get("name")
+            fn_args = payload.get("arguments", {})
+            normalized = self._normalize_tool_call(fn_name, fn_args)
+            if normalized is not None:
+                return normalized
+        return None
+
+    def _qwen_payload_candidates(self, payload_text: str) -> List[str]:
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        def add(text: str) -> None:
+            text = text.strip()
+            if text and text not in seen:
+                seen.add(text)
+                candidates.append(text)
+
+        add(payload_text)
+        stripped = payload_text.strip()
+        add(re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.DOTALL).strip())
+        add(re.sub(r"^<[^>]+>\s*|\s*</[^>]+>$", "", stripped, flags=re.DOTALL).strip())
+
+        bracket_tool_match = re.fullmatch(r"\[\s*tool_call:\s*(.+?)\s*\]", stripped, flags=re.DOTALL)
+        if bracket_tool_match:
+            add(bracket_tool_match.group(1))
+
+        wrapper_match = re.fullmatch(r"([`_]+)\s*(.+?)\s*\1", stripped, flags=re.DOTALL)
+        if wrapper_match:
+            add(wrapper_match.group(2))
+        add(stripped.strip("`_ \n\t"))
+        return candidates
+
+    def _parse_qwen_payload(self, payload_text: str) -> Optional[Dict[str, Any]]:
+        stripped = payload_text.strip()
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+        sanitized = stripped.strip("` \n\t")
+        sanitized = re.sub(r"^_+", "", sanitized)
+        sanitized = re.sub(r"_+\s*\)$", ")", sanitized)
+        match = re.fullmatch(
+            r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*(\{.*\})\s*\)\s*",
+            sanitized,
+            flags=re.DOTALL,
+        )
+        if not match:
+            repaired = self._repair_function_text_payload(sanitized)
+            if repaired is not None:
+                match = re.fullmatch(
+                    r"([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*(\{.*\})\s*\)\s*",
+                    repaired,
+                    flags=re.DOTALL,
+                )
+        if not match:
+            return None
+
+        fn_name = match.group(1)
+        if fn_name not in VALID_ACTION_TYPES:
+            return None
+
+        try:
+            fn_args = json.loads(match.group(2))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(fn_args, dict):
+            return None
+        return {"name": fn_name, "arguments": fn_args}
+
+    def _repair_function_text_payload(self, payload_text: str) -> Optional[str]:
+        stripped = payload_text.strip()
+        prefix_match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", stripped)
+        if not prefix_match or not stripped.endswith(")"):
+            return None
+
+        fn_name = prefix_match.group(1)
+        body = stripped[prefix_match.end():-1].strip()
+        if not body.startswith("{"):
+            return None
+
+        opens = body.count("{")
+        closes = body.count("}")
+        if opens <= closes:
+            return None
+
+        repaired_body = body + ("}" * (opens - closes))
+        return f"{fn_name}({repaired_body})"
+
+    def _normalize_tool_call(self, fn_name: Any, fn_args: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if not isinstance(fn_name, str) or fn_name not in VALID_ACTION_TYPES:
+            return None
+
+        try:
+            params = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(params, dict):
+            return None
+        return fn_name, params
 
     def serialize_step(self, step: TrajectoryStep) -> List[dict]:
         """Serialize as tool_call + tool response messages (standard OpenAI format)."""

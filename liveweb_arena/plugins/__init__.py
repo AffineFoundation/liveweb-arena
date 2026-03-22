@@ -139,6 +139,11 @@ def get_plugin_names() -> List[str]:
     return list(_plugins.keys())
 
 
+def get_disabled_plugins() -> List[str]:
+    """Return disabled plugin names in a stable order."""
+    return sorted(str(name) for name in DISABLED_PLUGINS)
+
+
 def reload_plugins():
     """Reload all plugins (useful for development)."""
     _plugins.clear()

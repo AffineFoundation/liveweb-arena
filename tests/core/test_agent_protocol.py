@@ -15,6 +15,34 @@ def protocol():
     return FunctionCallingProtocol()
 
 
+def test_gpt54_prompt_profile_adds_strict_system_rules():
+    from liveweb_arena.core.models import CompositeTask
+    from liveweb_arena.plugins.base import SubTask
+
+    task = CompositeTask(
+        subtasks=[SubTask(plugin_name="coingecko", intent="Example?", validation_info={}, answer_tag="answer1")],
+        combined_intent="## Tasks to Complete\n\n1. Example?\n   Answer tag: answer1\n\n## Output Requirements\n\nWhen you have completed all tasks, use the \"stop\" action with your answers in this JSON format:\n\n```json\n{\"answers\": {\"answer1\": \"...\"}}\n```",
+        plugin_hints={},
+        seed=1,
+    )
+    profile_protocol = FunctionCallingProtocol(prompt_profile="gpt54_strict_domains")
+    prompt = profile_protocol.build_system_prompt(task)
+    assert "Do not use Google Search, Google Finance, Yahoo Finance" in prompt
+    assert "Never call stop with an empty answers object." in prompt
+
+
+def test_gpt54_prompt_profile_adds_step_reminders():
+    obs = BrowserObservation(
+        url="https://www.coingecko.com/en/coins/optimism",
+        title="Optimism",
+        accessibility_tree="Circulating Supply 2,117,847,344",
+    )
+    profile_protocol = FunctionCallingProtocol(prompt_profile="gpt54_strict_domains")
+    prompt = profile_protocol.build_step_prompt(obs, [], current_step=2, max_steps=40)
+    assert 'Never call stop with {"answers": {}}.' in prompt
+    assert "Do not use Google, Yahoo, CoinMarketCap, XE, TradingView, or search engines." in prompt
+
+
 # ── get_tools ──────────────────────────────────────────────────────
 
 def test_get_tools_returns_all_actions(protocol):
@@ -104,6 +132,138 @@ def test_parse_uses_first_tool_call_only(protocol):
     tc2 = ToolCall(id="c2", function={"name": "click", "arguments": '{"selector": "b"}'})
     action = protocol.parse_response("", [tc1, tc2])
     assert action.action_type == "goto"
+
+
+def test_parse_qwen_tool_call_tag_fallback(protocol):
+    raw = """
+<think>
+</think>
+<tool_call>
+{"name":"goto","arguments":{"url":"https://example.com"}}
+</tool_call>
+"""
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "goto"
+    assert action.params["url"] == "https://example.com"
+
+
+def test_strict_compat_protocol_does_not_accept_qwen_fallback_text():
+    protocol = FunctionCallingProtocol(strict_compat=True)
+    raw = """
+<think>
+</think>
+<tool_call>
+{"name":"goto","arguments":{"url":"https://example.com"}}
+</tool_call>
+"""
+    assert protocol.parse_response(raw, None) is None
+    assert protocol.classify_format_failure(raw, None) == "terminal"
+
+
+def test_parse_qwen_stop_fallback(protocol):
+    raw = '{"name":"stop","arguments":{"answers":{"a1":"42"}}}'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_qwen_stop_after_think_fallback(protocol):
+    raw = '<think>\n</think>\n\n{"name":"stop","arguments":{"answers":{"a1":"42"}}}'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_qwen_function_style_fallback(protocol):
+    raw = 'click_role({"role":"link","name":"Ask HN","exact":false})'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "click_role"
+    assert action.params == {"role": "link", "name": "Ask HN", "exact": False}
+
+
+def test_parse_qwen_tool_tag_function_style_fallback(protocol):
+    raw = """
+<tool_call>
+stop({"answers":{"a1":"42"}})
+</tool_call>
+"""
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_qwen_function_style_with_wrapper_noise(protocol):
+    raw = '_goto({"url":"https://news.ycombinator.com"}_)'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "goto"
+    assert action.params == {"url": "https://news.ycombinator.com"}
+
+
+def test_parse_bracket_tool_call_stop_fallback(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"}})]'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_parse_bracket_tool_call_goto_fallback(protocol):
+    raw = '[tool_call: goto({"url":"https://example.com"})]'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "goto"
+    assert action.params == {"url": "https://example.com"}
+
+
+def test_debug_parse_metadata_identifies_bracket_tool_call(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"}})]'
+    metadata = protocol.debug_parse_metadata(raw, None)
+    assert metadata["protocol_parser_branch"] == "bracket_tool_call"
+    assert metadata["tool_calls_preview"] == []
+
+
+def test_debug_parse_metadata_identifies_unparsed_natural_language(protocol):
+    raw = "I will think first and then browse later."
+    metadata = protocol.debug_parse_metadata(raw, None)
+    assert metadata["protocol_parser_branch"] == "natural_language"
+
+
+def test_parse_qwen_fallback_rejects_natural_language(protocol):
+    raw = 'I should stop now. {"name":"stop","arguments":{"answers":{"a1":"42"}}}'
+    assert protocol.parse_response(raw, None) is None
+
+
+def test_classify_format_failure_empty_response_is_recoverable(protocol):
+    assert protocol.classify_format_failure("", None) == "recoverable_empty"
+
+
+def test_classify_format_failure_truncated_tool_call_is_recoverable(protocol):
+    raw = "<tool_call>{\"name\":\"goto\",\"arguments\":{\"url\":\"https://example.com\"}"
+    assert protocol.classify_format_failure(raw, None) == "recoverable_truncated_tool_json"
+
+
+def test_classify_format_failure_valid_bracket_tool_call_is_not_failure(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"}})]'
+    assert protocol.classify_format_failure(raw, None) == "none"
+
+
+def test_parse_bracket_tool_call_repairs_missing_outer_brace(protocol):
+    raw = '[tool_call: stop({"answers":{"a1":"42"})]'
+    action = protocol.parse_response(raw, None)
+    assert action is not None
+    assert action.action_type == "stop"
+    assert action.params == {"final": {"answers": {"a1": "42"}}}
+
+
+def test_classify_format_failure_natural_language_is_terminal(protocol):
+    raw = "I will now browse the page and report back with the answer."
+    assert protocol.classify_format_failure(raw, None) == "terminal_natural_language"
 
 
 # ── serialize_step ─────────────────────────────────────────────────

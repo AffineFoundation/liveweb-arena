@@ -15,6 +15,7 @@ from liveweb_arena.core.cache import (
     safe_path_component,
     url_to_cache_dir,
 )
+from liveweb_arena.plugins.taostats.taostats import TaostatsPlugin
 
 
 # ── CachedPage ──────────────────────────────────────────────────────
@@ -76,6 +77,19 @@ class TestCachedPage:
         page = CachedPage(url="u", html="h", api_data=None, fetched_at=1.0, accessibility_tree="tree")
         d = page.to_dict()
         assert d["accessibility_tree"] == "tree"
+
+    def test_from_dict_enriches_sparse_a11y_from_html(self):
+        d = {
+            "url": "https://taostats.io/subnets/75",
+            "html": "<html><body><nav>taostats</nav><main><h1>Hippius</h1><div>Statistics</div><div>Price Impact</div></main></body></html>",
+            "api_data": {"netuid": 75},
+            "fetched_at": 1.0,
+            "accessibility_tree": "taostats",
+            "need_api": True,
+        }
+        page = CachedPage.from_dict(d)
+        assert "Hippius" in page.accessibility_tree
+        assert "Statistics" in page.accessibility_tree
 
 
 # ── PageRequirement ──────────────────────────────────────────────────
@@ -194,6 +208,22 @@ class TestCacheFatalError:
         err = CacheFatalError("generic failure")
         assert err.url is None
 
+    def test_structured_fields(self):
+        err = CacheFatalError(
+            "timeout",
+            url="https://x.com",
+            status_code=504,
+            evidence={"k": "v"},
+            soft_fail_applied=True,
+            stale_fallback_used=False,
+            plugin_name="coingecko",
+        )
+        assert err.status_code == 504
+        assert err.evidence == {"k": "v"}
+        assert err.soft_fail_applied is True
+        assert err.stale_fallback_used is False
+        assert err.plugin_name == "coingecko"
+
 
 # ── CacheManager._load_if_valid (via file I/O) ──────────────────────
 
@@ -246,3 +276,72 @@ class TestCacheManagerLoadIfValid:
         mgr = CacheManager(cache_dir=tmp_path, ttl=3600)
         # need_api=True but cache has no api_data → rejected
         assert mgr._load_if_valid(cache_file, need_api=True) is None
+
+    def test_load_with_status_uses_shared_cache_fallback(self, tmp_path, monkeypatch):
+        local_cache = tmp_path / "local"
+        shared_cache = tmp_path / "shared"
+        monkeypatch.setenv("LIVEWEB_SHARED_CACHE_DIR", str(shared_cache))
+        monkeypatch.setenv("LIVEWEB_ENABLE_SHARED_CACHE", "1")
+        mgr = CacheManager(cache_dir=local_cache, ttl=3600)
+
+        url = "https://stooq.com/q/?s=jnj.us"
+        normalized = normalize_url(url)
+        shared_file = url_to_cache_dir(shared_cache, normalized) / "page.json"
+        shared_file.parent.mkdir(parents=True, exist_ok=True)
+        shared_page = CachedPage(
+            url=url,
+            html="<html><body><h1>JNJ</h1><p>Price 123</p></body></html>",
+            api_data={"symbol": "jnj.us"},
+            fetched_at=time.time(),
+            need_api=True,
+        )
+        with open(shared_file, "w") as f:
+            json.dump(shared_page.to_dict(), f)
+
+        local_file = url_to_cache_dir(local_cache, normalized) / "page.json"
+        status, cached = mgr._load_with_status(normalized, local_file, need_api=True)
+        assert status == "valid"
+        assert cached is not None
+        assert cached.api_data == {"symbol": "jnj.us"}
+        assert local_file.exists()
+
+
+def test_cache_manager_records_taostats_prefetch_cooldown(tmp_path):
+    mgr = CacheManager(cache_dir=tmp_path, ttl=3600)
+    url = "https://taostats.io/subnets/73"
+    err = CacheFatalError(
+        "Taostats detail prefetch invalidated",
+        url=url,
+        kind="taostats_prefetch_invalidated",
+        fatal=False,
+        evidence={
+            "classification": "env_taostats_detail_prefetch_invalidated",
+            "page_kind": "taostats_detail",
+            "prefetch_phase": "setup_page_for_cache",
+        },
+        plugin_name="taostats",
+    )
+
+    mgr._maybe_activate_taostats_prefetch_cooldown(url, err)
+    cooldown = mgr._get_taostats_prefetch_cooldown(url)
+    assert cooldown is not None
+    assert cooldown["classification"] == "env_taostats_detail_prefetch_invalidated"
+    assert cooldown["cooldown_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_cache_manager_short_circuits_taostats_detail_during_cooldown(tmp_path):
+    mgr = CacheManager(cache_dir=tmp_path, ttl=3600)
+    url = "https://taostats.io/subnets/73"
+    mgr._taostats_prefetch_cooldowns[normalize_url(url)] = (
+        time.monotonic() + 60,
+        {
+            "classification": "env_taostats_detail_prefetch_invalidated",
+            "page_kind": "taostats_detail",
+        },
+    )
+
+    with pytest.raises(CacheFatalError, match="cooldown active") as excinfo:
+        await mgr._ensure_single(url, TaostatsPlugin(), need_api=False)
+
+    assert excinfo.value.kind == "taostats_prefetch_cooldown"

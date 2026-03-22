@@ -3,7 +3,9 @@
 import asyncio
 import time
 from abc import ABC
-from typing import Any, ClassVar, Dict
+from typing import Any, ClassVar, Dict, Optional
+
+import aiohttp
 
 
 class APIFetchError(Exception):
@@ -14,10 +16,17 @@ class APIFetchError(Exception):
     All API clients should raise this instead of returning None/empty dict.
     """
 
-    def __init__(self, message: str, source: str = None, status_code: int = None):
+    def __init__(
+        self,
+        message: str,
+        source: str = None,
+        status_code: int = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.source = source
         self.status_code = status_code
+        self.metadata = dict(metadata or {})
 
 
 def validate_api_response(data: Any, expected_type: type, context: str) -> None:
@@ -69,3 +78,24 @@ class BaseAPIClient(ABC):
     async def _rate_limit(cls):
         """Apply rate limiting. Subclasses can override for custom behavior."""
         await cls._rate_limiter.wait()
+
+
+def create_http_session(
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: Optional[float] = None,
+) -> aiohttp.ClientSession:
+    """
+    Create a shared-config aiohttp session for plugin API access.
+
+    Important: trust_env=True allows the evaluation environment's proxy settings
+    to apply consistently, which is required on this machine for some sites/APIs.
+    """
+    timeout_cfg = aiohttp.ClientTimeout(total=timeout) if timeout is not None else None
+    connector = aiohttp.TCPConnector(ttl_dns_cache=300, limit=32, ssl=False)
+    return aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout_cfg,
+        trust_env=True,
+        connector=connector,
+    )
